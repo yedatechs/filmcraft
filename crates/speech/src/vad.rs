@@ -29,6 +29,20 @@ pub fn frame_db(audio: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// The level speech reaches in this recording (the 95th percentile of the frame levels, dBFS).
+pub fn speech_level(db: &[f32]) -> f32 {
+    let mut s: Vec<f32> = db.iter().copied().filter(|v| v.is_finite()).collect();
+    if s.is_empty() {
+        return 0.0;
+    }
+    s.sort_by(f32::total_cmp);
+    s[((s.len() - 1) as f32 * 0.95) as usize]
+}
+
+/// A voiced run whose loudest frame is this far (dB) below the recording's speech level is not
+/// the word whisper timed there: a click, breath or room noise.
+const FAINT_DB: f32 = 20.0;
+
 /// The speech/silence threshold in dBFS.
 pub fn threshold(db: &[f32]) -> f32 {
     if db.is_empty() {
@@ -105,6 +119,7 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
         return;
     }
     let th = threshold(&db);
+    let faint = speech_level(&db) - FAINT_DB;
     let frame_ticks = TICKS_PER_SAMPLE * FRAME as i64;
     let spans: Vec<(usize, usize)> = words
         .iter()
@@ -113,6 +128,9 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
     // the previous word's final end bounds how far a word may grow backwards; the next word's
     // span bounds growth forwards (so two words never claim the same frames)
     let mut prev_end = 0usize;
+    // words whose span holds no voiced audio at all: whisper put them in silence (a quiet first
+    // word before a long pause gets a DTW time in the pause); they are moved afterwards
+    let mut orphans: Vec<usize> = Vec::new();
     for (k, w) in words.iter_mut().enumerate() {
         let (a, b) = spans[k];
         let next_start = spans.get(k + 1).map(|s| s.0).unwrap_or(db.len());
@@ -151,8 +169,11 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
         {
             best = Some(r);
         }
-        // nothing voiced at all: leave the word alone
-        let Some((s, e, _)) = best else {
+        // nothing voiced at all, or only something far quieter than speech (a click in the
+        // silence whisper timed the word into): the word is somewhere else (`orphans`)
+        let loud_enough = best.is_some_and(|(s, e, _)| frames.get(s..e).into_iter().flatten().copied().fold(f32::MIN, f32::max) >= faint);
+        let Some((s, e, _)) = best.filter(|_| loud_enough) else {
+            orphans.push(k);
             prev_end = prev_end.max(b);
             continue;
         };
@@ -185,6 +206,56 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
         }
         prev_end = e.max(prev_end);
     }
+    relocate_orphans(&db, th, frame_ticks, words, &orphans);
+}
+
+/// Longest span (frames) a relocated word takes from the start of the next word's speech.
+const ORPHAN_FRAMES: usize = 25;
+
+/// A word whose own span was silent sits where the next word's speech begins: whisper heard it
+/// (the owner said "yo" right before "what a") but timed it into the silence before, and the
+/// next word's voiced run then swallowed its audio. The word gets the first part of that run and
+/// the boundary settles at the dip between them, so a cut of the next word no longer removes it.
+fn relocate_orphans(db: &[f32], th: f32, frame_ticks: i64, words: &mut [Word], orphans: &[usize]) {
+    for &k in orphans {
+        let Some(next) = words.get(k + 1) else { continue };
+        let ns = (next.start.0 / frame_ticks).max(0) as usize;
+        let ne = (next.end.0 / frame_ticks).max(0) as usize;
+        let own_end = (words[k].end.0 / frame_ticks).max(0) as usize;
+        // only when the next word's speech really starts later, with silence in between, and is
+        // long enough to share
+        if ns <= own_end || ne < ns + 2 * MIN_WORD_FRAMES || !db.get(ns).is_some_and(|l| *l >= th) {
+            continue;
+        }
+        let split = (ns + ORPHAN_FRAMES).min(ne - MIN_WORD_FRAMES);
+        words[k].start = Tick(ns as i64 * frame_ticks);
+        words[k].end = Tick(split as i64 * frame_ticks);
+        words[k + 1].start = words[k].end;
+        // the dip between the two words, if there is one, is the better boundary
+        let pair = &mut words[k..k + 2];
+        refine_pair(db, frame_ticks, pair);
+    }
+}
+
+/// [`refine_boundaries`] for one adjacent pair with the frame levels already computed.
+fn refine_pair(db: &[f32], frame_ticks: i64, pair: &mut [Word]) {
+    let frame = |t: Tick| (t.0 / frame_ticks).max(0) as usize;
+    let (Some(a), Some(b)) = (pair.first().cloned(), pair.get(1).cloned()) else { return };
+    let bf = frame(a.end);
+    let lo = (frame(a.start) + MIN_WORD_FRAMES).max(bf.saturating_sub(BOUNDARY_SEARCH_FRAMES));
+    let hi = frame(b.end).saturating_sub(MIN_WORD_FRAMES).min(bf + BOUNDARY_SEARCH_FRAMES).min(db.len().saturating_sub(1));
+    if lo >= hi {
+        return;
+    }
+    let Some((best, lvl)) = (lo..=hi).filter_map(|f| db.get(f).map(|l| (f, *l))).min_by(|x, y| x.1.total_cmp(&y.1)) else { return };
+    let loudest = |r: std::ops::Range<usize>| r.filter_map(|f| db.get(f)).copied().fold(f32::MIN, f32::max);
+    let (left, right) = (loudest(frame(a.start)..best), loudest(best + 1..frame(b.end).min(db.len())));
+    if left.min(right) - lvl < DIP_DB {
+        return;
+    }
+    let t = Tick(best as i64 * frame_ticks);
+    pair[0].end = t.max(pair[0].start);
+    pair[1].start = t.min(pair[1].end);
 }
 
 #[cfg(test)]
@@ -251,6 +322,37 @@ mod tests {
         tighten_words(&long, &mut words);
         let end = words[0].end.0 as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
         assert!(end <= 0.25 + 0.5 + 0.011, "{end}");
+    }
+
+    #[test]
+    fn a_word_timed_into_silence_moves_to_the_speech_before_the_next_word() {
+        // near-silence for 5.5 s (a faint blip at 2.0 s), then "yo what" spoken 5.60–6.30 s with a
+        // 40 ms dip at 5.80; whisper timed "yo" at 1.9–2.2 and "what" from there to 6.22
+        let sr = SAMPLE_RATE as usize;
+        let mut audio = vec![0.0f32; 7 * sr];
+        for (i, v) in audio.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            let tone = (t * 300.0 * std::f32::consts::TAU).sin();
+            *v = if (1.95..2.15).contains(&t) {
+                0.02 * tone
+            } else if (5.60..5.80).contains(&t) || (5.84..6.30).contains(&t) {
+                0.5 * tone
+            } else {
+                0.001 * tone
+            };
+        }
+        let w = |text: &str, a: f64, b: f64| Word { text: text.into(), start: seconds_tick(a), end: seconds_tick(b), speaker: None, confidence: 1.0 };
+        let mut words = vec![w("yo", 1.9, 2.2), w("what", 2.2, 6.22), w("a", 6.22, 6.5)];
+        tighten_words(&audio, &mut words);
+        let secs = |t: Tick| t.0 as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+        assert!((5.58..=5.63).contains(&secs(words[0].start)), "yo starts with the speech: {}", secs(words[0].start));
+        assert!((5.78..=5.86).contains(&secs(words[0].end)), "yo ends at the dip: {}", secs(words[0].end));
+        assert_eq!(words[1].start, words[0].end, "what follows yo");
+        assert!(secs(words[1].end) >= 6.2, "{}", secs(words[1].end));
+        // a last word with nothing voiced stays put (nothing to move it before)
+        let mut words = vec![w("what", 5.6, 6.3), w("hm", 6.6, 6.9)];
+        tighten_words(&audio, &mut words);
+        assert_eq!(words[1].start, seconds_tick(6.6));
     }
 
     #[test]
