@@ -5,8 +5,8 @@
 
 ## 2. Layout engine (F9.1)
 
-- [ ] 2.1 `filmcraft_edit::layout`: visible box, place transform, nearest preset, rounded-rect path; unit tests
-- [ ] 2.2 `layout.place / shape / swap / inspect / pick` commands, keyframe-aware, one undo step each; engine tests; `docs/layouts.md`
+- [x] 2.1 `filmcraft_edit::layout`: visible box, place transform, nearest preset, rounded-rect path; unit tests
+- [x] 2.2 `layout.place / shape / swap / inspect / pick` commands, keyframe-aware, one undo step each; engine tests; `docs/layouts.md`
 
 ## 3. Layout UI (F9.2)
 

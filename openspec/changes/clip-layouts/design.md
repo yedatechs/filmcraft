@@ -25,13 +25,18 @@ exactly like `effects.setParam`. One undo step per command.
 | Command | Params | Effect |
 |---|---|---|
 | `layout.place` | `at: topLeft\|topRight\|bottomLeft\|bottomRight\|top\|bottom\|left\|right\|center\|full`, `size: 25` (% of the frame width the visible box gets; ignored for `full`), `margin: 3` (% of the frame width from the edges) | Sets Motion `scale` (uniform; `scale_width` left alone, `uniform_scale` true) and `position` so the visible box lands there. `full` fits the whole source in the frame, centred (scale = min fit), shape untouched. Sizing uses the visible box, so a circle sized 25 % is a circle whose diameter is 25 % of the frame width. |
-| `layout.shape` | `shape: circle\|rounded\|square\|free`, `radius: 12` (% of the visible box's shorter side, `rounded` only) | Replaces the clip's `Layout shape` mask on the Opacity effect (adds the effect's mask list entry; Opacity is intrinsic). `circle`: `MaskPath::ellipse` inscribed in the central square of the source. `square`: a 4-vertex path of the central square. `rounded`: a Bezier rounded rectangle of the whole source. `free`: removes the `Layout shape` mask (other masks stay). The clip's place is kept: after a shape change the visible box is re-placed where its centre was, same width. |
+| `layout.shape` | `shape: circle\|rounded\|square\|free`, `radius: 12` (% of the visible box's shorter side, `rounded` only) | Replaces the clip's `Layout shape` mask on the Opacity effect (adds the effect's mask list entry; Opacity is intrinsic). `circle`: `MaskPath::ellipse` inscribed in the central square of the source. `square`: a 4-vertex path of the central square. `rounded`: a Bezier rounded rectangle of the whole source. `free`: removes the `Layout shape` mask (other masks stay). The clip's place is kept: after a shape change the visible box keeps its width and the edges its place touches (a bottom-right clip stays in the bottom-right corner; a custom box keeps its centre; Full stays Full). |
 | `layout.swap` | `clips: [a, b]?` (default: the two top-most video clips visible at the playhead) | The two clips exchange place and shape (Motion position/scale and the `Layout shape` mask). |
 | `layout.inspect` | `clips?` | Per clip: `{clip, at (preset name or "custom"), size, margin, shape, radius, box: [x, y, w, h]}` in frame pixels. Read-only; drives the UI's checkmarks and tests. |
 | `layout.pick` | `x, y` (frame pixels), `time?` | The video clips whose visible box contains the point at the playhead, top track first: `{clips: [id…]}`. Read-only; the monitor click uses it and cycles on repeated clicks. |
 
-Geometry lives in `filmcraft_edit::layout` (pure functions, unit-tested): `visible_box`,
-`place_transform(frame, source, shape, at, size, margin) -> (position, scale)`, `nearest_preset`.
+Geometry lives in `filmcraft_edit::layout` (pure functions, unit-tested; points are `(f64, f64)`
+because the edit crate does not depend on filmcraft_geom): `Pose`, `visible_box`, `place`, `place_box`,
+`refit`, `shape_path` / `shape_of_path`, `nearest_place` / `infer_place`. `layout.swap` and `layout.pick`
+are enabled with any open sequence (their defaults need no selection); the others need a selected or
+passed video clip and refuse graphic clips. Known limits (rotation of non-circle shapes, static scale
+when only position is animated, 1 % preset tolerance) are listed in `.frugal-fable/layout/REPORT.md`
+and `docs/layouts.md`.
 Engine tests: place every preset and read the box back through `layout.inspect`; circle then
 place keeps the circle round; swap is an involution; undo restores; pick returns top-most first.
 
