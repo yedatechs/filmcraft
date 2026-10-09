@@ -58,6 +58,29 @@ Without `speech-download`, `transcript.downloadModel` is disabled the same way. 
 still be imported with `transcript.set` and edited with every other command. Hosts and tests can
 install any recogniser in `Session::transcriber`, which enables transcription in any build.
 
+### whisper.cpp (your own models)
+
+Settings ▸ Media Analysis & Transcription ▸ **Speech engine** can switch from the built-in
+Whisper to **whisper.cpp**: FilmCraft then runs the command you name (`whisper-cli` from Homebrew,
+or a full path) with any ggml model file you point it at (`ggml-large-v3-turbo.bin`, for
+example), entirely on this computer, and reads back its word-level JSON
+(`filmcraft_speech::external`). This works in every native build, including releases built
+without the `whisper` feature, because the engine builds the recogniser from the preferences at
+run time (`mediaAnalysis.speechEngine`, `whisperCppCommand`, `whisperCppModel`, `whisperCppArgs`).
+
+- The audio goes to a temporary 16 kHz WAV file that is deleted afterwards; the command is run
+  with `-ojf -ml 1 -sow` so every segment is one word with millisecond offsets and a token
+  probability, which becomes the word's confidence. Punctuation-only segments attach to the
+  word before. Speaker labelling and word tightening are the same as for the built-in model.
+- The command is polled while it runs, so Cancel works and a stuck command times out.
+- Errors are specific: command not found (GUI apps don't see Homebrew's PATH, so the usual
+  locations are searched too), model not found, the command's own stderr when it fails, or no
+  JSON output when the build lacks `-ojf`.
+- Transcripts record `whisper.cpp:<model file stem>` as their `source`. `transcript.models`
+  reports the engine and whether the whisper.cpp settings are complete (`whisperCpp.ready`).
+- Not on the web build (no processes there); choosing the engine there disables transcription
+  with that reason.
+
 ### Models
 
 Weights are **never** bundled or committed. They are downloaded on request into

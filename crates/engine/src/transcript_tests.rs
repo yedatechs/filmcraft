@@ -179,3 +179,57 @@ fn generate_without_a_transcriber() {
     let r = s.execute("transcript.generate", json!({})).unwrap();
     assert!(r["items"].as_array().unwrap().len() >= 2, "{r}");
 }
+
+/// The whisper.cpp engine from Settings: a fake `whisper-cli` (a shell script) stands in for the
+/// real one, so this runs in CI without a model. The settings are validated, the command line and
+/// output file round-trip, and every failure has a reason the user can act on.
+#[cfg(unix)]
+#[test]
+fn whisper_cpp_engine_from_settings() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut s, item, _) = session();
+    s.transcriber = None;
+    let dir = crate::media_test_util::tmp_dir("whisper-cpp");
+    let set = |s: &mut Session, k: &str, v: serde_json::Value| s.execute("prefs.set", json!({"key": k, "value": v})).unwrap();
+    // selecting the engine without a model: disabled, with the reason
+    set(&mut s, "mediaAnalysis.speechEngine", json!("whisperCpp"));
+    let why = crate::transcript::can_transcribe(&s).unwrap_err();
+    assert!(why.contains("model path is not set"), "{why}");
+    assert_eq!(s.execute("transcript.models", json!({})).unwrap()["whisperCpp"]["ready"], json!(false));
+    // a model that does not exist: enabled (cheap check), but the run says what is missing
+    set(&mut s, "mediaAnalysis.whisperCppModel", json!(dir.join("missing.bin").to_string_lossy()));
+    assert!(s.is_enabled("transcript.generate"));
+    let e = s.execute("transcript.generate", json!({"items": [item.0]})).unwrap_err().to_string();
+    assert!(e.contains("model") && e.contains("was not found"), "{e}");
+    // a command that does not exist
+    let model = dir.join("ggml-fake.bin");
+    std::fs::write(&model, b"weights").unwrap();
+    set(&mut s, "mediaAnalysis.whisperCppModel", json!(model.to_string_lossy()));
+    set(&mut s, "mediaAnalysis.whisperCppCommand", json!("filmcraft-no-such-whisper-zzz"));
+    let e = s.execute("transcript.generate", json!({"items": [item.0]})).unwrap_err().to_string();
+    assert!(e.contains("not found on PATH"), "{e}");
+    // the fake command writes two words and echoes the language flag it got
+    let script = dir.join("fake-whisper-cli");
+    let body = "#!/bin/sh\nout=\"\"\nlang=\"\"\nwhile [ $# -gt 0 ]; do\n  [ \"$1\" = \"-of\" ] && out=\"$2\"\n  [ \"$1\" = \"-l\" ] && lang=\"$2\"\n  shift\ndone\ncat > \"$out.json\" <<J\n{\"result\":{\"language\":\"$lang\"},\"transcription\":[\n{\"offsets\":{\"from\":200,\"to\":500},\"text\":\" Hello\",\"tokens\":[{\"text\":\" Hello\",\"p\":0.9}]},\n{\"offsets\":{\"from\":600,\"to\":900},\"text\":\" world\",\"tokens\":[{\"text\":\" world\",\"p\":0.7}]},\n{\"offsets\":{\"from\":900,\"to\":900},\"text\":\".\",\"tokens\":[{\"text\":\".\",\"p\":0.9}]}]}\nJ\n";
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    set(&mut s, "mediaAnalysis.whisperCppCommand", json!(script.to_string_lossy()));
+    set(&mut s, "mediaAnalysis.whisperCppArgs", json!("-bs 5 --prompt 'two words'"));
+    set(&mut s, "mediaAnalysis.speakerLabeling", json!("off"));
+    assert_eq!(s.execute("transcript.models", json!({})).unwrap()["whisperCpp"]["ready"], json!(true));
+    let r = s.execute("transcript.generate", json!({"items": [item.0], "language": "de"})).unwrap();
+    assert_eq!(r["items"][0]["source"], json!("whisper.cpp:ggml-fake"));
+    assert_eq!(r["items"][0]["language"], json!("de"), "the language flag reached the command: {r}");
+    let t = &s.project.transcripts[&item];
+    let texts: Vec<&str> = t.words.iter().map(|w| w.text.as_str()).collect();
+    assert_eq!(texts, ["Hello", "world."]);
+    assert!(t.words[0].start < t.words[1].start && t.words[1].end <= t.words.last().unwrap().end);
+    assert!((t.words[1].confidence - 0.7).abs() < 1e-6);
+    assert!(s.execute("edit.undo", json!({})).is_ok());
+    assert!(!s.project.transcripts.contains_key(&item), "Transcribe is one undo step");
+    // back to the built-in engine: the old behaviour
+    set(&mut s, "mediaAnalysis.speechEngine", json!("builtin"));
+    assert_eq!(s.is_enabled("transcript.generate"), filmcraft_speech::available());
+    assert!(s.execute("prefs.set", json!({"key": "mediaAnalysis.speechEngine", "value": "cloud"})).is_err(), "unknown engines are rejected");
+    let _ = std::fs::remove_dir_all(&dir);
+}

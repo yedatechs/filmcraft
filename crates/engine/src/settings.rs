@@ -333,6 +333,15 @@ pub struct MediaAnalysisPrefs {
     pub default_language: String,
     /// Speech model (`transcript.models`).
     pub whisper_model: String,
+    /// Speech engine: `builtin` (the catalogue model above, feature `whisper`) | `whisperCpp`
+    /// (the user's whisper.cpp command and ggml model below; native builds).
+    pub speech_engine: String,
+    /// whisper.cpp command: a name on PATH (`whisper-cli`) or a full path.
+    pub whisper_cpp_command: String,
+    /// whisper.cpp ggml model file (`ggml-large-v3-turbo.bin`).
+    pub whisper_cpp_model: String,
+    /// Extra whisper.cpp arguments (shell-style, quotes allowed).
+    pub whisper_cpp_args: String,
 }
 
 impl Default for MediaAnalysisPrefs {
@@ -346,6 +355,10 @@ impl Default for MediaAnalysisPrefs {
             language_auto_detect: false,
             default_language: "en".into(),
             whisper_model: filmcraft_speech::models::DEFAULT_MODEL.into(),
+            speech_engine: "builtin".into(),
+            whisper_cpp_command: "whisper-cli".into(),
+            whisper_cpp_model: String::new(),
+            whisper_cpp_args: String::new(),
         }
     }
 }
@@ -646,6 +659,8 @@ const LANGUAGES: &[(&str, &str)] = &[
 ];
 const MODELS: &[(&str, &str)] =
     &[("whisper-tiny", "Whisper tiny (fastest)"), ("whisper-base", "Whisper base (balanced)"), ("whisper-small", "Whisper small (most accurate)")];
+const SPEECH_ENGINES: &[(&str, &str)] =
+    &[("builtin", "Built-in Whisper (downloaded model above)"), ("whisperCpp", "whisper.cpp command (your own ggml model, runs locally)")];
 const CACHE_MGMT: &[(&str, &str)] = &[
     ("never", "Do not delete cache files automatically"),
     ("olderThan", "Automatically delete cache files older than"),
@@ -902,7 +917,14 @@ static CATEGORIES: &[Category] = &[
                     b("mediaAnalysis.languageAutoDetect", "Enable language auto-detection", true),
                     f("mediaAnalysis.defaultLanguage", "Default language", Kind::Choice(LANGUAGES), true),
                     f("mediaAnalysis.whisperModel", "Speech model", Kind::Choice(MODELS), true),
+                    f("mediaAnalysis.speechEngine", "Speech engine", Kind::Choice(SPEECH_ENGINES), true),
+                    f("mediaAnalysis.whisperCppCommand", "whisper.cpp command", Kind::Path, true),
+                    f("mediaAnalysis.whisperCppModel", "whisper.cpp model (ggml .bin)", Kind::Path, true),
+                    f("mediaAnalysis.whisperCppArgs", "whisper.cpp extra arguments", Kind::Text, true),
                 ],
+            ),
+            Row::Note(
+                "The whisper.cpp engine runs the command you name (for example Homebrew's whisper-cli) with any ggml model, such as large-v3-turbo, entirely on this computer. It works in every build, including releases without the built-in Whisper.",
             ),
         ],
     },

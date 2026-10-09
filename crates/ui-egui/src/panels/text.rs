@@ -275,7 +275,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let note = if filmcraft_speech_available(app) {
             "Speech-to-text turns the dialogue into editable text."
         } else {
-            "This build has no speech-to-text; import a transcript with transcript.set."
+            "This build has no speech-to-text; choose the whisper.cpp engine in Settings, or import a transcript with transcript.set."
         };
         ui.painter().text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, note, Tokens::ui(12.0), t.text_dim);
         let r = Rect::from_center_size(c + vec2(0.0, 26.0), vec2(200.0, 26.0));
@@ -369,7 +369,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
 }
 
 fn filmcraft_speech_available(app: &FilmcraftApp) -> bool {
-    app.session.transcriber.is_some() || filmcraft_engine::transcript::speech_available()
+    filmcraft_engine::transcript::can_transcribe(&app.session).is_ok()
 }
 
 fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: usize, actions: &mut Vec<(String, Value)>) {

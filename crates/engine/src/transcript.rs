@@ -57,13 +57,44 @@ fn has_transcripts(s: &Session) -> std::result::Result<(), String> {
 }
 
 /// Why speech-to-text can't run in this build (no installed transcriber, built without `whisper`).
-pub(crate) const NO_SPEECH: &str =
-    "speech-to-text is not available in this build (built without the `whisper` feature); import a transcript with transcript.set instead";
+pub(crate) const NO_SPEECH: &str = "speech-to-text is not available in this build (built without the `whisper` feature); choose the whisper.cpp engine in Settings ▸ Media Analysis & Transcription, or import a transcript with transcript.set";
 
-/// `transcript.generate` can run: a host installed a transcriber or the build has speech-to-text
-/// (#97: it reported enabled and then always failed).
-pub(crate) fn can_transcribe(s: &Session) -> std::result::Result<(), String> {
-    if s.transcriber.is_some() || speech_available() { Ok(()) } else { Err(NO_SPEECH.into()) }
+/// The whisper.cpp engine is selected in Settings ▸ Media Analysis & Transcription.
+fn external_selected(s: &Session) -> bool {
+    s.prefs.media_analysis.speech_engine == "whisperCpp"
+}
+
+/// The whisper.cpp recogniser from the preferences (engine `whisperCpp`), or why it can't be
+/// built. Cheap: the command and model files are checked when it runs, not here.
+#[cfg(not(target_arch = "wasm32"))]
+fn external_transcriber(s: &Session) -> std::result::Result<filmcraft_speech::external::ExternalTranscriber, String> {
+    let ma = &s.prefs.media_analysis;
+    if ma.whisper_cpp_model.trim().is_empty() {
+        return Err("the whisper.cpp model path is not set (Settings ▸ Media Analysis & Transcription)".into());
+    }
+    if ma.whisper_cpp_command.trim().is_empty() {
+        return Err("the whisper.cpp command is not set (Settings ▸ Media Analysis & Transcription)".into());
+    }
+    let mut t = filmcraft_speech::external::ExternalTranscriber::new(ma.whisper_cpp_command.trim(), ma.whisper_cpp_model.trim());
+    t.args = filmcraft_speech::external::split_args(&ma.whisper_cpp_args);
+    Ok(t)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn external_transcriber(_: &Session) -> std::result::Result<std::sync::Arc<dyn Transcriber>, String> {
+    Err("the whisper.cpp engine is not available on the web".into())
+}
+
+/// `transcript.generate` can run: a host installed a transcriber, the whisper.cpp engine is set
+/// up, or the build has speech-to-text (#97: it reported enabled and then always failed).
+pub fn can_transcribe(s: &Session) -> std::result::Result<(), String> {
+    if s.transcriber.is_some() {
+        return Ok(());
+    }
+    if external_selected(s) {
+        return external_transcriber(s).map(|_| ());
+    }
+    if speech_available() { Ok(()) } else { Err(NO_SPEECH.into()) }
 }
 
 /// `transcript.downloadModel` can run: built with `speech-download` (#98).
@@ -127,10 +158,21 @@ fn speech_err(e: SpeechError) -> EngineError {
     EngineError::Other(e.to_string())
 }
 
-/// The transcriber to use: the installed one, else the named catalogue model.
+/// The transcriber to use: the installed one, else the whisper.cpp engine from the preferences,
+/// else the named catalogue model.
 fn transcriber(s: &Session, p: &Value) -> Result<Arc<dyn Transcriber>> {
     if let Some(t) = &s.transcriber {
         return Ok(t.clone());
+    }
+    if external_selected(s) {
+        let t = external_transcriber(s).map_err(EngineError::Other)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            t.check().map_err(speech_err)?;
+            return Ok(Arc::new(t));
+        }
+        #[cfg(target_arch = "wasm32")]
+        return Ok(t);
     }
     // Settings ▸ Media Analysis & Transcription ▸ Speech model
     let model = str_p(p, "model").unwrap_or(&s.prefs.media_analysis.whisper_model);
@@ -401,11 +443,17 @@ fn create_captions(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"track": tid.0, "captions": n}))
 }
 
-fn models(_: &mut Session, _: &Value) -> Result<Value> {
+fn models(s: &mut Session, _: &Value) -> Result<Value> {
     let dir = models_dir();
+    let ma = &s.prefs.media_analysis;
     Ok(json!({
         "available": filmcraft_speech::available(),
         "default": filmcraft_speech::models::DEFAULT_MODEL,
+        "engine": ma.speech_engine,
+        "whisperCpp": {
+            "command": ma.whisper_cpp_command, "model": ma.whisper_cpp_model, "args": ma.whisper_cpp_args,
+            "ready": external_transcriber(s).is_ok(),
+        },
         "dir": dir.as_ref().map(|d| d.to_string_lossy().to_string()),
         "models": filmcraft_speech::models::catalogue().iter().map(|m| json!({
             "id": m.id, "name": m.name, "multilingual": m.multilingual, "description": m.description,

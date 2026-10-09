@@ -8,6 +8,8 @@
 //!   `download`) the verified downloader. Weights are **never** bundled or committed.
 //! - [`whisper`] (feature `whisper`): Whisper inference in pure Rust on candle, with timestamp
 //!   decoding, language detection and word-level timestamps from cross-attention alignment (DTW).
+//! - [`external`] (native): recognition through the user's own whisper.cpp command (`whisper-cli`)
+//!   and any ggml model, for builds without `whisper` and for larger models than the catalogue.
 //! - [`diarize`]: speaker labelling by clustering per-chunk MFCC statistics (classical, no model).
 //! - [`mel`]: the log-mel front end shared by Whisper and diarization.
 //! - [`vad`]: energy-based tightening of word bounds (keeps pauses out of words).
@@ -17,6 +19,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod diarize;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod external;
 pub mod mel;
 pub mod models;
 pub mod vad;
