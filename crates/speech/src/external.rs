@@ -89,6 +89,11 @@ impl ExternalTranscriber {
         let mut cmd = Command::new(exe);
         cmd.arg("-m").arg(&self.model).arg("-f").arg(&wav).arg("-of").arg(&out);
         cmd.args(["-ojf", "-np", "-ml", "1", "-sow", "-l", language]);
+        // Token-level timestamps (DTW over the cross-attention) need flash attention off; without
+        // them whisper.cpp only has segment boundaries, which put a pause inside the next word.
+        if let Some(preset) = dtw_preset(&self.model) {
+            cmd.args(["-nfa", "-dtw", preset]);
+        }
         if self.threads > 0 {
             cmd.arg("-t").arg(self.threads.to_string());
         }
@@ -180,6 +185,30 @@ impl Transcriber for ExternalTranscriber {
     }
 }
 
+/// whisper.cpp's `-dtw` alignment-heads preset for a ggml model file, from its name
+/// (`ggml-large-v3-turbo.bin` → `large.v3.turbo`, `ggml-tiny.en.bin` → `tiny.en`); None for a
+/// name it does not know (quantised or custom models), which then runs without DTW.
+pub fn dtw_preset(model: &Path) -> Option<&'static str> {
+    let stem = model.file_stem()?.to_string_lossy().to_lowercase();
+    let name = stem.strip_prefix("ggml-").unwrap_or(&stem);
+    let name = name.split(['-', '.', '_']).filter(|p| !p.is_empty()).collect::<Vec<_>>();
+    match name.as_slice() {
+        ["tiny"] => Some("tiny"),
+        ["tiny", "en"] => Some("tiny.en"),
+        ["base"] => Some("base"),
+        ["base", "en"] => Some("base.en"),
+        ["small"] => Some("small"),
+        ["small", "en"] => Some("small.en"),
+        ["medium"] => Some("medium"),
+        ["medium", "en"] => Some("medium.en"),
+        ["large", "v1"] => Some("large.v1"),
+        ["large", "v2"] => Some("large.v2"),
+        ["large", "v3"] | ["large"] => Some("large.v3"),
+        ["large", "v3", "turbo"] => Some("large.v3.turbo"),
+        _ => None,
+    }
+}
+
 /// A fresh private directory for one run's files.
 fn scratch_dir() -> Result<PathBuf, SpeechError> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -238,6 +267,17 @@ pub fn parse_output(bytes: &[u8], max: Tick) -> Result<(Vec<Word>, Option<String
             continue;
         }
         let Some((a, b)) = offsets(seg, max) else { continue };
+        // With DTW, a token's time is where the decoder emitted it (about the word's end): the
+        // word runs from the previous word's end to there, and VAD tightening finds the voiced
+        // part. Segment offsets alone put the pause before a word inside it.
+        let (a, b) = match dtw_end(seg, max) {
+            Some(e) if e > a => {
+                let prev = words.last().map(|w: &Word| w.end).unwrap_or(a);
+                let start = prev.max(a).min(e);
+                (start, e)
+            }
+            _ => (a, b),
+        };
         let confidence = confidence(seg);
         if text.chars().all(|c| !c.is_alphanumeric()) {
             if let Some(last) = words.last_mut() {
@@ -273,6 +313,20 @@ fn offsets(seg: &Value, max: Tick) -> Option<(Tick, Tick)> {
     }
     let b = Tick(to.checked_mul(TICKS_PER_MS)?.min(max.0));
     Some((a, b.max(a)))
+}
+
+/// The latest DTW token time of a segment (`t_dtw`, 10 ms units; -1 = none) as ticks within
+/// `0..max`.
+fn dtw_end(seg: &Value, max: Tick) -> Option<Tick> {
+    let tokens = seg.get("tokens").and_then(Value::as_array)?;
+    let t = tokens
+        .iter()
+        .filter(|t| !t.get("text").and_then(Value::as_str).is_some_and(|s| s.starts_with("[_") || s.starts_with("<|")))
+        .filter_map(|t| t.get("t_dtw").and_then(Value::as_i64))
+        .filter(|t| *t >= 0)
+        .max()?;
+    let ticks = t.checked_mul(TICKS_PER_MS)?.checked_mul(10)?;
+    Some(Tick(ticks.min(max.0)))
 }
 
 /// Mean token probability of a segment (1.0 when it reports none).
@@ -345,6 +399,42 @@ mod tests {
         assert_eq!(w[0].start, Tick(320 * TICKS_PER_MS));
         assert_eq!(w[0].end, Tick(400 * TICKS_PER_MS));
         assert!((w[0].confidence - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dtw_times_bound_words_and_presets_follow_the_model_name() {
+        // whisper.cpp offsets put the pause (1.28–2.45) inside the second "welcome"; its DTW time
+        // (2.74 s) says where it really ended, so it runs from the previous end to there
+        let seg_dtw = |text: &str, from: i64, to: i64, dtw: i64| {
+            format!(r#"{{"offsets":{{"from":{from},"to":{to}}},"text":"{text}","tokens":[{{"text":"{text}","p":0.9,"t_dtw":{dtw}}}]}}"#)
+        };
+        let bytes = doc(&[
+            seg_dtw(" channel", 870, 1280, 124),
+            seg_dtw(" welcome", 1280, 2450, 274),
+            seg_dtw(" back", 2450, 2460, 302),
+            seg_dtw(" to", 2460, 2670, -1),
+        ]);
+        let (w, _) = parse_output(&bytes, seconds_tick(10.0)).unwrap();
+        assert_eq!(w[0].end, Tick(1240 * TICKS_PER_MS));
+        assert_eq!((w[1].start, w[1].end), (Tick(1280 * TICKS_PER_MS), Tick(2740 * TICKS_PER_MS)));
+        assert_eq!((w[2].start, w[2].end), (Tick(2740 * TICKS_PER_MS), Tick(3020 * TICKS_PER_MS)), "a 10 ms token widens to its DTW span");
+        assert_eq!((w[3].start, w[3].end), (Tick(2460 * TICKS_PER_MS), Tick(2670 * TICKS_PER_MS)), "no DTW: the offsets stand (normalize fixes the overlap)");
+        // a DTW time beyond the audio is clipped, a negative one ignored
+        let bytes = doc(&[seg_dtw(" late", 100, 200, 999_999), seg_dtw(" neg", 300, 400, -7)]);
+        let (w, _) = parse_output(&bytes, seconds_tick(1.0)).unwrap();
+        assert_eq!(w[0].end, seconds_tick(1.0));
+        assert_eq!(w[1].end, Tick(400 * TICKS_PER_MS));
+        for (file, preset) in [
+            ("ggml-large-v3-turbo.bin", Some("large.v3.turbo")),
+            ("/x/ggml-tiny.en.bin", Some("tiny.en")),
+            ("ggml-base.bin", Some("base")),
+            ("ggml-large-v3-turbo-q5_0.bin", None),
+            ("ggml-medium.en.bin", Some("medium.en")),
+            ("GGML-LARGE-V2.BIN", Some("large.v2")),
+            ("whatever.bin", None),
+        ] {
+            assert_eq!(dtw_preset(Path::new(file)), preset, "{file}");
+        }
     }
 
     #[test]

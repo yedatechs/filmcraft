@@ -107,8 +107,13 @@ run time (`mediaAnalysis.speechEngine`, `whisperCppCommand`, `whisperCppModel`, 
 
 - The audio goes to a temporary 16 kHz WAV file that is deleted afterwards; the command is run
   with `-ojf -ml 1 -sow` so every segment is one word with millisecond offsets and a token
-  probability, which becomes the word's confidence. Punctuation-only segments attach to the
-  word before. Speaker labelling and word tightening are the same as for the built-in model.
+  probability, which becomes the word's confidence, and, when the model file's name maps to one
+  of whisper.cpp's alignment-head presets (`ggml-large-v3-turbo.bin` → `large.v3.turbo`), with
+  `-nfa -dtw <preset>` for token-level timestamps (DTW needs flash attention off). Segment
+  offsets alone put the pause before a word inside that word; with DTW a word runs from the
+  previous word's end to its own emission time, and the energy-based tightening then keeps its
+  voiced part. Punctuation-only segments attach to the word before. Speaker labelling and word
+  tightening are the same as for the built-in model.
 - The command is polled while it runs, so Cancel works and a stuck command times out.
 - Errors are specific: command not found (GUI apps don't see Homebrew's PATH, so the usual
   locations are searched too), model not found, the command's own stderr when it fails, or no

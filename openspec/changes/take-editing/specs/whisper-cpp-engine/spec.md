@@ -5,7 +5,7 @@ Settings ▸ Media Analysis & Transcription SHALL offer a speech engine choice o
 
 #### Scenario: Engine chosen, model set
 - **WHEN** `mediaAnalysis.speechEngine` is `whisperCpp` and `whisperCppModel` names an existing file and the command resolves
-- **THEN** `transcript.generate` runs the command on the clip's mono 16 kHz audio and stores a transcript whose `source` is `whisper.cpp:<model file stem>` with word times and confidences
+- **THEN** `transcript.generate` runs the command on the clip's mono 16 kHz audio (with `-nfa -dtw <preset>` when the model name maps to a whisper.cpp alignment preset, so word times come from token-level DTW) and stores a transcript whose `source` is `whisper.cpp:<model file stem>` with word times and confidences
 
 #### Scenario: Engine chosen, model missing
 - **WHEN** `speechEngine` is `whisperCpp` and `whisperCppModel` is empty

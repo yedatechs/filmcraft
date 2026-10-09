@@ -34,7 +34,7 @@
 
 ## 6. Acceptance (owner)
 
-- [ ] 6.1 Real 5–10 min recording: transcribe (whisper.cpp), detect takes, ≥ 80 % grouped right, fix the rest in the UI
+- [ ] 6.1 (synthetic 15 s recording with 3 + 2 passes: both groups found, last take kept, switching and filler cuts work headlessly) Real 5–10 min recording: transcribe (whisper.cpp), detect takes, ≥ 80 % grouped right, fix the rest in the UI
 - [ ] 6.2 Cross out / restore / cycle with undo per step; filler and pause cleanup restorable
 - [ ] 6.3 Save, reopen; v12 project still opens
 - [ ] 6.4 FCPXML/OTIO export opens in Resolve (markers for labels: later change)
