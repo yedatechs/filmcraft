@@ -118,24 +118,33 @@ fn ids_p(p: &Value, k: &str) -> Option<Vec<ItemId>> {
 /// Items to transcribe: `items` / `item`, else the Project panel selection, else the media of the
 /// active sequence's enabled audio clips. Subclips resolve to their media; duplicates are removed.
 fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
-    let mut raw = ids_p(p, "items").or_else(|| u64_p(p, "item").map(|i| vec![ItemId(i)])).unwrap_or_default();
-    if raw.is_empty() {
-        raw = s.state.project_selection.clone();
+    let dedup = |raw: Vec<ItemId>| {
+        let mut out: Vec<ItemId> = Vec::new();
+        for i in raw {
+            if let Some(m) = media_item(s, i)
+                && !out.contains(&m)
+            {
+                out.push(m);
+            }
+        }
+        out
+    };
+    let has_audio = |m: &ItemId| s.source(*m).is_some_and(|src| src.info().has_audio());
+    if let Some(raw) = ids_p(p, "items").or_else(|| u64_p(p, "item").map(|i| vec![ItemId(i)])) {
+        return dedup(raw);
     }
-    if raw.is_empty()
-        && let Some(q) = s.active_sequence()
-    {
-        raw = q.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|it| it.enabled).map(|it| it.item).collect();
-    }
-    let mut out = Vec::new();
-    for i in raw {
-        if let Some(m) = media_item(s, i)
-            && !out.contains(&m)
-        {
-            out.push(m);
+    // the Project panel selection, when it has something with audio (a selected screen recording
+    // without a sound track must not block the Text panel's Transcribe); `sequence: true` skips it
+    if !bool_p(p, "sequence").unwrap_or(false) {
+        let picked = dedup(s.state.project_selection.clone());
+        if picked.iter().any(has_audio) {
+            return picked;
         }
     }
-    out
+    match s.active_sequence() {
+        Some(q) => dedup(q.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|it| it.enabled).map(|it| it.item).collect()),
+        None => Vec::new(),
+    }
 }
 
 /// Mono 16 kHz audio of a media item (None: no audio).
@@ -284,7 +293,11 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
         work.push((item, name, audio));
     }
     if work.is_empty() {
-        return Err(EngineError::Other("none of the clips has audio to transcribe".into()));
+        let names: Vec<String> = skipped.iter().filter_map(|i| s.project.item(ItemId(*i)).map(|it| it.name.clone())).collect();
+        return Err(EngineError::Other(format!(
+            "none of the clips has audio to transcribe ({}); put a clip with sound on an audio track, or select one in the Project panel",
+            if names.is_empty() { "no clips".to_string() } else { names.join(", ") }
+        )));
     }
     let seconds: f64 = work.iter().map(|w| w.2.len() as f64 / filmcraft_speech::SAMPLE_RATE as f64).sum();
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
@@ -739,7 +752,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.generate",
             "Transcribe…",
             &["Sequence", "Transcript"],
-            r#"{"items":[id]?,"model":"whisper-base"?,"language":"en|auto"?,"diarize":bool?,"maxSpeakers":n?,"background":bool=false}"#,
+            r#"{"items":[id]?,"sequence":bool=false,"model":"whisper-base"?,"language":"en|auto"?,"diarize":bool?,"maxSpeakers":n?,"background":bool=false}"#,
             can_transcribe,
             generate,
             true,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::Session;
-use filmcraft_project::{ItemId, Transcript, Word};
+use filmcraft_project::{ItemId, ItemKind, Transcript, Word};
 use filmcraft_speech::FixedTranscriber;
 use filmcraft_time::Tick;
 
@@ -305,4 +305,33 @@ fn generate_in_the_background_stores_the_transcript_when_polled() {
     let r = s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
     assert_eq!(r["items"][0]["words"], 6, "{r}");
     assert!(s.transcribe_jobs.is_empty());
+}
+
+#[test]
+fn a_selected_clip_without_audio_does_not_block_transcribing_the_sequence() {
+    let (mut s, item, _) = session();
+    // something selected in the Project panel that has no sound: a graphic, or a video-only item
+    let silent = s
+        .project
+        .items
+        .values()
+        .find(|it| match &it.kind {
+            ItemKind::Graphic { .. } => true,
+            ItemKind::Media(_) => s.source(it.id).is_none_or(|src| !src.info().has_audio()),
+            _ => false,
+        })
+        .map(|it| it.id)
+        .expect("the demo project has an item without audio");
+    s.execute("project.select", json!({"items": [silent.0]})).unwrap();
+    assert_eq!(s.state.project_selection, vec![silent]);
+    // the Text panel's button: the sequence's audio clips, whatever is selected
+    let r = s.execute("transcript.generate", json!({"sequence": true})).unwrap();
+    assert_eq!(r["items"][0]["item"], item.0, "{r}");
+    s.execute("transcript.delete", json!({})).unwrap();
+    // and even without `sequence`, a selection with no audio falls back to the sequence
+    let r = s.execute("transcript.generate", json!({})).unwrap();
+    assert_eq!(r["items"][0]["item"], item.0, "{r}");
+    // an explicit silent item is still an error
+    let e = s.execute("transcript.generate", json!({"items": [silent.0]})).unwrap_err().to_string();
+    assert!(e.contains("none of the clips has audio") || e.contains("nothing to transcribe"), "{e}");
 }
