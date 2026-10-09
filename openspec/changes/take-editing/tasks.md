@@ -7,21 +7,23 @@
 
 ## 2. Data model
 
-- [ ] 2.1 `Transcript::takes`, `TakeGroup`, `Take`, `TakeLabel` with normalisation and checks, unit tests (`crates/project/src/transcript.rs`)
-- [ ] 2.2 Schema v13: `v12_to_v13` no-op, `v12-minimal.fcproj` fixture, load test (`crates/format`); `docs/project-files.md` version note
+- [x] 2.1 `Transcript::takes`, `TakeGroup`, `Take`, `TakeLabel` with normalisation and checks, unit tests (`crates/project/src/transcript.rs`)
+- [x] 2.2 Schema v13: `v12_to_v13` no-op, `v12-minimal.fcproj` fixture, load test (`crates/format`); `docs/project-files.md` version note
 
 ## 3. Edit algebra
 
-- [ ] 3.1 `cut_spans`, `live_ranges` in `crates/edit/src/transcript.rs` with tests on the interview fixture
-- [ ] 3.2 `restore_media` / `restore_cut` (grow, lengthen-or-split, shift, insert fallback, captions) with tests incl. an extract/restore round-trip property
-- [ ] 3.3 `crates/edit/src/takes.rs`: `utterances`, `similarity`, `detect`, `merge`, `split`, `live_fraction` with tests
+- [x] 3.1 `cut_spans`, `live_ranges` in `crates/edit/src/transcript.rs` with tests on the interview fixture
+- [x] 3.2 `restore_media` / `restore_cut` (grow, lengthen-or-split, shift, insert fallback, captions, re-grow clips Extract split) with tests incl. an extract/restore round-trip property
+- [x] 3.3 `crates/edit/src/takes.rs`: `utterances`, `similarity`, `detect`, `merge`, `split`, `live_fraction` with tests
+- [ ] 3.4 Follow-up: restore does not grow back a clip that lost only its head or only its tail to Extract (a clip starting or ending inside the extracted range); needs a grow-left rule
+- [ ] 3.5 Follow-up: a take's range includes its retake cue words ("okay again, …"); consider starting the take after the stripped cue
 
 ## 4. Engine commands
 
-- [ ] 4.1 `transcript.cuts`, `transcript.restore` (+ tests in `transcript_tests.rs`)
-- [ ] 4.2 `crates/engine/src/takes.rs`: `takes.detect/list/select/next/previous/cross/restore/label/redo/merge/split/add/remove/preview`, registered in `commands.rs` with shortcuts and menu path
-- [ ] 4.3 `crates/engine/src/takes_tests.rs`: happy paths with undo/redo, hostile parameters for every command
-- [ ] 4.4 Docs: `docs/transcripts.md` (cuts, takes), `docs/keyboard.md`, `docs/control-protocol.md` command table
+- [x] 4.1 `transcript.cuts`, `transcript.restore` (+ tests in `takes_tests.rs`)
+- [x] 4.2 `crates/engine/src/takes.rs`: `takes.detect/list/select/next/previous/cross/restore/label/redo/merge/split/add/remove/preview`, registered in `commands.rs` with shortcuts and menu path
+- [x] 4.3 `crates/engine/src/takes_tests.rs`: happy paths with undo/redo, hostile parameters for every command
+- [x] 4.4 Docs: `docs/transcripts.md` (cuts, takes), `docs/keyboard.md` (control-protocol.md has no per-command table)
 
 ## 5. Text panel
 

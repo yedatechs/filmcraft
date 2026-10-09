@@ -14,14 +14,19 @@
 //! reuse the ordinary [`crate::extract`] / [`crate::lift`] edits. Pause and filler-word removal
 //! ([`find_pauses`], [`find_fillers`]) produce many ranges that [`ripple_delete_ranges`] removes in
 //! one pass, right to left. Captions come from [`caption_blocks`].
+//!
+//! What those edits took out stays visible as **cut spans** ([`cut_spans`]): media between two
+//! consecutive clips of the same source on an audio track. Nothing is stored; spans are derived
+//! from the timeline. [`restore_cut`] / [`restore_media`] put media back at a span's anchor (the
+//! inverse of Extract), and [`live_ranges`] tells where a media range is still heard.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use filmcraft_project::{Caption, ClipId, ItemId, Sequence, TrackId, Transcript};
+use filmcraft_project::{Caption, ClipId, ItemId, Sequence, Track, TrackId, TrackItem, Transcript};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 
-use crate::EditCtx;
+use crate::{EditCtx, EditError};
 
 /// A word of the sequence transcript.
 #[derive(Clone, Debug, PartialEq)]
@@ -268,6 +273,289 @@ pub fn ripple_delete_ranges(seq: &mut Sequence, ranges: Vec<TimeRange>, ctx: &mu
         total += r.duration;
     }
     total
+}
+
+/// Whether an audio track item plays speech forwards (the eligibility rule of [`sequence_words`]):
+/// enabled, not reversed, no frame hold, positive speed.
+fn plays_speech(it: &TrackItem) -> bool {
+    it.enabled && !it.reverse && it.frame_hold.is_none() && it.speed > 0.0
+}
+
+/// Media time just after the last one an item plays forwards: `source_in + duration × speed`.
+fn media_end(it: &TrackItem) -> Tick {
+    Tick(it.source_in.0.saturating_add(ticks(it.duration.0 as f64 * it.speed).0))
+}
+
+/// Media that was cut out between two clips of one source on an audio track (what Extract, Remove
+/// Pauses or Remove Filler Words left behind), anchored where it would go back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CutSpan {
+    /// The media item.
+    pub item: ItemId,
+    /// Media time not played.
+    pub media: TimeRange,
+    /// Sequence time where it goes back (the end of `before`).
+    pub at: Tick,
+    /// Audio track index (0 = A1).
+    pub track: usize,
+    /// The clip ending at `at`.
+    pub before: ClipId,
+    /// The next clip of the same media on that track.
+    pub after: ClipId,
+    /// Indices into the media transcript of the words whose midpoint lies inside `media` (empty for
+    /// a removed pause).
+    pub words: std::ops::Range<usize>,
+    /// Index in `sequence_words` of the last live word starting before `at` (where the Text panel
+    /// shows the crossed-out words).
+    pub after_word: Option<usize>,
+}
+
+/// Cut spans of the sequence, sorted by `(at, track)`. For two consecutive clips `a`, `b` of the
+/// same transcribed media on an audio track (clips that play speech, as in [`sequence_words`]),
+/// the media from `a`'s media Out to `b`'s media In is a span when `b` starts later in the media.
+/// Media before the first clip or after the last is not a span. `live` is the sequence transcript
+/// ([`sequence_words`]), used for `after_word`.
+pub fn cut_spans(seq: &Sequence, transcripts: &Transcripts, live: &[SeqWord]) -> Vec<CutSpan> {
+    let mut out = Vec::new();
+    for (ti, track) in seq.audio_tracks.iter().enumerate() {
+        let mut items: Vec<&TrackItem> = track.items.iter().filter(|it| plays_speech(it)).collect();
+        items.sort_by_key(|it| it.start);
+        for p in items.windows(2) {
+            let (Some(a), Some(b)) = (p.first(), p.get(1)) else { continue };
+            if a.item != b.item {
+                continue;
+            }
+            let Some(tr) = transcripts.get(&a.item) else { continue };
+            let from = media_end(a);
+            if b.source_in <= from {
+                continue;
+            }
+            let Some(len) = b.source_in.0.checked_sub(from.0) else { continue };
+            let media = TimeRange::new(from, Tick(len));
+            let at = a.end();
+            out.push(CutSpan {
+                item: a.item,
+                media,
+                at,
+                track: ti,
+                before: a.id,
+                after: b.id,
+                words: tr.words_within(media),
+                after_word: live.partition_point(|w| w.start < at).checked_sub(1),
+            });
+        }
+    }
+    out.sort_by_key(|c| (c.at, c.track));
+    out
+}
+
+/// Timeline ranges (sorted, merged) on which `media` of `item` is played by the audio track clips
+/// that play speech (as in [`sequence_words`]): each clip's share of `media` mapped through its
+/// media In and speed, clamped to the clip. Empty when that media is not heard anywhere.
+pub fn live_ranges(seq: &Sequence, item: ItemId, media: TimeRange) -> Vec<TimeRange> {
+    if media.is_empty() || media.start.0.checked_add(media.duration.0).is_none() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for it in seq.audio_tracks.iter().flat_map(|t| t.items.iter()) {
+        if it.item != item || !plays_speech(it) {
+            continue;
+        }
+        let clip_media = TimeRange::from_bounds(it.source_in, media_end(it).max(it.source_in));
+        let Some(m) = clip_media.intersect(&media) else { continue };
+        let to_tl = |t: Tick| {
+            let off = ticks(t.0.saturating_sub(it.source_in.0) as f64 / it.speed);
+            Tick(it.start.0.saturating_add(off.0)).max(it.start).min(it.end())
+        };
+        let (a, b) = (to_tl(m.start), to_tl(m.end()));
+        if b > a {
+            out.push(TimeRange::from_bounds(a, b));
+        }
+    }
+    merge_ranges(out)
+}
+
+/// Put `media` of `item` back at sequence time `at`, after the clip of that media ending at `at` on
+/// audio track `track` (0 = A1): the inverse of Extract for one media range. Returns the restored
+/// timeline range `[at, at + media.duration)`.
+///
+/// On every unlocked track (and sync-locked caption track): a clip of that media ending at `at`
+/// whose media continues into `media` at 100% grows by it (the clip before, its linked picture),
+/// and so does a 100% clip of other media that Extract split at `at` (the clip starting at `at` is
+/// the same media resuming exactly `media.duration` later: music, B-roll on a ripple track); a
+/// grown clip joins the clip after it when that clip continues it (no edit point is left); a clip spanning
+/// `at` is lengthened when its media allows, else split; everything from `at` moves right. When the
+/// clip on `track` could not grow (part of a span, a speed change), a new 100% clip of `media` is
+/// inserted at `at` with its linked partners. Fails without changing anything when the track does
+/// not exist or is locked, no clip of `item` ends at `at` on it, `media` is empty, shorter than a
+/// frame or outside the media.
+pub fn restore_media(seq: &mut Sequence, item: ItemId, media: TimeRange, at: Tick, track: usize, ctx: &mut EditCtx) -> crate::Result<TimeRange> {
+    restore(seq, item, media, at, track, None, ctx)
+}
+
+/// Restore a cut span ([`restore_media`] of its media at its anchor, after `span.before`). Fails when
+/// `span.before` is no longer on the span's track or no longer ends at the anchor (the span is out
+/// of date).
+pub fn restore_cut(seq: &mut Sequence, span: &CutSpan, ctx: &mut EditCtx) -> crate::Result<TimeRange> {
+    restore(seq, span.item, span.media, span.at, span.track, Some(span.before), ctx)
+}
+
+fn restore(seq: &mut Sequence, item: ItemId, media: TimeRange, at: Tick, track: usize, before: Option<ClipId>, ctx: &mut EditCtx) -> crate::Result<TimeRange> {
+    let audio = seq.audio_tracks.get(track).ok_or_else(|| EditError::Other(format!("no audio track A{}", track.saturating_add(1))))?;
+    if media.is_empty() {
+        return Err(EditError::Nothing);
+    }
+    let dur = media.duration;
+    let media_out = media.start.0.checked_add(dur.0).map(Tick).ok_or(EditError::NoHandles)?;
+    if media.start < (ctx.media_start)(item) || (ctx.media_duration)(item).is_some_and(|d| media_out > d) {
+        return Err(EditError::NoHandles);
+    }
+    if dur < ctx.min_duration {
+        return Err(EditError::TooShort);
+    }
+    if audio.locked {
+        return Err(EditError::Locked);
+    }
+    let template = match before {
+        Some(id) => {
+            let it = audio.item(id).ok_or(EditError::NoItem(id))?;
+            if it.end() != at || it.item != item {
+                return Err(EditError::Other("the cut is out of date: its clip no longer ends where the media goes back".into()));
+            }
+            it.clone()
+        }
+        None => audio
+            .items
+            .iter()
+            .find(|it| it.item == item && it.end() == at)
+            .cloned()
+            .ok_or_else(|| EditError::Other(format!("no clip of this media ends there on A{}", track.saturating_add(1))))?,
+    };
+    // everything after `at` moves right by `dur`: refuse a sequence that would overflow
+    let latest = seq
+        .all_tracks()
+        .flat_map(|t| t.items.iter().map(TrackItem::end).chain(t.transitions.iter().map(|x| x.end())))
+        .chain(seq.caption_tracks.iter().flat_map(|c| c.captions.iter().map(Caption::end)))
+        .fold(at, Tick::max);
+    let Some(end) = at.0.checked_add(dur.0).map(Tick) else { return Err(EditError::Other("the sequence would be too long".into())) };
+    if latest.0.checked_add(dur.0).is_none() {
+        return Err(EditError::Other("the sequence would be too long".into()));
+    }
+    let target = audio.id;
+    let mut work = seq.clone();
+    let mut links = HashMap::new();
+    let mut grown: Vec<ClipId> = Vec::new();
+    let mut audio_grew = false;
+    for tr in work.all_tracks_mut() {
+        if tr.locked {
+            continue;
+        }
+        // 1. grow the clip of this media that ends at `at` and continues into `media`, and any
+        //    other clip that Extract split at this cut: its right piece starts at `at` and
+        //    continues it after a media jump of exactly `dur` (music, B-roll on a ripple track)
+        let forward = |it: &TrackItem| it.speed == 1.0 && !it.reverse && it.frame_hold.is_none();
+        let resumes: Option<(ItemId, Tick)> = tr.items.iter().find(|b| b.start == at && forward(b)).map(|b| (b.item, b.source_in));
+        let mut grew_here: Vec<ClipId> = Vec::new();
+        for it in &mut tr.items {
+            if it.end() != at || !forward(it) {
+                continue;
+            }
+            let restored = it.item == item && media_end(it) == media.start;
+            let was_split = it.item != item && resumes == Some((it.item, Tick(media_end(it).0.saturating_add(dur.0))));
+            if restored || was_split {
+                it.duration = Tick(it.duration.0.saturating_add(dur.0));
+                grew_here.push(it.id);
+            }
+        }
+        if tr.id == target && !grew_here.is_empty() {
+            audio_grew = true;
+        }
+        // 2. lengthen (media allowing) or split a clip spanning `at`
+        let mut split = false;
+        for it in &mut tr.items {
+            if grew_here.contains(&it.id) || !(it.start < at && at < it.end()) {
+                continue;
+            }
+            let room = (ctx.media_duration)(it.item).is_none_or(|d| media_end(it).0.saturating_add(dur.0) <= d.0);
+            if it.speed == 1.0 && !it.reverse && room {
+                it.duration = Tick(it.duration.0.saturating_add(dur.0));
+            } else {
+                split = true;
+            }
+        }
+        if split {
+            crate::split_track_at(tr, at, ctx, &mut links);
+        }
+        // 3. shift
+        crate::shift_track_from(tr, at, dur);
+        for id in &grew_here {
+            join_continuation(tr, *id);
+        }
+        grown.extend(grew_here);
+    }
+    for ct in work.caption_tracks.iter_mut().filter(|c| !c.locked && c.sync_lock) {
+        crate::captions::shift_from(ct, at, dur);
+    }
+    // 4. insert a new clip (and its linked partners) when the clip before could not grow
+    if !audio_grew {
+        let gap = TimeRange::from_bounds(at, end);
+        for tr in work.all_tracks_mut() {
+            if tr.locked {
+                continue;
+            }
+            let src = if tr.id == target {
+                Some(template.clone())
+            } else if template.link.is_some() {
+                tr.items.iter().find(|it| it.end() == at && it.link == template.link).cloned()
+            } else {
+                None
+            };
+            let Some(mut n) = src else { continue };
+            if !crate::track_range_empty(tr, gap) {
+                return Err(EditError::Other(format!("{} has material where the media goes back", tr.name)));
+            }
+            n.id = ClipId(ctx.alloc());
+            n.start = at;
+            n.duration = dur;
+            n.source_in = media.start;
+            n.speed = 1.0;
+            n.reverse = false;
+            n.frame_hold = None;
+            let idx = tr.items.partition_point(|i| i.start <= at);
+            tr.items.insert(idx, n);
+        }
+    }
+    // 5. transitions
+    for tr in work.all_tracks_mut().filter(|t| !t.locked) {
+        crate::remove_orphan_transitions(tr);
+    }
+    *seq = work;
+    Ok(TimeRange::from_bounds(at, end))
+}
+
+/// Join a grown clip with the clip right after it when that one continues it in media time (the
+/// rest of the clip Extract split off), leaving no edit point. The left clip's attributes win.
+fn join_continuation(tr: &mut Track, id: ClipId) {
+    let Some(i) = tr.items.iter().position(|it| it.id == id) else { return };
+    let Some(j) = i.checked_add(1) else { return };
+    let (Some(a), Some(b)) = (tr.items.get(i), tr.items.get(j)) else { return };
+    if !crate::through::is_through_edit(a, b) {
+        return;
+    }
+    let (aid, bid, bdur) = (a.id, b.id, b.duration);
+    if let Some(l) = tr.items.get_mut(i) {
+        l.duration = Tick(l.duration.0.saturating_add(bdur.0));
+    }
+    tr.items.retain(|it| it.id != bid);
+    tr.transitions.retain(|t| !(t.from == Some(aid) && t.to == Some(bid)));
+    for t in &mut tr.transitions {
+        if t.from == Some(bid) {
+            t.from = Some(aid);
+        }
+        if t.to == Some(bid) {
+            t.to = Some(aid);
+        }
+    }
 }
 
 /// Rules for Create Captions from a transcript (Premiere's dialog defaults).

@@ -46,6 +46,7 @@ pub mod settings;
 pub mod shortcut_presets;
 pub mod shortcuts;
 pub mod sync;
+pub mod takes;
 pub mod transcript;
 pub mod trim;
 pub mod voiceover;
@@ -1091,6 +1092,8 @@ mod settings_tests;
 mod shortcuts_tests;
 #[cfg(test)]
 mod split_edit_ripple_trim_tests;
+#[cfg(test)]
+mod takes_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

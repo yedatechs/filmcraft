@@ -35,6 +35,43 @@ the control channel and MCP agents can do the same.
 | `transcript.createCaptions` | Lay the words out as captions on a new caption track (`maxChars`, `lines`, `minSeconds`, `maxSeconds`, `gapFrames`). |
 | `transcript.models` / `transcript.downloadModel` | List the speech models (size, licence, installed) / download one. |
 
+## Crossed-out text and takes
+
+Nothing a text edit removes is lost. Media that a clip used to play but no longer does (the
+stretch between two clips of the same media on an audio track, which is what Extract, Remove
+Pauses, Remove Filler Words and a crossed-out take leave behind) is a **cut span**
+(`filmcraft_edit::transcript::cut_spans`): derived from the timeline like the sequence transcript,
+never stored. The Text panel shows a cut span's words struck through where they were, a wordless
+span as a struck-through pause, and one click puts the media back. Head and tail trims are not
+spans (they would list a whole source file).
+
+| Command | What it does |
+|---|---|
+| `transcript.cuts` | The sequence's cut spans: `index`, `item`, media `start`/`end`, `at` (where it goes back), `track`, `afterWord` (the live word it follows), `words`. |
+| `transcript.restore` | Put a span back (`cut` index, or `item` + media `start`/`end`): the clip before it grows, everything from `at` moves right on every unlocked track, a clip on another track spanning `at` is lengthened when its media allows (the inverse of Extract) and otherwise split; linked video grows with the audio. One undo step. |
+
+**Takes** are lines the speaker recorded more than once. `takes.detect` splits a media
+transcript into utterances (at pauses or sentence punctuation), compares neighbours by
+normalised-word similarity (shared opening words, token overlap, edit distance; retake cues such
+as "okay again" help) and stores the matches as **take groups** on the transcript
+(`Transcript::takes`, media time, schema v13). Which take is *in the cut* is not stored: a take is
+**live** when the sequence plays at least half of its media, and switching takes is an ordinary
+timeline edit (the live takes are extracted, the chosen take's media is put back at the first of
+their positions), so undo, redo and export need nothing new, and the other takes show crossed out.
+
+| Command | What it does |
+|---|---|
+| `takes.detect` | Find groups (`sensitivity` 0..1, default 0.5; `maxGapSeconds`); hand-made groups are kept; `select` (`last` by default, `first`, `none`) puts that take of each new group in the cut, in the same undo step. |
+| `takes.list` | Groups of the sequence (`label`, `redo` filters): takes with `text`, `live`, `label`, `note`; the group's `active` take and `at`. |
+| `takes.select` / `takes.next` / `takes.previous` | Make one take the only live one; next/previous take the group at the playhead when `group` is omitted and wrap around. |
+| `takes.cross` / `takes.restore` | Cross out a live take; bring a take back without touching the others. |
+| `takes.label` / `takes.redo` | Label a take (`good`, `best`, `flat`, `stumble`, `wrongEnergy`) and note it; flag a group "needs re-record" (the redo list is `takes.list {redo: true}`). |
+| `takes.merge` / `takes.split` / `takes.add` / `takes.remove` | Fix a grouping by hand (`add` takes live word indices `from`/`to`, or `item` + media `start`/`end`); results are marked manual. |
+| `takes.preview` | Mark In/Out from the sentence before a live take to the sentence after (`pre`, `post`), so Play In to Out auditions it in context. |
+
+Shortcuts (Sequence ▸ Takes): Detect Takes `Alt+Shift+T`, Next/Previous Take `Alt+]` / `Alt+[`,
+Cross Out `Alt+Shift+X`, Restore `Alt+Shift+U`, Label `Alt+Shift+L`, Re-record `Alt+Shift+R`.
+
 ## Speech recognition
 
 Recognition goes through the `Transcriber` trait (`crates/speech`). The built-in recogniser is

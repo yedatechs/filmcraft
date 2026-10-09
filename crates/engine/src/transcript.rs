@@ -389,6 +389,80 @@ fn rename_speaker(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"renamed": n}))
 }
 
+/// Cut spans of the active sequence: media of a clip that the timeline no longer plays, shown
+/// crossed out in the Text panel (`filmcraft_edit::transcript::cut_spans`).
+pub fn cut_spans(s: &Session) -> Vec<tx::CutSpan> {
+    match s.active_sequence() {
+        Some(q) => {
+            let words = tx::sequence_words(q, &s.project.transcripts);
+            tx::cut_spans(q, &s.project.transcripts, &words)
+        }
+        None => Vec::new(),
+    }
+}
+
+fn cut_json(s: &Session, i: usize, c: &tx::CutSpan) -> Value {
+    let words: Vec<Value> = s
+        .project
+        .transcripts
+        .get(&c.item)
+        .and_then(|t| t.words.get(c.words.clone()))
+        .map(|ws| ws.iter().enumerate().map(|(k, w)| json!({"i": c.words.start + k, "text": w.text, "start": w.start.0, "end": w.end.0})).collect())
+        .unwrap_or_default();
+    json!({
+        "index": i, "item": c.item.0, "start": c.media.start.0, "end": c.media.end().0,
+        "seconds": c.media.duration.0 as f64 / TICKS_PER_SECOND as f64,
+        "at": c.at.0, "track": c.track, "before": c.before.0, "after": c.after.0,
+        "afterWord": c.after_word, "words": words,
+    })
+}
+
+fn cuts(s: &mut Session, _: &Value) -> Result<Value> {
+    let spans = cut_spans(s);
+    Ok(json!({"cuts": spans.iter().enumerate().map(|(i, c)| cut_json(s, i, c)).collect::<Vec<_>>()}))
+}
+
+/// `transcript.restore {cut}` (an index from `transcript.cuts`) or `{item, start, end, at?, track?}`
+/// (a media range in ticks; `at` and `track` default to the cut span holding it).
+fn restore(s: &mut Session, p: &Value) -> Result<Value> {
+    let spans = cut_spans(s);
+    let (item, media, at, track) = if let Some(i) = u64_p(p, "cut") {
+        let c = spans.get(i as usize).ok_or_else(|| bad("transcript.restore", format!("cut index out of range (there are {} cuts)", spans.len())))?;
+        (c.item, c.media, c.at, c.track)
+    } else {
+        let item = u64_p(p, "item")
+            .map(ItemId)
+            .and_then(|i| media_item(s, i))
+            .ok_or_else(|| bad("transcript.restore", "pass `cut` (an index from transcript.cuts) or `item` with `start`/`end`"))?;
+        let (a, b) = match (p.get("start").and_then(Value::as_i64), p.get("end").and_then(Value::as_i64)) {
+            (Some(a), Some(b)) => (Tick(a), Tick(b)),
+            _ => return Err(bad("transcript.restore", "`start` and `end` (media ticks) are required")),
+        };
+        if a < Tick::ZERO || b <= a {
+            return Err(bad("transcript.restore", "the range must be non-empty and start at or after 0"));
+        }
+        let media = TimeRange::from_bounds(a, b);
+        let holder = spans.iter().find(|c| c.item == item && c.media.overlaps(&media));
+        let at = match p.get("at").and_then(Value::as_i64) {
+            Some(t) => Tick(t),
+            None => holder.map(|c| c.at).ok_or_else(|| bad("transcript.restore", "that media is not inside a cut; pass `at` (sequence ticks)"))?,
+        };
+        let track = match u64_p(p, "track") {
+            Some(t) => t as usize,
+            None => holder.map(|c| c.track).ok_or_else(|| bad("transcript.restore", "pass `track` (audio track index)"))?,
+        };
+        (item, media, at, track)
+    };
+    let r = s.edit_sequence("Restore Text", |q, ctx, _| Ok(tx::restore_media(q, item, media, at, track, ctx)?))?;
+    s.set_playhead(r.start);
+    Ok(json!({"item": item.0, "start": r.start.0, "end": r.end().0, "seconds": r.duration.0 as f64 / TICKS_PER_SECOND as f64}))
+}
+
+fn has_cuts(s: &Session) -> std::result::Result<(), String> {
+    has_seq(s)?;
+    if cut_spans(s).is_empty() { Err("nothing is crossed out in this sequence".into()) } else { Ok(()) }
+}
+
 fn remove_ranges(s: &mut Session, label: &str, ranges: Vec<TimeRange>) -> Result<Value> {
     let n = ranges.len();
     if n == 0 {
@@ -504,6 +578,16 @@ pub fn commands() -> Vec<CommandSpec> {
         spec("transcript.delete", "Delete Transcript", &["Sequence", "Transcript"], r#"{"items":[id]?}"#, has_transcripts, delete, true),
         spec("transcript.inspect", "Inspect Transcript", &[], r#"{"paragraphGapSeconds":f?}"#, always, inspect, false),
         spec("transcript.search", "Search Transcript", &[], r#"{"query":str}"#, always, search, false),
+        spec("transcript.cuts", "List Crossed-out Text", &[], "{}", has_seq, cuts, false),
+        spec(
+            "transcript.restore",
+            "Restore Crossed-out Text",
+            &[],
+            r#"{"cut":n | "item":id,"start":ticks,"end":ticks,"at":ticks?,"track":n?}"#,
+            has_cuts,
+            restore,
+            true,
+        ),
         spec("transcript.models", "List Speech Models", &[], "{}", always, models, false),
         spec("transcript.downloadModel", "Download Speech Model", &[], r#"{"model":"whisper-base"?}"#, can_download, download_model, true),
         spec("transcript.select", "Mark Selected Text", &[], r#"{"from":word,"to":word?}"#, has_transcript, select, true),
