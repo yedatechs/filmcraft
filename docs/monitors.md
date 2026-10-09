@@ -30,3 +30,5 @@ Automation ids: `<monitor>.zoom`, `<monitor>.zoom.<level>`, `<monitor>.settings.
 `<monitor>.guide.<n>`, `program.compare.reference|prev|next|set`, `source.waveform`, and in the
 dialogs `guides.add.vertical|horizontal|position|ok|cancel`, `guides.save.name|ok|cancel`,
 `guides.manage.row.<n>|apply|delete|close`.
+
+Redact Area… (`redact.start`, Clip ▸ Layout) turns the Program picture into a draw surface (`program.redact.draw`): drag a box to add a tracked mosaic; see [layouts.md](layouts.md#tracked-redaction-redact).

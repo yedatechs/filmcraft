@@ -58,3 +58,41 @@ A layout attached to a span of the transcript, so the arrangement follows the wo
 ## Tracked redaction (`redact.*`)
 
 Draw a box over what to hide; a mosaic with a rectangle mask tracks it across the clip.
+
+A redaction is an ordinary effect with one mask, so Effect Controls lists it, undo takes it back in
+one step, and save, render and export need nothing new:
+
+- `mosaic` (default): Mosaic with blocks about a sixth of the box (`horizontal` = source width ×
+  6 / box width, `vertical` likewise, clamped to 1–4000);
+- `blur`: Gaussian Blur, blurriness 60;
+- `fill`: Mosaic with one block (1 × 1), so the box shows a flat colour.
+
+The effect goes before the intrinsic Motion / Opacity (like Apply Effect) and gets a rectangle mask
+named `Redaction N` (N = one more than the highest redaction number on the clip) with the tracking
+method `Position`. The new mask is selected, so its on-monitor handles show.
+
+| Command | Params | Result |
+|---|---|---|
+| `redact.add` | `clip?` (default: the top-most enabled video clip under the playhead), `rect: [x, y, w, h]` (clip pixels; clamped to the picture, an empty box is refused), `style: mosaic\|blur\|fill` (default mosaic), `track: bool` (default true), `frames: n?` (cap per direction), `wait: bool?` (track synchronously) | `{clip, effect, mask, name, style, rect, jobs, trackError?}` |
+| `redact.list` | `clip?` | `{clip, redactions: [{redaction: N, name, effect, mask, style, rect, tracked, tracking}]}`; `rect` is the mask's bounding box at the playhead, `tracked` = the mask path has keyframes, `tracking` = a job is running or queued |
+| `redact.remove` | `clip?`, `redaction: N` | removes that effect and its mask (one undo step) and stops its tracking |
+
+With `track`, `masks.track` runs forward from the playhead (method `position`) and, when that job
+finishes, backward from the same frame: two jobs, each one undo step (`Track Mask`), shown in the
+status bar with cancel like every job. Cancelling the forward job skips the backward run. A
+direction with nothing to track (the playhead on the clip's first or last frame) is skipped. While
+a mask on a clip is being tracked, `redact.add` on that clip is refused (effect indices would
+shift under the running job).
+
+### Draw mode (Program monitor)
+
+`redact.start {style?}` (Clip ▸ Layout ▸ Redact Area…; UI command) turns on the draw mode
+(`UiState.redact_draw`, style in `UiState.redact_style`) and shows "Drag a box over what to hide
+(Esc cancels)" in the status bar. The drag on the Program picture (automation id
+`program.redact.draw`) draws a rubber band; on release the box is mapped from the screen through
+the clip's Motion into source pixels of the top-most enabled video clip whose picture contains the
+box centre (else the top-most clip under the playhead) and `redact.add {clip, rect, style, track:
+true}` runs. One box per Redact Area…; a click without a drag keeps the mode; Esc cancels.
+
+Follow-up (not in this change): a scroll-following tracker for text that scrolls vertically (the
+`position` tracker follows rigid motion, not a scrolling page whose content changes).

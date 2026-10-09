@@ -522,7 +522,7 @@ pub struct PendingTrack {
 /// Longest side of the frames the tracker works on (speed; the result is in clip pixels).
 const TRACK_MAX_WIDTH: f64 = 960.0;
 
-fn track(s: &mut Session, p: &Value) -> Result<Value> {
+pub(crate) fn track(s: &mut Session, p: &Value) -> Result<Value> {
     let clip = target_clip(s, p)?;
     let sel = s.state.selected_mask;
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;

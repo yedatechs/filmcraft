@@ -553,6 +553,7 @@ impl Session {
     pub fn poll_persistence(&mut self) {
         proxies::poll(self);
         masks::poll(self);
+        redact::poll(self);
         scene_detect::poll(self);
         transcript::poll(self);
         export_tools::pump_queue(self, false);
@@ -1080,6 +1081,8 @@ mod project_manager_tests;
 mod project_panel_tests;
 #[cfg(test)]
 mod proxies_tests;
+#[cfg(test)]
+mod redact_tests;
 #[cfg(test)]
 mod relink_tests;
 #[cfg(test)]

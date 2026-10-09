@@ -474,6 +474,12 @@ pub struct UiState {
     /// Free-draw (pen) mask being placed on the Program monitor (Effect Controls ▸ pen icon).
     #[serde(default)]
     pub mask_pen: Option<MaskPenDraft>,
+    /// Redact Area… draw mode on the Program monitor (`redact.start`): the next drag on the picture
+    /// runs `redact.add` with this style (None = mosaic).
+    #[serde(default)]
+    pub redact_draw: bool,
+    #[serde(default)]
+    pub redact_style: Option<String>,
     /// Effect presets: the preset being renamed / the Save Preset dialog (open when Some).
     #[serde(default)]
     pub save_preset: Option<SavePresetDraft>,
@@ -860,6 +866,8 @@ impl Default for UiState {
             make_offline: None,
             color_dialog: None,
             mask_pen: None,
+            redact_draw: false,
+            redact_style: None,
             save_preset: None,
             audio_fx_editors: Vec::new(),
             sync_dialog: None,

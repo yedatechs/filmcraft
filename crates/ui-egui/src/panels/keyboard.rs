@@ -129,6 +129,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("textPanel.toggleCut", "Cross Out / Restore Text", [], None),
     uic!("textPanel.showProgramTranscript", "Show Program Transcript", [], None),
     uic!("graphics.beginTextEditing", "Begin Text Editing for a Graphic Layer", [], Some("Cmd+Alt+'")),
+    uic!("redact.start", "Redact Area…", ["Clip", "Layout"], None),
     uic!("help.filmcraftHelp", "FilmCraft Help…", ["Help"], Some("F1")),
     uic!("app.quit", "Quit FilmCraft", [], Some("Cmd+Q")),
 ];
@@ -198,6 +199,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             Ok(json!({"scroll": tv.target_scroll}))
         }
         "graphics.beginTextEditing" => begin_text_editing(app),
+        "redact.start" => crate::panels::redact::start(app, params),
         "help.filmcraftHelp" => {
             crate::links::open(ctx, HELP_URL);
             Ok(json!({"url": HELP_URL}))
