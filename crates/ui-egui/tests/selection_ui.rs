@@ -178,6 +178,7 @@ fn selection_after_a_removed_pause_crosses_out_the_right_words() {
     d.frames(2);
     let st = d.ok("ui.inspect", json!({}));
     assert_eq!(st["ui"]["transcript_sel"], json!([1, 2]), "{}", st["ui"]["transcript_sel"]);
+    d.exec("playhead.set", json!({"seconds": 0.0}));
     d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
     d.frames(3);
     assert_eq!(d.live_words(), ["yo", "what", "a", "time"], "the selected pair is crossed out");
@@ -189,4 +190,17 @@ fn selection_after_a_removed_pause_crosses_out_the_right_words() {
         .map(|c| c["words"].as_array().unwrap().iter().filter_map(|w| w["text"].as_str()).collect::<Vec<_>>().join(" "))
         .collect();
     assert_eq!(texts, ["", "what a"], "{r}");
+    let st = d.ok("ui.inspect", json!({}));
+    assert_eq!(st["playhead"].as_i64(), Some(0), "the playhead stays where it was: {}", st["playhead"]);
+    // with nothing selected, ⌘⌫ beside the two spans brings back the words, not the pause
+    d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
+    d.frames(3);
+    assert_eq!(d.live_words(), ["yo", "what", "a", "what", "a", "time"]);
+    assert_eq!(d.cuts(), 1, "the pause stays removed");
+    let st = d.ok("ui.inspect", json!({}));
+    assert_eq!(st["ui"]["transcript_sel"], json!([1, 2]), "the restored words are selected");
+    // and again crosses the same words out
+    d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
+    d.frames(3);
+    assert_eq!(d.live_words(), ["yo", "what", "a", "time"]);
 }

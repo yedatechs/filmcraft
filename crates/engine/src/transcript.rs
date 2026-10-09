@@ -507,7 +507,12 @@ fn extract_or_lift(s: &mut Session, p: &Value, extract: bool) -> Result<Value> {
         crate::scenes::reapply_in(q, sc.as_ref());
         Ok(())
     })?;
-    s.set_playhead(r.start);
+    // the playhead stays put (Play keeps starting where the user left it); only a playhead inside
+    // the removed words moves to the cut point
+    let ph = s.playhead();
+    if ph >= r.start && ph < r.end() {
+        s.set_playhead(r.start);
+    }
     Ok(range_json(r))
 }
 
@@ -617,7 +622,7 @@ fn restore(s: &mut Session, p: &Value) -> Result<Value> {
         crate::scenes::reapply_in(q, sc.as_ref());
         Ok(r)
     })?;
-    s.set_playhead(r.start);
+    // the playhead stays put, as for extract
     Ok(json!({"item": item.0, "start": r.start.0, "end": r.end().0, "seconds": r.duration.0 as f64 / TICKS_PER_SECOND as f64}))
 }
 

@@ -460,7 +460,10 @@ fn restore_beside(app: &mut FilmcraftApp, cur: usize) -> Result<Value, String> {
         None => cur == 0,
     };
     let mut found: Vec<(usize, &filmcraft_edit::transcript::CutSpan)> = spans.iter().enumerate().filter(|(_, c)| beside(c)).collect();
-    found.sort_by_key(|(_, c)| c.after_word.is_some_and(|w| w == cur));
+    // crossed-out words before a removed pause (both sit beside the same word): words come back
+    // first, a pause only when no words are there; the span right before the caret before the
+    // one after it
+    found.sort_by_key(|(_, c)| (c.words.is_empty(), c.after_word.is_some_and(|w| w == cur)));
     let Some((ci, span)) = found.first().copied() else {
         return Err("select text to cross out, or put the playhead beside crossed-out text to restore it".into());
     };
@@ -499,7 +502,9 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
     let paras = filmcraft_edit::transcript::paragraphs(&words, filmcraft_time::Tick::from_seconds_f64(1.5));
     let para_of = |i: usize| paras.iter().position(|p| p.contains(&i)).unwrap_or(0);
     let (anchor, cur) = app.ui.transcript_sel.unwrap_or_else(|| {
-        let i = filmcraft_edit::transcript::word_at(&words, app.session.playhead()).unwrap_or(0);
+        // the caret: the word at the playhead, else the next word after it (never word 0 by default)
+        let ph = app.session.playhead();
+        let i = filmcraft_edit::transcript::word_at(&words, ph).unwrap_or_else(|| words.iter().position(|w| w.start >= ph).unwrap_or(n - 1));
         (i, i)
     });
     let line = |i: usize, d: i64| -> usize {
@@ -532,11 +537,17 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
         "toggleCut" => {
             if let Some((a0, b0)) = app.ui.transcript_sel {
                 let (a, b) = (a0.min(b0), a0.max(b0));
-                let at = words.get(a).map(|w| w.start);
+                let (at, end) = (words.get(a).map(|w| w.start), words.get(b).map(|w| w.end));
                 let text: Vec<&str> = words.get(a..=b).into_iter().flatten().map(|w| w.text.as_str()).collect();
+                let ph = app.session.playhead();
                 let r = app.session.execute("transcript.extract", json!({"from": a, "to": b})).map_err(|e| e.to_string())?;
                 app.ui.transcript_sel = None;
-                if let Some(at) = at {
+                // the playhead stays where it was (so Play still starts where the user left it);
+                // only a playhead inside the removed words moves to the cut point
+                if let (Some(at), Some(end)) = (at, end)
+                    && ph >= at
+                    && ph < end
+                {
                     app.session.set_playhead(at);
                 }
                 app.ui.status = format!("Crossed out: {}", text.join(" "));

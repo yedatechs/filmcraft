@@ -28,7 +28,7 @@ the control channel and MCP agents can do the same.
 | `transcript.inspect` | The sequence transcript: words (index, text, sequence times, speaker, clip), paragraphs, speakers, the word at the playhead. |
 | `transcript.search` | Word-index ranges matching a phrase (case and punctuation ignored; the last word may be a prefix). |
 | `transcript.select` | Mark In/Out around words `from..=to` (frame-snapped outward) and move the playhead there. |
-| `transcript.extract` / `transcript.lift` | Extract (ripple) or lift the words' frames on the targeted tracks. |
+| `transcript.extract` / `transcript.lift` | Extract (ripple) or lift the words' frames on the targeted tracks. The playhead stays where it was unless it was inside the removed words (then it moves to the cut point); `transcript.restore` leaves it alone too. |
 | `transcript.renameSpeaker` | Rename a speaker by name (every transcript) or by index in one `item`. |
 | `transcript.removeFillers` | Ripple-delete filler words (`fillers`, default um/uh/erm/…; phrases such as "you know" allowed). |
 | `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping `keepSeconds` of air on both sides. One undo step. From the menu or the Text panel (no `minSeconds` / `keepSeconds`) it opens the Remove Pauses dialog instead of running. |

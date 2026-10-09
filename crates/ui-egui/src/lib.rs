@@ -1029,6 +1029,8 @@ impl FilmcraftApp {
     // ---------------------------------------------------------------- input
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        /// Commands that toggle state and therefore ignore key auto-repeat.
+        const NO_REPEAT: &[&str] = &["textPanel.toggleCut"];
         let workspaces = (dock::names(&self.workspaces), self.ui.workspace.clone());
         if self.bindings_rev != self.session.shortcuts.revision || workspaces != self.menu_workspaces {
             self.menu_workspaces = workspaces;
@@ -1052,10 +1054,24 @@ impl FilmcraftApp {
         ctx.input_mut(|i| {
             let modifiers = i.modifiers;
             clipboard_events_as_keys(&mut i.events, modifiers);
+            // key auto-repeat must not toggle a cross-out back and forth (holding ⌘⌫ a moment
+            // too long): a repeat of that chord is consumed without firing
+            let repeats: Vec<(egui::Modifiers, egui::Key)> = i
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, repeat: true, modifiers, .. } => Some((*modifiers, *key)),
+                    _ => None,
+                })
+                .collect();
             let panel = self.bindings.iter().filter(|b| b.3.as_deref() == Some(focused));
             let app_wide = self.bindings.iter().filter(|b| b.3.is_none());
             for (m, k, id, _) in panel.chain(app_wide) {
                 if i.consume_key(*m, *k) {
+                    let is_repeat = repeats.iter().any(|(rm, rk)| rk == k && rm.matches_logically(*m));
+                    if NO_REPEAT.contains(&id.as_str()) && is_repeat {
+                        continue;
+                    }
                     fire.push(id.clone());
                 }
             }
