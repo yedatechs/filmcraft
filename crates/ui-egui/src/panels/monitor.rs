@@ -242,6 +242,8 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     if which == Which::Program && show_picture {
         crate::panels::graphics::monitor_overlay(app, ui, pic, frame_size);
         crate::panels::masks::monitor_overlay(app, ui, pic, frame_size);
+        crate::panels::layout::monitor_overlay(app, ui, pic, frame_size);
+        crate::panels::redact::monitor_overlay(app, ui, pic, frame_size);
     }
     if show_picture {
         monitor_view::guides(app, ui, which, video_area, pic, frame_size);

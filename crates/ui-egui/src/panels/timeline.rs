@@ -2115,6 +2115,7 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
                 }
             }
         }
+        crate::panels::layout::clip_menu(app, ui);
     });
 
     // ---- drops: project items and effects
