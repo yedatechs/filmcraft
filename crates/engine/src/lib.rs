@@ -360,6 +360,8 @@ pub struct Session {
     pub mask_jobs: Vec<masks::PendingTrack>,
     /// Scene Edit Detection jobs whose results are applied when they finish.
     pub scene_jobs: Vec<scene_detect::PendingScene>,
+    /// Transcriptions running on a worker thread; stored when they finish.
+    pub transcribe_jobs: Vec<transcript::PendingTranscribe>,
     /// Effect presets (built-in + the user's, persisted in the data directory).
     pub presets: presets::PresetLibrary,
     /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
@@ -456,6 +458,7 @@ impl Session {
             media_jobs: Vec::new(),
             mask_jobs: Vec::new(),
             scene_jobs: Vec::new(),
+            transcribe_jobs: Vec::new(),
             presets: Default::default(),
             export_presets: Default::default(),
             export_queue: Default::default(),
@@ -549,6 +552,7 @@ impl Session {
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
+        transcript::poll(self);
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
         let Some(p) = self.persistence.as_mut() else { return };

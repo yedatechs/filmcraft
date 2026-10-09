@@ -126,6 +126,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("textPanel.selectToSegmentEnd", "Select to Segment End", [], None),
     uic!("textPanel.delete", "Delete", [], None),
     uic!("textPanel.rippleDelete", "Ripple Delete", [], None),
+    uic!("textPanel.toggleCut", "Cross Out / Restore Text", [], None),
     uic!("textPanel.showProgramTranscript", "Show Program Transcript", [], None),
     uic!("graphics.beginTextEditing", "Begin Text Editing for a Graphic Layer", [], Some("Cmd+Alt+'")),
     uic!("help.filmcraftHelp", "FilmCraft Help…", ["Help"], Some("F1")),
@@ -445,6 +446,26 @@ fn project_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
 
 // ------------------------------------------------------------------ Text panel (transcript)
 
+/// Restore the crossed-out span beside word `cur` (the one just before it first, then the one
+/// after it) and select the words that came back.
+fn restore_beside(app: &mut FilmcraftApp, cur: usize) -> Result<Value, String> {
+    let spans = filmcraft_engine::transcript::cut_spans(&app.session);
+    let beside = |c: &filmcraft_edit::transcript::CutSpan| match c.after_word {
+        Some(w) => w + 1 == cur || w == cur,
+        None => cur == 0,
+    };
+    let mut found: Vec<(usize, &filmcraft_edit::transcript::CutSpan)> = spans.iter().enumerate().filter(|(_, c)| beside(c)).collect();
+    found.sort_by_key(|(_, c)| c.after_word.is_some_and(|w| w == cur));
+    let Some((ci, span)) = found.first().copied() else {
+        return Err("select text to cross out, or put the playhead beside crossed-out text to restore it".into());
+    };
+    let count = span.words.len();
+    let first = span.after_word.map_or(0, |w| w + 1);
+    let r = app.session.execute("transcript.restore", json!({"cut": ci})).map_err(|e| e.to_string())?;
+    app.ui.transcript_sel = (count > 0).then_some((first, first + count - 1));
+    Ok(r)
+}
+
 fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
     if op == "showProgramTranscript" {
         app.show_panel(PanelKind::Text);
@@ -461,6 +482,9 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
     }
     let words = filmcraft_engine::transcript::sequence_words(&app.session);
     if words.is_empty() {
+        if op == "toggleCut" && app.ui.transcript_sel.is_none() {
+            return restore_beside(app, 0);
+        }
         return Err("the sequence has no transcript".into());
     }
     let n = words.len();
@@ -493,6 +517,22 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
             let r = app.session.execute(cmd, json!({"from": a.min(b), "to": a.max(b)})).map_err(|e| e.to_string())?;
             app.ui.transcript_sel = None;
             return Ok(r);
+        }
+        // Descript's ⌘⌫: selected words are crossed out (the playhead stays where they were); with
+        // nothing selected, crossed-out text beside the playhead word comes back, selected, so ⌘⌫
+        // again crosses it out.
+        "toggleCut" => {
+            if let Some((a0, b0)) = app.ui.transcript_sel {
+                let (a, b) = (a0.min(b0), a0.max(b0));
+                let at = words.get(a).map(|w| w.start);
+                let r = app.session.execute("transcript.extract", json!({"from": a, "to": b})).map_err(|e| e.to_string())?;
+                app.ui.transcript_sel = None;
+                if let Some(at) = at {
+                    app.session.set_playhead(at);
+                }
+                return Ok(r);
+            }
+            return restore_beside(app, cur);
         }
         _ => return Err(format!("unknown Text panel command `{op}`")),
     };

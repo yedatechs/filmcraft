@@ -152,6 +152,19 @@ pub fn panel_command_id(p: PanelKind) -> String {
 
 /// Execute a UI or engine command by id.
 pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+    // Transcription from the menu, the Text panel or a shortcut runs on a worker thread (the
+    // status bar and the Text panel show its progress); the control channel and the CLI keep the
+    // synchronous default.
+    let params = if id == "transcript.generate" && params.get("background").is_none() {
+        let mut p = params;
+        if !p.is_object() {
+            p = serde_json::json!({});
+        }
+        p["background"] = Value::Bool(true);
+        p
+    } else {
+        params
+    };
     if matches!(id, "app.language.english" | "app.language.japanese" | "app.language.spanish" | "app.language.portuguese") {
         // Japanese needs the craft-fonts (built with CRAFT_FONTS_DIR) or a font installed on the system
         if id == "app.language.japanese" && !crate::i18n::install_japanese_font(ctx) {

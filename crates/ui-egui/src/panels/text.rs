@@ -518,6 +518,10 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let spans = filmcraft_engine::transcript::cut_spans(&app.session);
     if words.is_empty() && spans.is_empty() {
         let c = rect.center();
+        if let Some(job) = filmcraft_engine::transcript::running(&app.session) {
+            transcribing(app, ui, c, &job, &t);
+            return;
+        }
         icons::paint(ui.painter(), Rect::from_center_size(c - vec2(0.0, 70.0), vec2(40.0, 40.0)), Icon::Captions, t.text_dim);
         ui.painter().text(c - vec2(0.0, 30.0), Align2::CENTER_CENTER, "Transcribe sequence", Tokens::semibold(16.0), t.text);
         let note = if filmcraft_speech_available(app) {
@@ -777,6 +781,33 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
             }
         }
     });
+}
+
+/// The empty state while a transcription runs: a spinner, the job's status, a progress bar and
+/// Cancel (`text.transcript.cancel`).
+fn transcribing(app: &mut FilmcraftApp, ui: &mut egui::Ui, c: egui::Pos2, job: &filmcraft_engine::Job, t: &Tokens) {
+    use std::sync::atomic::Ordering;
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    let spin = Rect::from_center_size(c - vec2(0.0, 70.0), vec2(36.0, 36.0));
+    ui.put(spin, egui::Spinner::new().size(36.0).color(t.accent));
+    ui.painter().text(c - vec2(0.0, 30.0), Align2::CENTER_CENTER, &job.label, Tokens::semibold(16.0), t.text);
+    let status = job.progress.status.lock().map(|s| s.clone()).unwrap_or_default();
+    ui.painter().text(c - vec2(0.0, 8.0), Align2::CENTER_CENTER, status, Tokens::ui(12.0), t.text_dim);
+    let f = job.progress.fraction().clamp(0.0, 1.0);
+    let bar = Rect::from_center_size(c + vec2(0.0, 12.0), vec2(240.0, 6.0));
+    ui.painter().rect_filled(bar, 3.0, t.separator);
+    ui.painter().rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, bar.height())), 3.0, t.accent);
+    if let Some(left) = job.progress.eta().map(crate::panels::left_text) {
+        ui.painter().text(c + vec2(0.0, 28.0), Align2::CENTER_CENTER, left, Tokens::ui(11.0), t.text_dim);
+    }
+    let r = Rect::from_center_size(c + vec2(0.0, 52.0), vec2(90.0, 24.0));
+    let resp = ui.interact(r, egui::Id::new("text.transcript.cancel"), Sense::click());
+    ui.painter().rect_stroke(r, 12.0, Stroke::new(1.0, if resp.hovered() { t.text } else { t.separator }), egui::StrokeKind::Inside);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, "Cancel", Tokens::ui(12.0), t.text);
+    app.auto.add("text.transcript.cancel", r, "Cancel transcription");
+    if resp.clicked() {
+        job.progress.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 fn run(app: &mut FilmcraftApp, ui: &egui::Ui, actions: Vec<(String, Value)>) {

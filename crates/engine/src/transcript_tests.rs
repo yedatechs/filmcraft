@@ -233,3 +233,35 @@ fn whisper_cpp_engine_from_settings() {
     assert!(s.execute("prefs.set", json!({"key": "mediaAnalysis.speechEngine", "value": "cloud"})).is_err(), "unknown engines are rejected");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn generate_in_the_background_stores_the_transcript_when_polled() {
+    let (mut s, item, _) = session();
+    let r = s.execute("transcript.generate", json!({"items": [item.0], "background": true})).unwrap();
+    let job = r["job"].as_u64().expect("a job id");
+    assert_eq!(r["items"], json!([item.0]));
+    assert!(s.jobs.iter().any(|j| j.id == job && j.label == "Transcribing 1 clip"), "{:?}", s.jobs.iter().map(|j| &j.label).collect::<Vec<_>>());
+    assert!(
+        s.execute("transcript.generate", json!({"items": [item.0], "background": true})).is_err() || s.project.transcripts.contains_key(&item),
+        "a second run while one is going is refused"
+    );
+    let t0 = std::time::Instant::now();
+    while !s.project.transcripts.contains_key(&item) {
+        assert!(t0.elapsed().as_secs() < 10, "the transcript never arrived");
+        s.poll_persistence();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(s.project.transcripts[&item].words.len(), 6);
+    assert!(s.transcribe_jobs.is_empty(), "the pending job is dropped once stored");
+    let toast = s.drain_events().into_iter().find_map(|e| match e {
+        crate::Event::Toast { message, error: false } if message.starts_with("Transcribed") => Some(message),
+        _ => None,
+    });
+    assert_eq!(toast.as_deref(), Some("Transcribed 1 clip (6 words)"));
+    assert_eq!(words(&mut s), ["Hello", "um", "world.", "Second", "speaker", "here."]);
+    // the synchronous default still reports the words directly
+    s.execute("transcript.delete", json!({})).unwrap();
+    let r = s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    assert_eq!(r["items"][0]["words"], 6, "{r}");
+    assert!(s.transcribe_jobs.is_empty());
+}

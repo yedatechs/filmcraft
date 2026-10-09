@@ -209,3 +209,34 @@ fn everything_crossed_out_still_shows_the_text() {
     d.click("text.transcript.cut.0");
     assert!(!d.live_words().is_empty(), "clicking the crossed-out text brings it back");
 }
+
+#[test]
+fn cmd_backspace_crosses_out_and_restores_like_descript() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    d.frames(2);
+    d.click("text.tab.Transcript");
+    three_passes(&mut d);
+    d.ok("ui.set", json!({"focused": "Text"}));
+    // select "start the" (words 1–2) and cross them out
+    d.click("text.transcript.word.1");
+    d.ok("ui.key", json!({"key": "Shift+Right"}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
+    d.frames(3);
+    assert_eq!(d.cuts(), 1);
+    assert_eq!(d.ids("text.transcript.word.").len(), 14);
+    assert_eq!(&d.live_words()[..4], ["We", "show", "here.", "We"]);
+    // nothing selected, the playhead sits where the words were: ⌘⌫ brings them back, selected
+    d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
+    d.frames(3);
+    assert_eq!(d.cuts(), 0);
+    assert_eq!(d.ids("text.transcript.word.").len(), 16);
+    assert_eq!(&d.live_words()[..4], ["We", "start", "the", "show"]);
+    // and again crosses the same words out
+    d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
+    d.frames(3);
+    assert_eq!(d.cuts(), 1);
+    assert_eq!(&d.live_words()[..3], ["We", "show", "here."]);
+    d.snapshot("cmd-backspace");
+}

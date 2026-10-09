@@ -9,7 +9,7 @@
 //! engine feature `whisper`; without it `transcript.generate` fails with a clear error, and agents
 //! can still bring their own transcript with `transcript.set`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
@@ -186,10 +186,79 @@ fn transcriber(s: &Session, p: &Value) -> Result<Arc<dyn Transcriber>> {
     filmcraft_speech::load(&dir, model).map_err(speech_err)
 }
 
+/// A transcription running on its own thread; its transcripts are stored when it finishes
+/// ([`poll`]), as one undo step.
+pub struct PendingTranscribe {
+    pub job: u64,
+    pub results: Arc<Mutex<Option<Vec<(ItemId, Transcript)>>>>,
+    pub skipped: Vec<u64>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The transcription job still running, if any (the Text panel shows its progress).
+pub fn running(s: &Session) -> Option<crate::Job> {
+    use std::sync::atomic::Ordering;
+    s.transcribe_jobs.iter().filter_map(|pj| s.jobs.iter().find(|j| j.id == pj.job)).find(|j| !j.progress.finished.load(Ordering::Relaxed)).cloned()
+}
+
+/// Store finished transcriptions (one undo step each) and drop finished or cancelled jobs. Called
+/// once per UI frame from [`Session::poll_persistence`] and after synchronous runs.
+pub fn poll(s: &mut Session) {
+    use std::sync::atomic::Ordering;
+    let mut i = 0;
+    while i < s.transcribe_jobs.len() {
+        let job = s.jobs.iter().find(|j| j.id == s.transcribe_jobs[i].job);
+        let finished = job.is_none_or(|j| j.progress.finished.load(Ordering::Relaxed));
+        if !finished {
+            i += 1;
+            continue;
+        }
+        let cancelled = job.is_some_and(|j| j.progress.cancel.load(Ordering::Relaxed));
+        let error = job.and_then(|j| lock(&j.result).clone()).and_then(|r| r.err());
+        let pj = s.transcribe_jobs.remove(i);
+        if let Some(e) = error {
+            if !cancelled {
+                s.error_toast("transcript.generate", format!("Transcribe: {e}"));
+            }
+            continue;
+        }
+        let Some(done) = lock(&pj.results).take().filter(|_| !cancelled) else { continue };
+        match store(s, done) {
+            Ok(r) => {
+                let n = r["items"].as_array().map(Vec::len).unwrap_or(0);
+                let words: u64 = r["items"].as_array().into_iter().flatten().filter_map(|i| i["words"].as_u64()).sum();
+                s.toast(format!("Transcribed {n} clip{} ({words} words)", if n == 1 { "" } else { "s" }));
+            }
+            Err(e) => s.error_toast("transcript.generate", format!("Transcribe: {e}")),
+        }
+    }
+}
+
+/// Store transcripts as one undo step; the report `transcript.generate` returns.
+fn store(s: &mut Session, done: Vec<(ItemId, Transcript)>) -> Result<Value> {
+    let report: Vec<Value> = done
+        .iter()
+        .map(|(i, t)| json!({"item": i.0, "words": t.words.len(), "speakers": t.speakers.len(), "language": t.language, "source": t.source}))
+        .collect();
+    s.edit("Transcribe", move |pr, _| {
+        for (i, t) in done {
+            pr.transcripts.insert(i, Arc::new(t));
+        }
+        Ok(())
+    })?;
+    Ok(json!({"items": report}))
+}
+
 fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     let items = targets(s, p);
     if items.is_empty() {
         return Err(bad("transcript.generate", "nothing to transcribe (pass `items`, select clips, or open a sequence with audio)"));
+    }
+    if running(s).is_some() {
+        return Err(EngineError::Other("a transcription is already running (cancel it in the status bar, or wait)".into()));
     }
     let t = transcriber(s, p)?;
     // Settings ▸ Media Analysis & Transcription: language (or auto-detect) and speaker labelling
@@ -203,31 +272,105 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
         diarize: bool_p(p, "diarize").unwrap_or(ma.speaker_labeling != "off"),
         max_speakers: u64_p(p, "maxSpeakers").map(|n| n.clamp(1, 32) as usize).unwrap_or(Options::default().max_speakers),
     };
-    let mut done: Vec<(ItemId, Transcript)> = Vec::new();
+    // Decode now (the project and media pool stay on this thread); recognise on a worker.
+    let mut work: Vec<(ItemId, String, Vec<f32>)> = Vec::new();
     let mut skipped = Vec::new();
     for item in items {
         let Some(audio) = item_audio(s, item) else {
             skipped.push(item.0);
             continue;
         };
-        let mut tr = t.transcribe(&audio, &opts, &mut |_, _| true).map_err(speech_err)?;
-        tr.normalize();
-        done.push((item, tr));
+        let name = s.project.item(item).map(|it| it.name.clone()).unwrap_or_default();
+        work.push((item, name, audio));
     }
-    if done.is_empty() {
+    if work.is_empty() {
         return Err(EngineError::Other("none of the clips has audio to transcribe".into()));
     }
-    let report: Vec<Value> = done
-        .iter()
-        .map(|(i, t)| json!({"item": i.0, "words": t.words.len(), "speakers": t.speakers.len(), "language": t.language, "source": t.source}))
-        .collect();
-    s.edit("Transcribe", move |pr, _| {
-        for (i, t) in done {
-            pr.transcripts.insert(i, Arc::new(t));
+    let seconds: f64 = work.iter().map(|w| w.2.len() as f64 / filmcraft_speech::SAMPLE_RATE as f64).sum();
+    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+    let n = work.len();
+    let label = format!("Transcribing {n} clip{}", if n == 1 { "" } else { "s" });
+    let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
+    // progress in permille of all the audio, weighted by each clip's length
+    job.progress.total.store(1000, std::sync::atomic::Ordering::Relaxed);
+    *lock(&job.progress.status) = format!("Transcribing {} of audio…", audio_length(seconds));
+    let ids: Vec<u64> = work.iter().map(|w| w.0.0).collect();
+    let results: Arc<Mutex<Option<Vec<(ItemId, Transcript)>>>> = Arc::default();
+    let (prog, res, out) = (job.progress.clone(), job.result.clone(), results.clone());
+    let run = move || {
+        use std::sync::atomic::Ordering;
+        let t0 = web_time::Instant::now();
+        let total_samples: f64 = work.iter().map(|w| w.2.len() as f64).sum::<f64>().max(1.0);
+        let mut before = 0.0f64;
+        let mut done: Vec<(ItemId, Transcript)> = Vec::new();
+        let mut err: Option<String> = None;
+        for (k, (item, name, audio)) in work.iter().enumerate() {
+            let share = audio.len() as f64 / total_samples;
+            let mut on_progress = |frac: f32, what: &str| -> bool {
+                let f = before + share * frac.clamp(0.0, 1.0) as f64;
+                prog.done.store((f * 1000.0) as u64, Ordering::Relaxed);
+                *lock(&prog.status) = if n == 1 { what.to_string() } else { format!("{what} — {} ({} of {n})", name, k + 1) };
+                !prog.cancel.load(Ordering::Relaxed)
+            };
+            match t.transcribe(audio, &opts, &mut on_progress) {
+                Ok(mut tr) => {
+                    tr.normalize();
+                    done.push((*item, tr));
+                }
+                Err(SpeechError::Cancelled) => {
+                    err = Some("stopped".into());
+                    break;
+                }
+                Err(e) => {
+                    err = Some(e.to_string());
+                    break;
+                }
+            }
+            before += share;
         }
-        Ok(())
-    })?;
-    Ok(json!({"items": report, "skipped": skipped}))
+        let secs = t0.elapsed().as_secs_f64();
+        let words: usize = done.iter().map(|(_, t)| t.words.len()).sum();
+        *lock(&prog.status) = match &err {
+            Some(e) if e == "stopped" => "Stopped: nothing was changed".into(),
+            Some(e) => e.clone(),
+            None => format!("Transcribed {words} word(s) in {secs:.1}s"),
+        };
+        let r = match err {
+            Some(e) => Err(e),
+            None => {
+                *lock(&out) = Some(done);
+                Ok(filmcraft_export::Report { path: String::new(), frames: words as u64, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() })
+            }
+        };
+        *lock(&res) = Some(r);
+        prog.finished.store(true, Ordering::Relaxed);
+    };
+    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    s.jobs.push(job);
+    s.transcribe_jobs.push(PendingTranscribe { job: id, results: results.clone(), skipped: skipped.clone() });
+    let background = bool_p(p, "background").unwrap_or(false) && !cfg!(target_arch = "wasm32");
+    if background {
+        std::thread::Builder::new().name("filmcraft-transcribe".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+        return Ok(json!({"job": id, "items": ids, "skipped": skipped}));
+    }
+    run();
+    // synchronous: store here and report the words (poll would toast instead)
+    let error = s.jobs.iter().find(|j| j.id == id).and_then(|j| lock(&j.result).clone()).and_then(|r| r.err());
+    s.transcribe_jobs.retain(|pj| pj.job != id);
+    if let Some(e) = error {
+        return Err(EngineError::Other(e));
+    }
+    let done = lock(&results).take().unwrap_or_default();
+    let mut out = store(s, done)?;
+    out["skipped"] = json!(skipped);
+    Ok(out)
+}
+
+/// `4:32` / `1:02:05` for a length of audio in seconds.
+fn audio_length(seconds: f64) -> String {
+    let t = seconds.max(0.0).round() as u64;
+    let (h, m, s) = (t / 3600, (t / 60) % 60, t % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
@@ -561,7 +704,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.generate",
             "Transcribe…",
             &["Sequence", "Transcript"],
-            r#"{"items":[id]?,"model":"whisper-base"?,"language":"en|auto"?,"diarize":bool?,"maxSpeakers":n?}"#,
+            r#"{"items":[id]?,"model":"whisper-base"?,"language":"en|auto"?,"diarize":bool?,"maxSpeakers":n?,"background":bool=false}"#,
             can_transcribe,
             generate,
             true,

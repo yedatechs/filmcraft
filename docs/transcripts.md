@@ -22,7 +22,7 @@ the control channel and MCP agents can do the same.
 
 | Command | What it does |
 |---|---|
-| `transcript.generate` | Transcribe media items (`items`, else the Project selection, else the media of the sequence's audio clips). Params: `model` (default `whisper-base`), `language` (`auto` = detect), `diarize`, `maxSpeakers`. One undo step. |
+| `transcript.generate` | Transcribe media items (`items`, else the Project selection, else the media of the sequence's audio clips). Params: `model` (default `whisper-base`), `language` (`auto` = detect), `diarize`, `maxSpeakers`, `background` (default false: the command returns when the transcripts are stored; true: it returns `{job}` at once and recognition runs on a worker thread, with progress and Cancel in the status bar and the Text panel, and the transcripts are stored, one undo step, when it finishes. The desktop app always uses `background`; the CLI, MCP and control channel default to synchronous). One undo step. |
 | `transcript.set` | Store a transcript you bring (JSON: `language`, `speakers`, `words` with `text`/`start`/`end`/`speaker`); it is sorted and made well formed. |
 | `transcript.delete` | Remove transcripts. |
 | `transcript.inspect` | The sequence transcript: words (index, text, sequence times, speaker, clip), paragraphs, speakers, the word at the playhead. |
@@ -70,7 +70,10 @@ their positions), so undo, redo and export need nothing new, and the other takes
 | `takes.preview` | Mark In/Out from the sentence before a live take to the sentence after (`pre`, `post`), so Play In to Out auditions it in context. |
 
 Shortcuts (Sequence ▸ Takes): Detect Takes `Alt+Shift+T`, Next/Previous Take `Alt+]` / `Alt+[`,
-Cross Out `Alt+Shift+X`, Restore `Alt+Shift+U`, Label `Alt+Shift+L`, Re-record `Alt+Shift+R`.
+Cross Out `Alt+Shift+X`, Restore `Alt+Shift+U`, Label `Alt+Shift+L`, Re-record `Alt+Shift+R`. In the
+Text panel, `Cmd+Backspace` crosses out the selected words, and with nothing selected brings back
+the crossed-out text beside the playhead word (Descript's ⌘⌫); `Backspace` extracts and
+`Alt+Backspace` lifts the selection.
 
 ## Speech recognition
 
