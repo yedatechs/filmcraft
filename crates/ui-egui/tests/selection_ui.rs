@@ -195,6 +195,13 @@ fn selection_after_a_removed_pause_crosses_out_the_right_words() {
         .map(|c| c["words"].as_array().unwrap().iter().filter_map(|w| w["text"].as_str()).collect::<Vec<_>>().join(" "))
         .collect();
     assert_eq!(texts, ["", "what a"], "{r}");
+    // the crossed-out "what a" sits right before the words that follow it (it was closer to them
+    // than to "yo"), after the pause span
+    let rect = |d: &mut Driver, id: &str| {
+        d.ok("ui.elements", json!({"prefix": id}))[0]["rect"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>()
+    };
+    let (cut, pause, next) = (rect(&mut d, "text.transcript.cut.1.0"), rect(&mut d, "text.transcript.cut.0"), rect(&mut d, "text.transcript.word.1"));
+    assert!((cut[1] - next[1]).abs() < 2.0 && pause[0] < cut[0] && cut[0] < next[0], "pause {pause:?} cut {cut:?} next {next:?}");
     let st = d.ok("ui.inspect", json!({}));
     assert_eq!(st["playhead"].as_i64(), Some(0), "the playhead stays where it was: {}", st["playhead"]);
     // with nothing selected, ⌘⌫ beside the two spans brings back the words, not the pause
@@ -247,4 +254,38 @@ fn dragging_in_a_long_wrapped_paragraph_selects_only_the_words_under_the_pointer
     let (min, max) = heights.iter().fold((f64::MAX, 0.0f64), |(lo, hi), h| (lo.min(*h), hi.max(*h)));
     assert!(max < min * 1.5, "a word box spans more than one line: {min}..{max}");
     d.snapshot("wrapped-drag");
+}
+
+#[test]
+fn crossed_out_words_stay_in_their_own_paragraph() {
+    // "yo", a 2.4 s gap (a paragraph break), then "what a what a time": crossing out the first
+    // "what a" keeps it at the start of the second paragraph, not at the end of "yo"'s
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    d.frames(2);
+    d.click("text.tab.Transcript");
+    let mut probe = Session::default();
+    probe.execute("file.openDemoProject", json!({})).unwrap();
+    let a = probe.active_sequence().unwrap().audio_tracks[0].items[0].clone();
+    let tk = |s: f64| a.source_in.0 + (s * filmcraft_time::TICKS_PER_SECOND as f64).round() as i64;
+    let mut words: Vec<Value> = vec![json!({"text": "yo", "start": tk(0.1), "end": tk(0.4), "speaker": 0})];
+    for (i, w) in ["what", "a", "what", "a", "time"].iter().enumerate() {
+        let s = 2.8 + i as f64 * 0.4;
+        words.push(json!({"text": w, "start": tk(s), "end": tk(s + 0.3), "speaker": 0}));
+    }
+    d.exec("transcript.set", json!({"item": a.item.0, "transcript": {"language": "en", "words": words}}));
+    d.frames(3);
+    assert_eq!(d.ids("text.transcript.paragraph.").len(), 2, "two paragraphs");
+    d.ok("ui.drag", json!({"from": {"id": "text.transcript.word.1"}, "to": {"id": "text.transcript.word.2"}}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
+    d.frames(3);
+    assert_eq!(d.live_words(), ["yo", "what", "a", "time"]);
+    let rect = |d: &mut Driver, id: &str| {
+        d.ok("ui.elements", json!({"prefix": id}))[0]["rect"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>()
+    };
+    let (cut, yo, next) = (rect(&mut d, "text.transcript.cut.0.0"), rect(&mut d, "text.transcript.word.0"), rect(&mut d, "text.transcript.word.1"));
+    assert!(cut[1] > yo[1] + 10.0, "the crossed-out words are not on yo's line: cut {cut:?} yo {yo:?}");
+    assert!((cut[1] - next[1]).abs() < 2.0 && cut[0] < next[0], "they start the next paragraph: cut {cut:?} next {next:?}");
+    d.snapshot("own-paragraph");
 }

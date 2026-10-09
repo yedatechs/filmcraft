@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::FilmcraftApp;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
+use filmcraft_edit::transcript::SeqWord;
 
 const TABS: [&str; 3] = ["Transcript", "Captions", "Graphics"];
 
@@ -567,13 +568,38 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             CutView { index, item: c.item.0, media_words: c.words.clone(), words, seconds: c.media.duration.seconds() }
         })
         .collect();
-    // where each span goes: after a live word, or before the first word
+    // Where each span goes: before the first word, after the live word before it, or, when its
+    // words were closer in time to the live word after it (the start of a sentence crossed out
+    // after a pause), before that word, so it stays in its own paragraph instead of hanging off
+    // the end of the one above.
     let mut cuts_after: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+    let mut cuts_before: std::collections::HashMap<usize, Vec<usize>> = Default::default();
     let mut leading: Vec<usize> = Vec::new();
+    let media_word = |w: &SeqWord| app.session.project.transcripts.get(&w.item).and_then(|tr| tr.words.get(w.index)).map(|m| (m.start, m.end));
     for (ci, c) in spans.iter().enumerate() {
-        match c.after_word.filter(|i| *i < words.len()) {
-            Some(i) => cuts_after.entry(i).or_default().push(ci),
-            None => leading.push(ci),
+        let Some(i) = c.after_word.filter(|i| *i < words.len()) else {
+            leading.push(ci);
+            continue;
+        };
+        let tr = app.session.project.transcripts.get(&c.item);
+        let span_words = tr.and_then(|tr| tr.words.get(c.words.clone())).filter(|ws| !ws.is_empty());
+        let closer_to_next = match (span_words, words.get(i), words.get(i + 1)) {
+            (Some(ws), Some(prev), Some(next)) if prev.item == c.item && next.item == c.item => {
+                match (media_word(prev), media_word(next), ws.first(), ws.last()) {
+                    (Some((_, prev_end)), Some((next_start, _)), Some(first), Some(last)) => {
+                        let before = (first.start - prev_end).0.max(0);
+                        let after = (next_start - last.end).0.max(0);
+                        after < before
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if closer_to_next {
+            cuts_before.entry(i + 1).or_default().push(ci);
+        } else {
+            cuts_after.entry(i).or_default().push(ci);
         }
     }
     // take groups: which live word belongs to which take, and where each group's chip goes
@@ -709,6 +735,9 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 for i in pr.clone() {
                     let Some(w) = words.get(i) else { continue };
+                    for ci in cuts_before.get(&i).into_iter().flatten() {
+                        span(app, ui, *ci, &mut actions);
+                    }
                     for gi in chip_word.get(&i).into_iter().flatten() {
                         if let Some(g) = groups.get(*gi) {
                             take_chip(app, ui, g, &mut actions);
