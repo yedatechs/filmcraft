@@ -165,6 +165,11 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
     } else {
         params
     };
+    // Remove Pauses without thresholds (the Sequence ▸ Transcript menu, the Text panel button)
+    // opens the Remove Pauses dialog; with `minSeconds` or `keepSeconds` it runs directly.
+    if id == "transcript.removePauses" && params.get("minSeconds").is_none() && params.get("keepSeconds").is_none() {
+        return crate::panels::text::open_pauses_dialog(app);
+    }
     if matches!(id, "app.language.english" | "app.language.japanese" | "app.language.spanish" | "app.language.portuguese") {
         // Japanese needs the craft-fonts (built with CRAFT_FONTS_DIR) or a font installed on the system
         if id == "app.language.japanese" && !crate::i18n::install_japanese_font(ctx) {

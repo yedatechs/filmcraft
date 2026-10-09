@@ -623,6 +623,29 @@ fn remove_pauses(s: &mut Session, p: &Value) -> Result<Value> {
     remove_ranges(s, "Remove Pauses", ranges)
 }
 
+/// A seconds value for the pause preview: missing or NaN gives `default`, anything else is
+/// clamped to `lo..=hi` (so negative or huge values never overflow a tick).
+pub(crate) fn clamp_seconds(v: Option<f64>, default: f64, lo: f64, hi: f64) -> f64 {
+    match v {
+        Some(v) if !v.is_nan() => v.clamp(lo, hi),
+        _ => default,
+    }
+}
+
+/// The longest pause threshold `transcript.pauses` accepts (an hour).
+const MAX_PAUSE_SECONDS: f64 = 3600.0;
+
+/// `transcript.pauses {minSeconds, keepSeconds}`: how many pauses `transcript.removePauses` would
+/// shorten with these values and how many seconds it would remove (read-only).
+fn pauses(s: &mut Session, p: &Value) -> Result<Value> {
+    let words = sequence_words(s);
+    let min = clamp_seconds(f64_p(p, "minSeconds"), 1.0, 0.0, MAX_PAUSE_SECONDS);
+    let keep = clamp_seconds(f64_p(p, "keepSeconds"), 0.15, 0.0, MAX_PAUSE_SECONDS).min(min);
+    let ranges = tx::find_pauses(&words, Tick::from_seconds_f64(min), Tick::from_seconds_f64(keep), s.sequence_rate());
+    let total = ranges.iter().fold(0i64, |acc, r| acc.saturating_add(r.duration.0.max(0)));
+    Ok(json!({"count": ranges.len(), "seconds": total as f64 / TICKS_PER_SECOND as f64}))
+}
+
 fn remove_fillers(s: &mut Session, p: &Value) -> Result<Value> {
     let words = sequence_words(s);
     let fillers: Vec<String> = match p.get("fillers").and_then(Value::as_array) {
@@ -747,13 +770,14 @@ pub fn commands() -> Vec<CommandSpec> {
         ),
         spec(
             "transcript.removePauses",
-            "Remove Pauses",
+            "Remove Pauses…",
             &["Sequence", "Transcript"],
             r#"{"minSeconds":f?,"keepSeconds":f?}"#,
             has_transcript,
             remove_pauses,
             true,
         ),
+        spec("transcript.pauses", "Preview Pauses", &[], r#"{"minSeconds":f=1.0,"keepSeconds":f=0.15}"#, has_transcript, pauses, false),
         spec("transcript.removeFillers", "Remove Filler Words", &["Sequence", "Transcript"], r#"{"fillers":[str]?}"#, has_transcript, remove_fillers, true),
         spec(
             "transcript.createCaptions",

@@ -251,10 +251,26 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                 }
             }
             // fields of the open M3.11 menu dialog (`panels::menu_dialogs`)
+            // (`pauseMin` / `pauseKeep`: the Text panel's Remove Pauses dialog, seconds)
             if let Some(m) = p.get("menuDialog").and_then(Value::as_object) {
-                let Some(d) = app.ui.extras.dialog.as_mut() else { return err("no menu dialog is open") };
-                for (k, v) in m {
-                    d.params[k.as_str()] = v.clone();
+                let pauses = ["pauseMin", "pauseKeep"];
+                if m.keys().any(|k| pauses.contains(&k.as_str())) {
+                    if !app.ui.transcript_pause_dialog {
+                        return err("the Remove Pauses dialog is not open");
+                    }
+                    let f = |k: &str| m.get(k).map(|v| v.as_f64().ok_or(format!("`menuDialog.{k}` must be a number of seconds"))).transpose();
+                    let (min, keep) = match (f("pauseMin"), f("pauseKeep")) {
+                        (Ok(a), Ok(b)) => (a.unwrap_or(app.ui.transcript_pause_min), b.unwrap_or(app.ui.transcript_pause_keep)),
+                        (Err(e), _) | (_, Err(e)) => return err(e),
+                    };
+                    (app.ui.transcript_pause_min, app.ui.transcript_pause_keep) = crate::panels::text::clamp_pauses(min, keep);
+                }
+                let rest: Vec<(&String, &Value)> = m.iter().filter(|(k, _)| !pauses.contains(&k.as_str())).collect();
+                if !rest.is_empty() {
+                    let Some(d) = app.ui.extras.dialog.as_mut() else { return err("no menu dialog is open") };
+                    for (k, v) in rest {
+                        d.params[k.as_str()] = v.clone();
+                    }
                 }
             }
             ok(Value::Null)

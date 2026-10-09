@@ -5,7 +5,8 @@
 //! sequence transcript as speaker paragraphs of clickable words (click, Shift+click to extend);
 //! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands). Crossed-out
 //! text (cut spans) shows struck through in place and restores on click; take groups get a
-//! `Take 2/3` chip and an optional Takes list (`takes.*` commands).
+//! `Take 2/3` chip and an optional Takes list (`takes.*` commands). Remove Pauses opens a dialog
+//! (`text.pauses.*`) with the threshold, the length kept and a live count from `transcript.pauses`.
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat};
@@ -607,10 +608,12 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut x = bar.min.x + sw + 10.0;
     let range = sel.map(|(a, b)| json!({"from": a.min(b), "to": a.max(b)}));
     let has_words = !words.is_empty();
-    let tools: [(Icon, &str, &str, bool, &str, Value); 7] = [
+    let tools: [(Icon, &str, &str, bool, &str, Value); 8] = [
         (Icon::Razor, "text.transcript.extract", "Extract selected text", sel.is_some(), "transcript.extract", range.clone().unwrap_or_default()),
         (Icon::Trash, "text.transcript.lift", "Lift selected text", sel.is_some(), "transcript.lift", range.unwrap_or_default()),
         (Icon::Link, "text.transcript.removeFillers", "Remove filler words", has_words, "transcript.removeFillers", json!({})),
+        // no thresholds: `menus::invoke` opens the Remove Pauses dialog
+        (Icon::Pause, "text.transcript.removePauses", "Remove pauses…", has_words, "transcript.removePauses", json!({})),
         (Icon::Captions, "text.transcript.createCaptions", "Create captions", has_words, "transcript.createCaptions", json!({})),
         (Icon::Sparkle, "text.transcript.detectTakes", "Detect takes", has_words, "takes.detect", json!({})),
         (Icon::Undo, "text.transcript.restoreAll", "Restore all crossed-out text", !cuts.is_empty(), "transcript.restoreAll", json!({})),
@@ -807,6 +810,102 @@ fn transcribing(app: &mut FilmcraftApp, ui: &mut egui::Ui, c: egui::Pos2, job: &
     app.auto.add("text.transcript.cancel", r, "Cancel transcription");
     if resp.clicked() {
         job.progress.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Remove Pauses dialog limits (seconds): the minimum pause and the length each pause keeps.
+const PAUSE_MIN: std::ops::RangeInclusive<f64> = 0.1..=10.0;
+const PAUSE_KEEP: std::ops::RangeInclusive<f64> = 0.0..=2.0;
+
+/// The Remove Pauses values in range: minimum 0.1–10 s, kept 0–2 s and never above the minimum
+/// (NaN falls back to the defaults).
+pub fn clamp_pauses(min: f64, keep: f64) -> (f64, f64) {
+    let min = if min.is_nan() { 1.0 } else { min.clamp(*PAUSE_MIN.start(), *PAUSE_MIN.end()) };
+    let keep = if keep.is_nan() { 0.15 } else { keep.clamp(*PAUSE_KEEP.start(), *PAUSE_KEEP.end()) };
+    (min, keep.min(min))
+}
+
+/// Open the Remove Pauses dialog (Text panel button, Sequence ▸ Transcript ▸ Remove Pauses).
+pub fn open_pauses_dialog(app: &mut FilmcraftApp) -> Result<Value, String> {
+    if let Some(c) = filmcraft_engine::find_command("transcript.removePauses")
+        && let Err(e) = (c.enabled)(&app.session)
+    {
+        app.ui.status = e.clone();
+        return Err(e);
+    }
+    app.ui.transcript_pause_dialog = true;
+    Ok(json!({"dialog": "text.pauses"}))
+}
+
+/// The Remove Pauses dialog: pauses longer than the minimum are shortened to the kept length, with
+/// a live count from `transcript.pauses`. Apply runs `transcript.removePauses` (one undo step).
+pub fn pauses_dialog(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    if !app.ui.transcript_pause_dialog {
+        return;
+    }
+    let (mut min, mut keep) = clamp_pauses(app.ui.transcript_pause_min, app.ui.transcript_pause_keep);
+    let (count, seconds, error) = match app.session.execute("transcript.pauses", json!({"minSeconds": min, "keepSeconds": keep})) {
+        Ok(v) => (v["count"].as_u64().unwrap_or(0), v["seconds"].as_f64().unwrap_or(0.0), None),
+        Err(e) => (0, 0.0, Some(e.to_string())),
+    };
+    let line = format!("{count} {}, {seconds:.1} s", if count == 1 { "pause" } else { "pauses" });
+    let mut elems: Vec<(&str, Rect, String)> = Vec::new();
+    let mut action: Option<bool> = None;
+    egui::Window::new("Remove Pauses")
+        .id(egui::Id::new("text-pauses-dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(340.0)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            egui::Grid::new("text-pauses-grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                ui.label("Pauses longer than:");
+                let r = ui.add(egui::DragValue::new(&mut min).range(PAUSE_MIN).speed(0.05).suffix(" s").max_decimals(2));
+                elems.push(("text.pauses.min", r.rect, "Minimum pause".into()));
+                ui.end_row();
+                ui.label("Shorten to:");
+                let r = ui.add(egui::DragValue::new(&mut keep).range(PAUSE_KEEP).speed(0.05).suffix(" s").max_decimals(2));
+                elems.push(("text.pauses.keep", r.rect, "Pause length to keep".into()));
+                ui.end_row();
+            });
+            let r = ui.label(egui::RichText::new(&line).strong());
+            elems.push(("text.pauses.count", r.rect, line.clone()));
+            if let Some(e) = &error {
+                ui.colored_label(Color32::from_rgb(0xe0, 0x60, 0x60), e);
+            }
+            ui.label(egui::RichText::new("Pauses longer than the minimum are shortened to the kept length. They show crossed out and can be restored.").weak());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let r = ui.button("Cancel");
+                elems.push(("text.pauses.cancel", r.rect, "Cancel".into()));
+                if r.clicked() {
+                    action = Some(false);
+                }
+                let r = ui.add_enabled(count > 0, egui::Button::new("Apply"));
+                elems.push(("text.pauses.apply", r.rect, if count > 0 { "Apply".into() } else { "Apply (no pauses)".into() }));
+                if r.clicked() && count > 0 {
+                    action = Some(true);
+                }
+            });
+        });
+    for (id, r, label) in elems {
+        app.auto.add(id, r, &label);
+    }
+    let (min, keep) = clamp_pauses(min, keep);
+    app.ui.transcript_pause_min = min;
+    app.ui.transcript_pause_keep = keep;
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        action = Some(false);
+    }
+    match action {
+        Some(false) => app.ui.transcript_pause_dialog = false,
+        Some(true) => {
+            app.ui.transcript_pause_dialog = false;
+            if let Err(e) = crate::menus::invoke(app, ctx, "transcript.removePauses", json!({"minSeconds": min, "keepSeconds": keep})) {
+                app.ui.status = e;
+            }
+        }
+        None => {}
     }
 }
 

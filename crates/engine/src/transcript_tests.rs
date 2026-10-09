@@ -129,6 +129,47 @@ fn remove_fillers_pauses_and_create_captions() {
 }
 
 #[test]
+fn pauses_preview_matches_remove_pauses() {
+    let (mut s, item, _) = session();
+    assert!(s.execute("transcript.pauses", json!({})).is_err(), "disabled without a transcript");
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    let before = s.active_sequence().unwrap().duration();
+    let p = json!({"minSeconds": 1.0, "keepSeconds": 0.1});
+    let r = s.execute("transcript.pauses", p.clone()).unwrap();
+    assert_eq!(r["count"], 1, "{r}");
+    assert_eq!(s.active_sequence().unwrap().duration(), before, "read-only");
+    let removed = s.execute("transcript.removePauses", p).unwrap();
+    assert_eq!(removed["removed"], r["count"], "{removed}");
+    assert!((removed["seconds"].as_f64().unwrap() - r["seconds"].as_f64().unwrap()).abs() < 1e-9, "{removed} vs {r}");
+    s.execute("edit.undo", json!({})).unwrap();
+
+    // a lower threshold also finds the shorter gaps
+    let r = s.execute("transcript.pauses", json!({"minSeconds": 0.05, "keepSeconds": 0.0})).unwrap();
+    assert!(r["count"].as_u64().unwrap() > 1, "{r}");
+    let r = s.execute("transcript.pauses", json!({"minSeconds": 30.0})).unwrap();
+    assert_eq!(r, json!({"count": 0, "seconds": 0.0}));
+
+    // hostile values are clamped, never panic
+    for p in [
+        json!({"minSeconds": -5.0, "keepSeconds": -1.0}),
+        json!({"minSeconds": f64::MAX, "keepSeconds": f64::MAX}),
+        json!({"minSeconds": 1e300, "keepSeconds": -1e300}),
+        json!({"minSeconds": "x", "keepSeconds": null}),
+        json!({"minSeconds": 0.5, "keepSeconds": 5.0}),
+    ] {
+        let r = s.execute("transcript.pauses", p.clone()).unwrap();
+        assert!(r["count"].is_u64() && r["seconds"].as_f64().is_some_and(|x| x >= 0.0), "{p}: {r}");
+    }
+    // NaN can't travel through JSON; the clamp maps it to the default
+    use crate::transcript::clamp_seconds;
+    assert_eq!(clamp_seconds(Some(f64::NAN), 1.0, 0.0, 10.0), 1.0);
+    assert_eq!(clamp_seconds(None, 0.15, 0.0, 10.0), 0.15);
+    assert_eq!(clamp_seconds(Some(f64::INFINITY), 1.0, 0.0, 10.0), 10.0);
+    assert_eq!(clamp_seconds(Some(f64::NEG_INFINITY), 1.0, 0.0, 10.0), 0.0);
+    assert_eq!(s.active_sequence().unwrap().duration(), before);
+}
+
+#[test]
 fn set_delete_and_models() {
     let (mut s, item, _) = session();
     let t = json!({"language": "en", "words": [

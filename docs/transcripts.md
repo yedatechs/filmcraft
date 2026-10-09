@@ -31,9 +31,30 @@ the control channel and MCP agents can do the same.
 | `transcript.extract` / `transcript.lift` | Extract (ripple) or lift the words' frames on the targeted tracks. |
 | `transcript.renameSpeaker` | Rename a speaker by name (every transcript) or by index in one `item`. |
 | `transcript.removeFillers` | Ripple-delete filler words (`fillers`, default um/uh/erm/…; phrases such as "you know" allowed). |
-| `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping `keepSeconds` of air on both sides. |
+| `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping `keepSeconds` of air on both sides. One undo step. From the menu or the Text panel (no `minSeconds` / `keepSeconds`) it opens the Remove Pauses dialog instead of running. |
+| `transcript.pauses` | Read-only preview of Remove Pauses: `{minSeconds=1.0, keepSeconds=0.15}` → `{count, seconds}` (how many pauses would be shortened and the total length removed). Values are clamped (0–3600 s, kept ≤ minimum; missing or NaN → the defaults). |
 | `transcript.createCaptions` | Lay the words out as captions on a new caption track (`maxChars`, `lines`, `minSeconds`, `maxSeconds`, `gapFrames`). |
 | `transcript.models` / `transcript.downloadModel` | List the speech models (size, licence, installed) / download one. |
+
+## Remove Pauses dialog
+
+The Text panel ▸ Transcript toolbar button **Remove pauses…** (`text.transcript.removePauses`,
+enabled when the sequence has live words) and Sequence ▸ Transcript ▸ Remove Pauses open the
+**Remove Pauses** dialog (Descript's "shorten gaps longer than X to Y"):
+
+| Id | Control |
+|---|---|
+| `text.pauses.min` | Pauses longer than (seconds, 0.1–10, step 0.05; default 1.0) |
+| `text.pauses.keep` | Shorten to (seconds, 0–2, step 0.05, never above the minimum; default 0.15) |
+| `text.pauses.count` | Live "N pauses, S.s s" from `transcript.pauses` (the element's label carries the text) |
+| `text.pauses.apply` | Apply: runs `transcript.removePauses {minSeconds, keepSeconds}` and closes; disabled (label "Apply (no pauses)") when the count is 0 |
+| `text.pauses.cancel` | Cancel (or Escape) |
+
+The shortened pauses show crossed out in the transcript (wordless cut spans) and restore on click;
+one Edit ▸ Undo brings them all back. The two values are remembered between sessions
+(`UiState::transcript_pause_min` / `transcript_pause_keep`). Agents set them on the open dialog with
+`ui.set {"menuDialog": {"pauseMin": 0.5, "pauseKeep": 0.15}}` (clamped like the drag values), then
+`ui.click {"id": "text.pauses.apply"}`.
 
 ## Crossed-out text and takes
 

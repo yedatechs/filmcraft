@@ -411,6 +411,15 @@ pub struct UiState {
     /// Text panel ▸ Transcript: the Takes list is shown below the words.
     #[serde(default)]
     pub transcript_show_takes: bool,
+    /// Text panel ▸ Transcript ▸ Remove Pauses dialog: pauses longer than this (seconds) are shortened.
+    #[serde(default = "pause_min")]
+    pub transcript_pause_min: f64,
+    /// Text panel ▸ Transcript ▸ Remove Pauses dialog: the length each pause keeps (seconds).
+    #[serde(default = "pause_keep")]
+    pub transcript_pause_keep: f64,
+    /// Text panel ▸ Transcript: the Remove Pauses dialog is open.
+    #[serde(default)]
+    pub transcript_pause_dialog: bool,
     /// Text panel ▸ Transcript ▸ Takes: only groups flagged "needs re-record".
     #[serde(default)]
     pub transcript_takes_redo_only: bool,
@@ -789,6 +798,14 @@ fn captions_tab() -> String {
     "Captions".into()
 }
 
+fn pause_min() -> f64 {
+    1.0
+}
+
+fn pause_keep() -> f64 {
+    0.15
+}
+
 fn yes() -> bool {
     true
 }
@@ -822,6 +839,9 @@ impl Default for UiState {
             transcript_sel: None,
             transcript_search: String::new(),
             transcript_show_takes: false,
+            transcript_pause_min: pause_min(),
+            transcript_pause_keep: pause_keep(),
+            transcript_pause_dialog: false,
             transcript_takes_redo_only: false,
             transcript_takes_open: None,
             play_after_render: true,
