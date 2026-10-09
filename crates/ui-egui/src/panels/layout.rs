@@ -349,6 +349,13 @@ pub fn clip_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
 pub fn controls_row(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, x0: f32, clip: ClipId, prefix: &str, actions: &mut Vec<(String, Value)>) {
     refresh(app);
     let t = app.tokens;
+    if let Some(name) = filmcraft_engine::scenes::scene_owning(&app.session, clip) {
+        // arranged by a scene: the buttons would be overwritten on the next re-apply
+        let text = format!("Set by scene \"{name}\" (Sequence ▸ Scenes…)");
+        let tr = ui.painter().text(pos2(x0, r.center().y), egui::Align2::LEFT_CENTER, &text, crate::theme::Tokens::ui(11.0), t.text_dim);
+        app.auto.add(&format!("{prefix}.layout.scene"), tr, &text);
+        return;
+    }
     let cur = info(app).filter(|i| i.clip == clip).cloned();
     let size = 16.0;
     let step = 18.0;
@@ -432,8 +439,6 @@ struct Drag {
     scale: f64,
     scale_width: f64,
     uniform: bool,
-    /// Undo steps before the drag: everything it does folds into the one after.
-    undo_len: usize,
     begun: bool,
 }
 
@@ -554,23 +559,17 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
             starts.push((Some(n), hresp));
         }
         starts.push((None, resp.clone()));
-        if let Some((handle, sr)) = starts.iter().find(|(_, sr)| sr.drag_started())
+        if let Some((_, sr)) = starts.iter().find(|(_, sr)| sr.drag_started())
+            && let Some(name) = filmcraft_engine::scenes::scene_owning(&app.session, i.clip)
+        {
+            // scene-owned clips are arranged by their scene; a hand edit would be overwritten
+            let _ = sr;
+            app.ui.status = format!("This clip's layout is set by the scene \"{name}\". Open Sequence ▸ Scenes… to change it.");
+        } else if let Some((handle, sr)) = starts.iter().find(|(_, sr)| sr.drag_started())
             && let Some((position, scale, scale_width, uniform)) = motion_of(app, i.clip, frame)
         {
             let start = ui.input(|inp| inp.pointer.press_origin()).or(sr.interact_pointer_pos()).unwrap_or(r.center());
-            drag = Some(Drag {
-                clip: i.clip,
-                handle: *handle,
-                start,
-                screen: r,
-                bx: i.bx,
-                position,
-                scale,
-                scale_width,
-                uniform,
-                undo_len: app.session.history.undo.len(),
-                begun: false,
-            });
+            drag = Some(Drag { clip: i.clip, handle: *handle, start, screen: r, bx: i.bx, position, scale, scale_width, uniform, begun: false });
         }
         let dragging = starts.iter().any(|(_, sr)| sr.dragged());
         let stopped = starts.iter().any(|(_, sr)| sr.drag_stopped());
@@ -588,34 +587,24 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                 let (p, s, sw) = drag_target(d, cur, k, off);
                 let begin = !d.begun;
                 d.begun = true;
-                actions.push((
-                    "effects.setParam".into(),
-                    json!({"clip": d.clip.0, "effect": "motion", "param": "position", "value": p, "merge": true, "begin": begin}),
-                ));
+                // one command, one merged undo step for the whole drag (`layout.set`)
+                let mut params = json!({"clips": [d.clip.0], "position": p, "merge": true, "begin": begin});
                 if d.handle.is_some() {
-                    actions.push(("effects.setParam".into(), json!({"clip": d.clip.0, "effect": "motion", "param": "scale", "value": s, "merge": true})));
+                    params["scale"] = json!(s);
                     if !d.uniform {
-                        actions.push((
-                            "effects.setParam".into(),
-                            json!({"clip": d.clip.0, "effect": "motion", "param": "scale_width", "value": sw, "merge": true}),
-                        ));
+                        params["scaleWidth"] = json!(sw);
                     }
                 }
+                actions.push(("layout.set".into(), params));
             }
         }
         box_resp = Some(resp);
     }
-    // ---- run the drag's edits as one undo step
-    let undo_len = drag.map(|d| d.undo_len);
+    // ---- run the drag's edits (`layout.set` with `merge`: one undo step per drag)
     for (c, p) in actions {
         if let Err(e) = app.session.execute(&c, p) {
             app.ui.status = e.to_string();
         }
-    }
-    if let Some(base) = undo_len
-        && app.session.history.undo.len() > base + 1
-    {
-        app.session.history.undo.truncate(base + 1);
     }
     let released = ui.input(|i| !i.pointer.any_down());
     if drag.is_some() {
@@ -693,7 +682,6 @@ mod tests {
             scale: 50.0,
             scale_width: 50.0,
             uniform: true,
-            undo_len: 0,
             begun: false,
         }
     }

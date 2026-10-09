@@ -23,6 +23,7 @@ nothing. None of them has a menu path or shortcut of its own: the UI adds its La
 | `layout.place` | `at`: `topLeft` `topRight` `bottomLeft` `bottomRight` `top` `bottom` `left` `right` `center` `full`; `size` = 25 (% of the frame width); `margin` = 3 (% of the frame width) | Sets Motion `position` and uniform `scale` (`uniform_scale` on) so the clip's visible box has width `size` and sits `margin` from the edges of its place. `full` fits the whole source in the frame, centred, whatever the shape. | Place Clip |
 | `layout.shape` | `shape`: `circle` `rounded` `square` `free`; `radius` = 12 (% of the shorter side, `rounded` only) | Replaces the `Layout shape` mask (`free` removes it; other masks stay), then re-places the clip: the box keeps its width and the edges its place touches (a bottom-right box stays bottom right with the same margin; a custom box keeps its centre; a full clip stays full). | Shape Clip |
 | `layout.swap` | `clips: [a, b]?` (default: the two top-most enabled, non-graphic video clips whose span covers the playhead) | The two clips exchange place and shape: each gets the other's box (re-fitted to its own source the way `layout.shape` re-places) and layout mask. Swapping twice restores both. | Swap Layouts |
+| `layout.set` | `clips?`, `position: [x, y]?`, `scale?`, `scaleWidth?`, `merge?`, `begin?` | Motion position / scale of the clips at the playhead (keyframes when animated). `merge` folds consecutive calls into one undo step and `begin` starts a new one: the Program monitor's move and scale drags use it, so a drag is one undo step even though it changes several parameters. |
 | `layout.inspect` | `clips?`, `time?` | `{clips: [{clip, at, size, margin, shape, radius, box: [x, y, w, h], track}]}`: `at` is the place the box is at (within 1 % of the frame width) or `"custom"`, `margin` the margin it implies (`null` for `center`, `full`, `custom`), `shape` `"custom"` for a hand-edited layout mask, `radius` `null` unless rounded. | – |
 | `layout.pick` | `x`, `y` (frame pixels), `time?` | `{clips: [id…]}`: the enabled video clips (enabled tracks, graphics left out) whose span covers the time and whose visible box contains the point, top track first. | – |
 
@@ -99,6 +100,8 @@ above, so it is one undo step.
 | `properties.layout.place.{at}`, `properties.layout.shape.{s}` | the same row in the Properties panel |
 
 ## Scenes (`scenes.*`)
+
+Clips whose media item appears in a scene are arranged by the scene: the Program monitor refuses to drag them (the status bar names the scene), and the Effect Controls / Properties layout row shows "Set by scene …" instead of buttons. Change the scene in Sequence ▸ Scenes….
 
 A layout attached to a span of the transcript, so the arrangement follows the words when takes change.
 

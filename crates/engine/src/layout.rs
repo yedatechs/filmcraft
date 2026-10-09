@@ -13,7 +13,7 @@ use filmcraft_project::{ClipId, EffectInstance, ItemKind, Mask, MaskPath, Param,
 use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, bad, clips_p, f64_p, has_seq, str_p, time_p};
+use crate::commands::{CommandSpec, bad, bool_p, clips_p, f64_p, has_seq, str_p, time_p};
 use crate::{EngineError, Result, Session};
 
 type Run = fn(&mut Session, &Value) -> Result<Value>;
@@ -40,6 +40,14 @@ pub fn commands() -> Vec<CommandSpec> {
         ),
         spec("layout.shape", "Shape Clip", r#"{"clips":[id]?,"shape":"circle"|"rounded"|"square"|"free","radius":0..50=12}"#, has_layout_clips, shape, true),
         spec("layout.swap", "Swap Layouts", r#"{"clips":[id,id]?}"#, has_seq, swap, true),
+        spec(
+            "layout.set",
+            "Transform Clip",
+            r#"{"clips":[id]?,"position":[x,y]?,"scale":pct?,"scaleWidth":pct?,"merge":bool?,"begin":bool?}"#,
+            has_layout_clips,
+            set,
+            true,
+        ),
         spec("layout.inspect", "Inspect Layout", r#"{"clips":[id]?,"time":ticks?}"#, has_layout_clips, inspect, false),
         spec("layout.pick", "Pick Clip at Point", r#"{"x":px,"y":px,"time":ticks?}"#, has_seq, pick, false),
     ]
@@ -255,6 +263,55 @@ fn place(s: &mut Session, p: &Value) -> Result<Value> {
         None => Ok(()),
     })?;
     Ok(json!({"clips": clips.iter().map(|c| c.0).collect::<Vec<_>>(), "at": at.name(), "size": size, "margin": margin}))
+}
+
+/// `layout.set`: Motion position / scale / scale width of the clips at the playhead in one step
+/// (keyframes when animated). `merge` folds consecutive calls into one undo step (the Program
+/// monitor's move and scale drags, which change several parameters at once); `begin` starts a new
+/// step.
+fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "layout.set";
+    let position = match p.get("position") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let a = v.as_array().filter(|a| a.len() == 2).ok_or_else(|| bad(CMD, "`position` must be [x, y]"))?;
+            let (x, y) = (a[0].as_f64().unwrap_or(f64::NAN), a[1].as_f64().unwrap_or(f64::NAN));
+            if !x.is_finite() || !y.is_finite() {
+                return Err(bad(CMD, "`position` must be finite numbers"));
+            }
+            Some((x.clamp(-1e6, 1e6), y.clamp(-1e6, 1e6)))
+        }
+    };
+    let scale = f64_p(p, "scale").filter(|v| v.is_finite()).map(|v| v.clamp(0.0, lay::MAX_SCALE));
+    let scale_width = f64_p(p, "scaleWidth").filter(|v| v.is_finite()).map(|v| v.clamp(0.0, lay::MAX_SCALE));
+    if position.is_none() && scale.is_none() && scale_width.is_none() {
+        return Err(bad(CMD, "give `position`, `scale` or `scaleWidth`"));
+    }
+    let clips = target_clips(s, p, CMD)?;
+    let t = s.playhead();
+    let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("layout.set:{}", clips.iter().map(|c| c.0.to_string()).collect::<Vec<_>>().join(",")));
+    if bool_p(p, "begin").unwrap_or(false) {
+        s.history.merge_key = None;
+    }
+    s.edit_sequence_as("Transform Clip", merge.as_deref(), |q, _, _| {
+        for c in &clips {
+            let (_, it) = q.find_item_mut(*c).ok_or_else(|| bad(CMD, "the clip is gone"))?;
+            let mt = media_time(it, t);
+            let m = it.effect_mut("motion").ok_or_else(|| bad(CMD, "the clip has no Motion effect"))?;
+            m.enabled = true;
+            if let Some((x, y)) = position {
+                param_mut(m, "position").ok_or_else(|| bad(CMD, "Motion has no position"))?.set_at(mt, ParamValue::Vec2(Vec2::new(x, y)));
+            }
+            if let Some(v) = scale {
+                param_mut(m, "scale").ok_or_else(|| bad(CMD, "Motion has no scale"))?.set_at(mt, ParamValue::Float(v));
+            }
+            if let Some(v) = scale_width {
+                param_mut(m, "scale_width").ok_or_else(|| bad(CMD, "Motion has no scale width"))?.set_at(mt, ParamValue::Float(v));
+            }
+        }
+        Ok(())
+    })?;
+    Ok(json!({"clips": clips.iter().map(|c| c.0).collect::<Vec<_>>()}))
 }
 
 fn shape(s: &mut Session, p: &Value) -> Result<Value> {

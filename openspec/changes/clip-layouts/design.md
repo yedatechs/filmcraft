@@ -129,10 +129,8 @@ tracker for text that scrolls vertically.
 
 ## 7. Follow-ups recorded
 
-From the slices as built: the Program monitor scale drag changes two Motion parameters whose
-`effects.setParam` merge keys differ, so the overlay trims the undo stack itself; a
-`layout.set {clips, position, scale, merge}` engine command using `edit_merged` would make that a
-proper single step. Shift-anchored scaling and click-on-empty-to-deselect are not done. Redaction
+From the slices as built: `layout.set {clips, position, scale, scaleWidth, merge, begin}` makes
+a monitor drag one merged undo step (done at integration). Shift-anchored scaling and click-on-empty-to-deselect are not done. Redaction
 keeps queued backward tracking runs in a process-global list (`redact::PENDING`); it should live on
 the `Session`. Scroll-following redaction tracker, recording, auto zoom.
 

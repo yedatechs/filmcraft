@@ -298,3 +298,30 @@ fn hostile_params() {
     assert_eq!(inspect(&mut s, v1)["at"], json!("top"));
     assert!(s.execute("layout.pick", json!({"x": f64::MAX, "y": 1})).unwrap()["clips"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn set_moves_and_scales_as_one_merged_step() {
+    let (mut s, a, _) = session();
+    let before = s.history.undo.len();
+    let (p0, _) = motion(&s, a);
+    // a drag: several merged calls, one undo step; `begin` starts the next drag's step
+    s.execute("layout.set", json!({"clips": [a.0], "position": [100.0, 80.0], "scale": 40.0, "merge": true, "begin": true})).unwrap();
+    s.execute("layout.set", json!({"clips": [a.0], "position": [120.0, 90.0], "scale": 42.0, "merge": true})).unwrap();
+    s.execute("layout.set", json!({"clips": [a.0], "position": [130.0, 95.0], "merge": true})).unwrap();
+    assert_eq!(s.history.undo.len(), before + 1, "one undo step for the whole drag");
+    let (p, sc) = motion(&s, a);
+    assert_eq!(vec2(&p), (130.0, 95.0));
+    assert_eq!(float(&sc), 42.0);
+    s.execute("layout.set", json!({"clips": [a.0], "position": [10.0, 10.0], "merge": true, "begin": true})).unwrap();
+    assert_eq!(s.history.undo.len(), before + 2, "begin starts a new step");
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    let (p, _) = motion(&s, a);
+    assert_eq!(vec2(&p), vec2(&p0), "both steps undone");
+    // hostile input
+    assert!(s.execute("layout.set", json!({"clips": [a.0]})).is_err());
+    assert!(s.execute("layout.set", json!({"clips": [a.0], "position": [1.0]})).is_err());
+    assert!(s.execute("layout.set", json!({"clips": [a.0], "position": ["x", 2.0]})).is_err());
+    s.execute("layout.set", json!({"clips": [a.0], "scale": 1e300})).unwrap();
+    assert!(float(&motion(&s, a).1) <= filmcraft_edit::layout::MAX_SCALE);
+}
