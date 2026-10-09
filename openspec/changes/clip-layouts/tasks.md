@@ -16,8 +16,8 @@
 
 ## 4. Tracked redaction (F15)
 
-- [ ] 4.1 `redact.add / list / remove` with forward-then-backward tracking jobs; engine tests
-- [ ] 4.2 Redact Area… draw mode in the Program monitor; menu entries; headless test; docs
+- [x] 4.1 `redact.add / list / remove` with forward-then-backward tracking jobs; engine tests
+- [x] 4.2 Redact Area… draw mode in the Program monitor; menu entries; headless test; docs
 
 ## 5. Scenes (F9.3)
 
