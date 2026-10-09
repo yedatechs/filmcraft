@@ -151,3 +151,42 @@ fn dragging_across_words_selects_them() {
     let st = d.ok("ui.inspect", json!({}));
     assert_eq!(st["ui"]["transcript_sel"], json!([4, 3]), "{}", st["ui"]["transcript_sel"]);
 }
+
+#[test]
+fn selection_after_a_removed_pause_crosses_out_the_right_words() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    d.frames(2);
+    d.click("text.tab.Transcript");
+    // "yo", a 2.4 s pause, then "what a what a time"
+    let mut probe = Session::default();
+    probe.execute("file.openDemoProject", json!({})).unwrap();
+    let a = probe.active_sequence().unwrap().audio_tracks[0].items[0].clone();
+    let tk = |s: f64| a.source_in.0 + (s * filmcraft_time::TICKS_PER_SECOND as f64).round() as i64;
+    let mut words: Vec<Value> = vec![json!({"text": "yo", "start": tk(0.1), "end": tk(0.4), "speaker": 0})];
+    for (i, w) in ["what", "a", "what", "a", "time"].iter().enumerate() {
+        let s = 2.8 + i as f64 * 0.4;
+        words.push(json!({"text": w, "start": tk(s), "end": tk(s + 0.3), "speaker": 0}));
+    }
+    d.exec("transcript.set", json!({"item": a.item.0, "transcript": {"language": "en", "words": words}}));
+    d.frames(3);
+    d.exec("transcript.removePauses", json!({"minSeconds": 1.0, "keepSeconds": 0.15}));
+    d.frames(3);
+    assert_eq!(d.cuts(), 1, "the pause is a cut span");
+    assert_eq!(d.live_words(), ["yo", "what", "a", "what", "a", "time"]);
+    d.ok("ui.drag", json!({"from": {"id": "text.transcript.word.1"}, "to": {"id": "text.transcript.word.2"}}));
+    d.frames(2);
+    let st = d.ok("ui.inspect", json!({}));
+    assert_eq!(st["ui"]["transcript_sel"], json!([1, 2]), "{}", st["ui"]["transcript_sel"]);
+    d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
+    d.frames(3);
+    assert_eq!(d.live_words(), ["yo", "what", "a", "time"], "the selected pair is crossed out");
+    let r = d.exec("transcript.cuts", json!({}));
+    let texts: Vec<String> = r["cuts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["words"].as_array().unwrap().iter().filter_map(|w| w["text"].as_str()).collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(texts, ["", "what a"], "{r}");
+}

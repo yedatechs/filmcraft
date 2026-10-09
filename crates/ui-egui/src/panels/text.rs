@@ -732,6 +732,9 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     if resp.drag_started() {
                         app.ui.transcript_drag = Some(i);
                         app.ui.transcript_sel = Some((i, i));
+                        // a drag is not a click, so give the panel the keyboard focus itself:
+                        // Cmd+Backspace must act on the words just selected
+                        app.ui.focused = crate::dock::PanelKind::Text;
                     }
                     if let Some(anchor) = app.ui.transcript_drag
                         && let Some(pos) = ui.input(|inp| inp.pointer.interact_pos())

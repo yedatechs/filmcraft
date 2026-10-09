@@ -52,6 +52,8 @@ pub fn threshold(db: &[f32]) -> f32 {
 
 /// Quiet stretches shorter than this inside a word do not split it (a stop consonant's closure).
 const MAX_GAP_FRAMES: usize = 15;
+/// How far (frames) a word may grow past whisper's span into audio that is still voiced.
+const MAX_GROW_FRAMES: usize = 50;
 
 /// Frames searched on each side of a word boundary for the quietest moment between two words.
 const BOUNDARY_SEARCH_FRAMES: usize = 12;
@@ -104,10 +106,18 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
     }
     let th = threshold(&db);
     let frame_ticks = TICKS_PER_SAMPLE * FRAME as i64;
-    for w in words {
-        let a = (w.start.0 / frame_ticks).max(0) as usize;
-        let b = (((w.end.0 + frame_ticks - 1) / frame_ticks).max(0) as usize).min(db.len());
+    let spans: Vec<(usize, usize)> = words
+        .iter()
+        .map(|w| ((w.start.0 / frame_ticks).max(0) as usize, (((w.end.0 + frame_ticks - 1) / frame_ticks).max(0) as usize).min(db.len())))
+        .collect();
+    // the previous word's final end bounds how far a word may grow backwards; the next word's
+    // span bounds growth forwards (so two words never claim the same frames)
+    let mut prev_end = 0usize;
+    for (k, w) in words.iter_mut().enumerate() {
+        let (a, b) = spans[k];
+        let next_start = spans.get(k + 1).map(|s| s.0).unwrap_or(db.len());
         if b <= a + MIN_WORD_FRAMES {
+            prev_end = prev_end.max(b);
             continue;
         }
         let Some(frames) = db.get(a..b) else { continue };
@@ -142,19 +152,38 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
             best = Some(r);
         }
         // nothing voiced at all: leave the word alone
-        let Some((s, e, _)) = best else { continue };
+        let Some((s, e, _)) = best else {
+            prev_end = prev_end.max(b);
+            continue;
+        };
         let (mut s, mut e) = (a + s, a + e);
         if e < s + MIN_WORD_FRAMES {
             // too short to be a word on its own: pad to the minimum inside the original span
             e = (s + MIN_WORD_FRAMES).min(b);
             s = e.saturating_sub(MIN_WORD_FRAMES).max(a);
         }
-        if s > a {
+        // Whisper's times undershoot: when the voiced run reaches the span's edge and the audio
+        // stays voiced beyond it, the word keeps going (up to the neighbour's span, at most
+        // MAX_GROW_FRAMES), so a pause cut after "yo" starts after "yo" and not inside it.
+        if e >= b {
+            let limit = next_start.max(b).min(b + MAX_GROW_FRAMES).min(db.len());
+            while e < limit && db.get(e).is_some_and(|l| *l >= th) {
+                e += 1;
+            }
+        }
+        if s <= a {
+            let limit = prev_end.min(a).max(a.saturating_sub(MAX_GROW_FRAMES));
+            while s > limit && db.get(s - 1).is_some_and(|l| *l >= th) {
+                s -= 1;
+            }
+        }
+        if s != a {
             w.start = filmcraft_time::Tick(s as i64 * frame_ticks);
         }
-        if e < b {
+        if e != b {
             w.end = filmcraft_time::Tick(e as i64 * frame_ticks).max(w.start);
         }
+        prev_end = e.max(prev_end);
     }
 }
 
@@ -192,6 +221,36 @@ mod tests {
         assert_eq!(words[0].end, seconds_tick(0.40));
         assert_eq!(words[2].start, seconds_tick(1.0));
         refine_boundaries(&[], &mut words);
+    }
+
+    #[test]
+    fn a_word_grows_into_voiced_audio_past_its_span_before_a_pause() {
+        // "yo" is voiced 0.10–0.45 s, then silence until the next word at 2.8 s; whisper's span
+        // ended at 0.25 s, so a pause cut would have started inside the word
+        let sr = SAMPLE_RATE as usize;
+        let mut audio = vec![0.0f32; 3 * sr];
+        for (i, v) in audio.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            if (0.10..0.45).contains(&t) || (2.80..3.00).contains(&t) {
+                *v = 0.5 * (t * 300.0 * std::f32::consts::TAU).sin();
+            }
+        }
+        let w = |text: &str, a: f64, b: f64| Word { text: text.into(), start: seconds_tick(a), end: seconds_tick(b), speaker: None, confidence: 1.0 };
+        let mut words = vec![w("yo", 0.10, 0.25), w("what", 2.80, 3.00)];
+        tighten_words(&audio, &mut words);
+        let end = words[0].end.0 as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+        assert!((0.43..=0.47).contains(&end), "grew to the end of the voiced audio: {end}");
+        let start = words[1].start.0 as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+        assert!((2.78..=2.82).contains(&start), "{start}");
+        // growth stops at the next word's span and at MAX_GROW_FRAMES
+        let mut words = vec![w("a", 0.10, 0.25), w("b", 0.30, 0.45)];
+        tighten_words(&audio, &mut words);
+        assert!(words[0].end <= words[1].start, "{:?} {:?}", words[0].end, words[1].start);
+        let long: Vec<f32> = (0..3 * sr).map(|i| 0.5 * (i as f32 / sr as f32 * 300.0 * std::f32::consts::TAU).sin()).collect();
+        let mut words = vec![w("a", 0.10, 0.25)];
+        tighten_words(&long, &mut words);
+        let end = words[0].end.0 as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+        assert!(end <= 0.25 + 0.5 + 0.011, "{end}");
     }
 
     #[test]

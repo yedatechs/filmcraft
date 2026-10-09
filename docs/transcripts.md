@@ -151,7 +151,9 @@ run time (`mediaAnalysis.speechEngine`, `whisperCppCommand`, `whisperCppModel`, 
   often late by most of the word), the boundary between two touching words moves to the quietest
   10 ms frame within 120 ms of it when that frame is at least 6 dB below the speech on both sides
   (`vad::refine_boundaries`, so a cut never clips the neighbour's last syllable), and the
-  energy-based tightening then keeps each word's voiced part. Punctuation-only segments attach to the word before. Speaker labelling and word
+  energy-based tightening then keeps each word's voiced part and lets a word grow into voiced audio
+  just past whisper's span (up to the neighbour, at most 0.5 s), so a pause removed after "yo"
+  starts after the word and not inside it. Punctuation-only segments attach to the word before. Speaker labelling and word
   tightening are the same as for the built-in model.
 - The command is polled while it runs, so Cancel works and a stuck command times out.
 - Errors are specific: command not found (GUI apps don't see Homebrew's PATH, so the usual

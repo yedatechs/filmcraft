@@ -468,6 +468,9 @@ fn restore_beside(app: &mut FilmcraftApp, cur: usize) -> Result<Value, String> {
     let first = span.after_word.map_or(0, |w| w + 1);
     let r = app.session.execute("transcript.restore", json!({"cut": ci})).map_err(|e| e.to_string())?;
     app.ui.transcript_sel = (count > 0).then_some((first, first + count - 1));
+    let words = filmcraft_engine::transcript::sequence_words(&app.session);
+    let text: Vec<&str> = words.get(first..first + count).into_iter().flatten().map(|w| w.text.as_str()).collect();
+    app.ui.status = if text.is_empty() { "Restored a pause".to_string() } else { format!("Restored: {}", text.join(" ")) };
     Ok(r)
 }
 
@@ -530,11 +533,13 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
             if let Some((a0, b0)) = app.ui.transcript_sel {
                 let (a, b) = (a0.min(b0), a0.max(b0));
                 let at = words.get(a).map(|w| w.start);
+                let text: Vec<&str> = words.get(a..=b).into_iter().flatten().map(|w| w.text.as_str()).collect();
                 let r = app.session.execute("transcript.extract", json!({"from": a, "to": b})).map_err(|e| e.to_string())?;
                 app.ui.transcript_sel = None;
                 if let Some(at) = at {
                     app.session.set_playhead(at);
                 }
+                app.ui.status = format!("Crossed out: {}", text.join(" "));
                 return Ok(r);
             }
             return restore_beside(app, cur);
