@@ -21,9 +21,9 @@
 
 ## 5. Scenes (F9.3)
 
-- [ ] 5.1 Spec `specs/scenes/spec.md`; `Sequence::scenes` + transcript assignments, schema v14, fixture
-- [ ] 5.2 `scenes.*` commands (apply writes hold keyframes); defaults; tests
-- [ ] 5.3 Text panel scene strip; headless test; docs
+- [x] 5.1 Spec `specs/scenes/spec.md`; `Sequence::scenes` + transcript assignments, schema v14, fixture
+- [x] 5.2 `scenes.*` commands (apply writes hold keyframes); defaults; tests
+- [x] 5.3 Text panel scene strip; headless test; docs
 
 ## 6. Acceptance
 
