@@ -56,7 +56,7 @@ place keeps the circle round; swap is an involution; undo restores; pick returns
   Square, Free; Swap With Clip Below; Redact Area…; the current values carry a check mark
   (`layout.inspect`). Ids `layout.menu.place.{at}`, `layout.menu.size.{n}`, `layout.menu.shape.{s}`,
   `layout.menu.swap`, `layout.menu.redact`.
-- **Effect Controls.** The Transform section gets one row of nine small position buttons and four
+- **Effect Controls.** The Transform section (and the Properties panel's Transform section, ids `properties.layout.*`) gets one row of nine small position buttons and four
   shape buttons (`effectControls.layout.{at|shape}.*`), tooltips with the command names.
 - **Explanation.** A first-run hint in the status bar when a video clip is selected in the monitor:
   "Drag to move, corners to scale, right-click for layouts". `docs/layouts.md` and
@@ -128,6 +128,13 @@ tracker for text that scrolls vertically.
   Transcript ▸ Remove Pauses… menu entry opens the same dialog.
 
 ## 7. Follow-ups recorded
+
+From the slices as built: the Program monitor scale drag changes two Motion parameters whose
+`effects.setParam` merge keys differ, so the overlay trims the undo stack itself; a
+`layout.set {clips, position, scale, merge}` engine command using `edit_merged` would make that a
+proper single step. Shift-anchored scaling and click-on-empty-to-deselect are not done. Redaction
+keeps queued backward tracking runs in a process-global list (`redact::PENDING`); it should live on
+the `Session`. Scroll-following redaction tracker, recording, auto zoom.
 
 Recording (screen + camera + mic, OBS-style per-source files, auto sync), click log + auto zoom,
 animated layout transitions, scroll-following redaction tracker. See the owner's spec §11.

@@ -10,9 +10,9 @@
 
 ## 3. Layout UI (F9.2)
 
-- [ ] 3.1 Program monitor: click selects the top-most video clip (cycle on repeat), box + 8 handles, drag to move (merged undo step, snapping), corners scale
-- [ ] 3.2 Right-click menu on the box; the same `Layout` submenu in the timeline clip menu and Clip menu; check marks from `layout.inspect`
-- [ ] 3.3 Effect Controls Transform row of layout buttons; status-bar hint; `docs/monitors.md`; headless tests `layout_ui.rs`
+- [x] 3.1 Program monitor: click selects the top-most video clip (cycle on repeat), box + 8 handles, drag to move (merged undo step, snapping), corners scale
+- [x] 3.2 Right-click menu on the box; the same `Layout` submenu in the timeline clip menu and Clip menu; check marks from `layout.inspect`
+- [x] 3.3 Effect Controls Transform row of layout buttons; status-bar hint; `docs/monitors.md`; headless tests `layout_ui.rs`
 
 ## 4. Tracked redaction (F15)
 

@@ -216,8 +216,8 @@ fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, Stri
     };
     let exec = |app: &mut FilmcraftApp, cmd: &str, p: Value| app.session.execute(cmd, p).map_err(|e| e.to_string());
     if rest == "redact" {
-        app.ui.status = "Redact Area… is not available yet".into();
-        return Ok(Value::Null);
+        // Redact Area…: the Program picture becomes a draw surface (`panels::redact`)
+        return crate::panels::redact::start(app, params);
     }
     if rest == "swap" {
         let p = match params.get("clips") {
