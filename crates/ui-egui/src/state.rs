@@ -405,6 +405,9 @@ pub struct UiState {
     /// `transcript.inspect` lists them).
     #[serde(default)]
     pub transcript_sel: Option<(usize, usize)>,
+    /// Text panel ▸ Transcript: the anchor word of a mouse drag that is selecting words. Not saved.
+    #[serde(skip)]
+    pub transcript_drag: Option<usize>,
     /// Text panel ▸ Transcript: search text.
     #[serde(default)]
     pub transcript_search: String,
@@ -853,6 +856,7 @@ impl Default for UiState {
             text_tab: captions_tab(),
             caption_search: String::new(),
             transcript_sel: None,
+            transcript_drag: None,
             transcript_search: String::new(),
             transcript_show_takes: false,
             transcript_pause_min: pause_min(),

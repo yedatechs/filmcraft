@@ -94,7 +94,9 @@ Shortcuts (Sequence ▸ Takes): Detect Takes `Alt+Shift+T`, Next/Previous Take `
 Cross Out `Alt+Shift+X`, Restore `Alt+Shift+U`, Label `Alt+Shift+L`, Re-record `Alt+Shift+R`. In the
 Text panel, `Cmd+Backspace` crosses out the selected words, and with nothing selected brings back
 the crossed-out text beside the playhead word (Descript's ⌘⌫); `Backspace` extracts and
-`Alt+Backspace` lifts the selection.
+`Alt+Backspace` lifts the selection. Words are selected with the mouse like text: click one,
+Shift+click to extend, or drag across words (in either direction). The toolbar is icons only;
+hovering a button names it at once in a tooltip and in the status bar.
 
 ## Scenes
 
@@ -145,8 +147,11 @@ run time (`mediaAnalysis.speechEngine`, `whisperCppCommand`, `whisperCppModel`, 
   of whisper.cpp's alignment-head presets (`ggml-large-v3-turbo.bin` → `large.v3.turbo`), with
   `-nfa -dtw <preset>` for token-level timestamps (DTW needs flash attention off). Segment
   offsets alone put the pause before a word inside that word; with DTW a word runs from the
-  previous word's end to its own emission time, and the energy-based tightening then keeps its
-  voiced part. Punctuation-only segments attach to the word before. Speaker labelling and word
+  previous word's end to its own emission time (whisper.cpp's own segment start is ignored: it is
+  often late by most of the word), the boundary between two touching words moves to the quietest
+  10 ms frame within 120 ms of it when that frame is at least 6 dB below the speech on both sides
+  (`vad::refine_boundaries`, so a cut never clips the neighbour's last syllable), and the
+  energy-based tightening then keeps each word's voiced part. Punctuation-only segments attach to the word before. Speaker labelling and word
   tightening are the same as for the built-in model.
 - The command is polled while it runs, so Cancel works and a stuck command times out.
 - Errors are specific: command not found (GUI apps don't see Homebrew's PATH, so the usual

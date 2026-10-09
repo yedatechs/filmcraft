@@ -55,9 +55,15 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
 fn tool_button(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, icon: Icon, id: &str, label: &str, enabled: bool) -> bool {
     let t = app.tokens;
-    let resp = ui.interact(r, egui::Id::new(("text-tool", id)), if enabled { Sense::click() } else { Sense::hover() });
-    if enabled && resp.hovered() {
-        ui.painter().rect_filled(r, 3.0, t.hover);
+    // the toolbar is icons only, so a hovered button names itself at once (tooltip without the
+    // usual delay) and in the status bar
+    ui.style_mut().interaction.tooltip_delay = 0.0;
+    let resp = ui.interact(r, egui::Id::new(("text-tool", id)), Sense::click());
+    if resp.hovered() {
+        if enabled {
+            ui.painter().rect_filled(r, 3.0, t.hover);
+        }
+        app.ui.status = if enabled { label.to_string() } else { format!("{label} (nothing to apply it to yet)") };
     }
     icons::paint(ui.painter(), r.shrink(5.0), icon, if enabled { t.icon } else { t.text_faint });
     app.auto.add(id, r, label);
@@ -713,14 +719,29 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     } else if hit {
                         text = text.background_color(t.hover);
                     }
-                    let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
+                    let resp = ui.add(egui::Label::new(text).sense(Sense::click_and_drag()));
                     if take_of_word.get(i).copied().flatten().is_some() {
                         let r = resp.rect;
                         ui.painter().line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, t.accent));
                     }
                     app.auto.add(&format!("text.transcript.word.{i}"), resp.rect, &w.text);
+                    // Selecting words: click selects one, Shift+click extends from the anchor, and
+                    // dragging across words selects the range under the pointer (like text).
+                    if resp.drag_started() {
+                        app.ui.transcript_drag = Some(i);
+                        app.ui.transcript_sel = Some((i, i));
+                    }
+                    if let Some(anchor) = app.ui.transcript_drag
+                        && let Some(pos) = ui.input(|inp| inp.pointer.interact_pos())
+                        && resp.rect.expand2(vec2(2.0, 1.5)).contains(pos)
+                    {
+                        app.ui.transcript_sel = Some((anchor, i));
+                    }
                     if resp.clicked() {
-                        let shift = ui.input(|inp| inp.modifiers.shift);
+                        // the modifier state, or the Shift carried by the click event itself
+                        let shift = ui.input(|inp| {
+                            inp.modifiers.shift || inp.events.iter().any(|e| matches!(e, egui::Event::PointerButton { modifiers, .. } if modifiers.shift))
+                        });
                         app.ui.transcript_sel = Some(match (shift, sel) {
                             (true, Some((a, _))) => (a, i),
                             _ => (i, i),
@@ -736,6 +757,12 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             ui.add_space(8.0);
         }
     });
+    if app.ui.transcript_drag.is_some() && ui.input(|inp| !inp.pointer.any_down()) {
+        app.ui.transcript_drag = None;
+        if let Some((a, b)) = app.ui.transcript_sel {
+            actions.push(("transcript.select".into(), json!({"from": a.min(b), "to": a.max(b)})));
+        }
+    }
     if let Some(r) = takes_rect {
         let tc = |at: i64| format_time(filmcraft_time::Tick(at), rate, df, TimeDisplay::Timecode, 48_000);
         takes_list(app, ui, r, &groups, &tc, &mut actions);

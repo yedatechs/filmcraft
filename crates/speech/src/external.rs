@@ -143,6 +143,15 @@ impl ExternalTranscriber {
             return Err(SpeechError::Model(format!("whisper.cpp output is too large ({len} bytes)")));
         }
         let bytes = std::fs::read(&json_path)?;
+        // `FILMCRAFT_SPEECH_DEBUG_DIR=<dir>` keeps a copy of what whisper.cpp got and said
+        // (`audio.wav`, `out.json`) for debugging word timing; the temp dir itself is deleted.
+        if let Some(dbg) = std::env::var_os("FILMCRAFT_SPEECH_DEBUG_DIR").filter(|v| !v.is_empty()) {
+            let dbg = Path::new(&dbg);
+            if std::fs::create_dir_all(dbg).is_ok() {
+                let _ = std::fs::copy(&wav, dbg.join("audio.wav"));
+                let _ = std::fs::write(dbg.join("out.json"), &bytes);
+            }
+        }
         if !progress(0.92, "Reading words") {
             return Err(SpeechError::Cancelled);
         }
@@ -150,6 +159,7 @@ impl ExternalTranscriber {
         let language = detected.or_else(|| opts.language.clone()).unwrap_or_else(|| "en".into());
         let mut t = Transcript { language, source: self.id(), speakers: Vec::new(), words, takes: Vec::new(), scenes: Vec::new() };
         t.normalize();
+        crate::vad::refine_boundaries(audio, &mut t.words);
         crate::vad::tighten_words(audio, &mut t.words);
         if opts.diarize && !t.words.is_empty() {
             if !progress(0.96, "Labelling speakers") {
@@ -270,13 +280,15 @@ pub fn parse_output(bytes: &[u8], max: Tick) -> Result<(Vec<Word>, Option<String
         // With DTW, a token's time is where the decoder emitted it (about the word's end): the
         // word runs from the previous word's end to there, and VAD tightening finds the voiced
         // part. Segment offsets alone put the pause before a word inside it.
+        // whisper.cpp's own segment offsets are unreliable with `-ml 1` (often late by most of the
+        // word, sometimes a whole word off), so with DTW they only place the first word: every
+        // later word runs from the previous word's end to its own DTW time.
         let (a, b) = match dtw_end(seg, max) {
-            Some(e) if e > a => {
-                let prev = words.last().map(|w: &Word| w.end).unwrap_or(a);
-                let start = prev.max(a).min(e);
-                (start, e)
+            Some(e) => {
+                let start = words.last().map(|w: &Word| w.end).unwrap_or_else(|| a.min(e));
+                (start.min(e), e)
             }
-            _ => (a, b),
+            None => (a, b),
         };
         let confidence = confidence(seg);
         if text.chars().all(|c| !c.is_alphanumeric()) {
@@ -416,9 +428,19 @@ mod tests {
         ]);
         let (w, _) = parse_output(&bytes, seconds_tick(10.0)).unwrap();
         assert_eq!(w[0].end, Tick(1240 * TICKS_PER_MS));
-        assert_eq!((w[1].start, w[1].end), (Tick(1280 * TICKS_PER_MS), Tick(2740 * TICKS_PER_MS)));
+        assert_eq!(
+            (w[1].start, w[1].end),
+            (Tick(1240 * TICKS_PER_MS), Tick(2740 * TICKS_PER_MS)),
+            "starts where the previous word ended, not at whisper's late segment start"
+        );
         assert_eq!((w[2].start, w[2].end), (Tick(2740 * TICKS_PER_MS), Tick(3020 * TICKS_PER_MS)), "a 10 ms token widens to its DTW span");
         assert_eq!((w[3].start, w[3].end), (Tick(2460 * TICKS_PER_MS), Tick(2670 * TICKS_PER_MS)), "no DTW: the offsets stand (normalize fixes the overlap)");
+        // a segment whose offsets start after its DTW time (whisper.cpp shifts them by a word at
+        // times) still gets the DTW span, not the offsets
+        let bytes = doc(&[seg_dtw(" the", 3300, 3760, 332), seg_dtw(" channel", 3760, 4900, 370)]);
+        let (w, _) = parse_output(&bytes, seconds_tick(10.0)).unwrap();
+        assert_eq!((w[0].start, w[0].end), (Tick(3300 * TICKS_PER_MS), Tick(3320 * TICKS_PER_MS)));
+        assert_eq!((w[1].start, w[1].end), (Tick(3320 * TICKS_PER_MS), Tick(3700 * TICKS_PER_MS)), "DTW wins over a late segment start");
         // a DTW time beyond the audio is clipped, a negative one ignored
         let bytes = doc(&[seg_dtw(" late", 100, 200, 999_999), seg_dtw(" neg", 300, 400, -7)]);
         let (w, _) = parse_output(&bytes, seconds_tick(1.0)).unwrap();

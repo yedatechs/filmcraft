@@ -11,6 +11,7 @@
 //! keeps at least 60 ms; a word with no voiced frame is left alone.
 
 use filmcraft_project::Word;
+use filmcraft_time::Tick;
 
 use crate::{SAMPLE_RATE, TICKS_PER_SAMPLE};
 
@@ -52,6 +53,49 @@ pub fn threshold(db: &[f32]) -> f32 {
 /// Quiet stretches shorter than this inside a word do not split it (a stop consonant's closure).
 const MAX_GAP_FRAMES: usize = 15;
 
+/// Frames searched on each side of a word boundary for the quietest moment between two words.
+const BOUNDARY_SEARCH_FRAMES: usize = 12;
+/// How much quieter (dB) than the speech on both sides the quietest frame must be to count as
+/// the gap between two words.
+const DIP_DB: f32 = 6.0;
+
+/// Move the boundary between touching words to the quietest frame near it. Whisper's token times
+/// land a little before or after the real end of a word, and a cut made there clips the
+/// neighbour ("yo" losing its tail when "what" is removed). Only boundaries with no pause between
+/// the words move, each word keeps at least [`MIN_WORD_FRAMES`], and a boundary moves only to a
+/// real dip (at least [`DIP_DB`] below the loudest frame on either side of it).
+pub fn refine_boundaries(audio: &[f32], words: &mut [Word]) {
+    let db = frame_db(audio);
+    let frame_ticks = TICKS_PER_SAMPLE * FRAME as i64;
+    if db.len() < 3 || frame_ticks <= 0 {
+        return;
+    }
+    let frame = |t: Tick| (t.0 / frame_ticks).max(0) as usize;
+    for i in 1..words.len() {
+        let (prev, next) = words.split_at_mut(i);
+        let (Some(a), Some(b)) = (prev.last_mut(), next.first_mut()) else { continue };
+        if (b.start.0 - a.end.0).abs() > frame_ticks {
+            continue; // a pause between them: nothing to settle
+        }
+        let bf = frame(a.end);
+        let lo = (frame(a.start) + MIN_WORD_FRAMES).max(bf.saturating_sub(BOUNDARY_SEARCH_FRAMES));
+        let hi = frame(b.end).saturating_sub(MIN_WORD_FRAMES).min(bf + BOUNDARY_SEARCH_FRAMES).min(db.len() - 1);
+        if lo >= hi {
+            continue;
+        }
+        let Some((best, lvl)) = (lo..=hi).filter_map(|f| db.get(f).map(|l| (f, *l))).min_by(|x, y| x.1.total_cmp(&y.1)) else { continue };
+        // the speech on either side: the loudest frame of each word around the dip
+        let loudest = |r: std::ops::Range<usize>| r.filter_map(|f| db.get(f)).copied().fold(f32::MIN, f32::max);
+        let (left, right) = (loudest(frame(a.start)..best), loudest(best + 1..frame(b.end).min(db.len())));
+        if left.min(right) - lvl < DIP_DB {
+            continue; // continuous speech: whisper's boundary is as good as any
+        }
+        let t = Tick(best as i64 * frame_ticks);
+        a.end = t.max(a.start);
+        b.start = t.min(b.end);
+    }
+}
+
 /// Snap each word to the loudest voiced run inside its span (see the module docs).
 pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
     let db = frame_db(audio);
@@ -67,13 +111,15 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
             continue;
         }
         let Some(frames) = db.get(a..b) else { continue };
-        // voiced runs, merging gaps shorter than MAX_GAP_FRAMES; keep the one with the most energy
+        // voiced runs, merging gaps shorter than MAX_GAP_FRAMES; keep the one with the most speech
+        // (decibels above the threshold summed over its frames: a long word beats a short loud
+        // burst, which linear energy would not)
         let mut best: Option<(usize, usize, f64)> = None;
         let mut run: Option<(usize, usize, f64)> = None;
         let mut quiet = 0usize;
         for (i, &lvl) in frames.iter().enumerate() {
             if lvl >= th {
-                let e = 10f64.powf((lvl as f64) / 10.0);
+                let e = (lvl - th) as f64 + 1.0;
                 run = Some(match run {
                     Some((s0, _, sum)) => (s0, i + 1, sum + e),
                     None => (i, i + 1, e),
@@ -116,6 +162,37 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
 mod tests {
     use super::*;
     use crate::seconds_tick;
+
+    #[test]
+    fn boundaries_move_to_the_dip_between_touching_words() {
+        // two loud tones with 60 ms of silence between them at 0.50–0.56 s; whisper put the
+        // boundary 60 ms late (0.62) so a cut of word B would clip the end of A
+        let sr = SAMPLE_RATE as usize;
+        let mut audio = vec![0.0f32; sr];
+        for (i, v) in audio.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            if !(0.50..0.56).contains(&t) {
+                *v = 0.5 * (t * 440.0 * std::f32::consts::TAU).sin();
+            }
+        }
+        let w = |text: &str, a: f64, b: f64| Word { text: text.into(), start: seconds_tick(a), end: seconds_tick(b), speaker: None, confidence: 1.0 };
+        let mut words = vec![w("a", 0.0, 0.62), w("b", 0.62, 1.0)];
+        refine_boundaries(&audio, &mut words);
+        let end = words[0].end.0 as f64 / filmcraft_time::TICKS_PER_SECOND as f64;
+        assert!((0.49..=0.56).contains(&end), "boundary moved into the gap: {end}");
+        assert_eq!(words[1].start, words[0].end, "the words still touch");
+        // continuous tone: no dip, the boundary stays
+        let flat: Vec<f32> = (0..sr).map(|i| 0.5 * (i as f32 / sr as f32 * 440.0 * std::f32::consts::TAU).sin()).collect();
+        let mut words = vec![w("a", 0.0, 0.62), w("b", 0.62, 1.0)];
+        refine_boundaries(&flat, &mut words);
+        assert_eq!(words[0].end, seconds_tick(0.62));
+        // a pause between the words: untouched; tiny words keep their minimum length
+        let mut words = vec![w("a", 0.0, 0.40), w("b", 0.70, 1.0), w("c", 1.0, 1.02)];
+        refine_boundaries(&audio, &mut words);
+        assert_eq!(words[0].end, seconds_tick(0.40));
+        assert_eq!(words[2].start, seconds_tick(1.0));
+        refine_boundaries(&[], &mut words);
+    }
 
     #[test]
     fn silence_is_trimmed_from_words() {
