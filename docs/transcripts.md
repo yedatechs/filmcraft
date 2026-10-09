@@ -96,6 +96,16 @@ Text panel, `Cmd+Backspace` crosses out the selected words, and with nothing sel
 the crossed-out text beside the playhead word (Descript's ⌘⌫); `Backspace` extracts and
 `Alt+Backspace` lifts the selection.
 
+## Scenes
+
+A paragraph can carry a **scene**: a named arrangement of the camera and the screen (which clip is
+full, which is a circle in a corner, which is hidden). The scene chip at the start of each
+paragraph in the Transcript tab (`text.scene.{paragraph}`) shows it; a click picks another scene,
+No Scene, or opens Sequence ▸ Scenes…. The assignment is stored on the media transcript as a
+media-time span beside the take groups (`Transcript::scenes`, schema v14), so it stays with its
+words when takes are switched, text is crossed out or restored, or pauses are removed: those
+edits re-apply the scenes in the same undo step. See [layouts.md](layouts.md#scenes-scenes).
+
 ## Speech recognition
 
 Recognition goes through the `Transcriber` trait (`crates/speech`). The built-in recogniser is

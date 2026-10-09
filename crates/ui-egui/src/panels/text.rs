@@ -684,7 +684,12 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         for (pi, pr) in paras.iter().enumerate() {
             let Some(w0) = words.get(pr.start) else { continue };
             let head = format!("{}  {}", w0.speaker.as_deref().unwrap_or("Speaker"), format_time(w0.start, rate, df, TimeDisplay::Timecode, 48_000));
-            let hr = ui.label(egui::RichText::new(head).size(11.0).color(t.text_dim).strong());
+            let hr = ui
+                .horizontal(|ui| {
+                    crate::panels::scenes::chip(app, ui, pi, pr.clone(), &words, &mut actions);
+                    ui.label(egui::RichText::new(head).size(11.0).color(t.text_dim).strong())
+                })
+                .inner;
             app.auto.add(&format!("text.transcript.paragraph.{pi}"), hr.rect, "Paragraph");
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = vec2(4.0, 3.0);

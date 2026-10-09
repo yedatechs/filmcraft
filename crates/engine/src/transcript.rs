@@ -482,6 +482,7 @@ fn extract_or_lift(s: &mut Session, p: &Value, extract: bool) -> Result<Value> {
     let cmd = if extract { "transcript.extract" } else { "transcript.lift" };
     let r = range_p(s, p, cmd)?;
     let tg = s.targeting().targeted;
+    let sc = crate::scenes::prepare_active(s);
     s.edit_sequence(if extract { "Extract Text" } else { "Lift Text" }, |q, ctx, _| {
         if extract {
             edit::extract(q, &tg, r, ctx);
@@ -490,6 +491,7 @@ fn extract_or_lift(s: &mut Session, p: &Value, extract: bool) -> Result<Value> {
         }
         q.mark_in = None;
         q.mark_out = None;
+        crate::scenes::reapply_in(q, sc.as_ref());
         Ok(())
     })?;
     s.set_playhead(r.start);
@@ -596,7 +598,12 @@ fn restore(s: &mut Session, p: &Value) -> Result<Value> {
         };
         (item, media, at, track)
     };
-    let r = s.edit_sequence("Restore Text", |q, ctx, _| Ok(tx::restore_media(q, item, media, at, track, ctx)?))?;
+    let sc = crate::scenes::prepare_active(s);
+    let r = s.edit_sequence("Restore Text", |q, ctx, _| {
+        let r = tx::restore_media(q, item, media, at, track, ctx)?;
+        crate::scenes::reapply_in(q, sc.as_ref());
+        Ok(r)
+    })?;
     s.set_playhead(r.start);
     Ok(json!({"item": item.0, "start": r.start.0, "end": r.end().0, "seconds": r.duration.0 as f64 / TICKS_PER_SECOND as f64}))
 }
@@ -611,7 +618,12 @@ fn remove_ranges(s: &mut Session, label: &str, ranges: Vec<TimeRange>) -> Result
     if n == 0 {
         return Ok(json!({"removed": 0, "ticks": 0}));
     }
-    let total = s.edit_sequence(label, |q, ctx, _| Ok(tx::ripple_delete_ranges(q, ranges, ctx)))?;
+    let sc = crate::scenes::prepare_active(s);
+    let total = s.edit_sequence(label, |q, ctx, _| {
+        let total = tx::ripple_delete_ranges(q, ranges, ctx);
+        crate::scenes::reapply_in(q, sc.as_ref());
+        Ok(total)
+    })?;
     Ok(json!({"removed": n, "ticks": total.0, "seconds": total.0 as f64 / TICKS_PER_SECOND as f64}))
 }
 

@@ -148,7 +148,7 @@ impl ExternalTranscriber {
         }
         let (words, detected) = parse_output(&bytes, sample_tick(audio.len() as i64))?;
         let language = detected.or_else(|| opts.language.clone()).unwrap_or_else(|| "en".into());
-        let mut t = Transcript { language, source: self.id(), speakers: Vec::new(), words, takes: Vec::new() };
+        let mut t = Transcript { language, source: self.id(), speakers: Vec::new(), words, takes: Vec::new(), scenes: Vec::new() };
         t.normalize();
         crate::vad::tighten_words(audio, &mut t.words);
         if opts.diarize && !t.words.is_empty() {

@@ -37,6 +37,7 @@ pub mod project_views;
 pub mod redact;
 pub mod reference;
 pub mod remix;
+pub mod scenes;
 pub mod scopes;
 pub mod settings;
 pub mod shortcuts_dialog;

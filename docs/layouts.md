@@ -102,6 +102,82 @@ above, so it is one undo step.
 
 A layout attached to a span of the transcript, so the arrangement follows the words when takes change.
 
+**Clips in a scene are arranged by the scene.** Once a media item appears in any scene of the
+sequence, its video clips' Motion `position` / `scale`, Opacity `opacity` and `Layout shape` mask
+are recomputed from the scenes on every scene edit and after every transcript or take edit; a
+hand edit of those parameters on such a clip is overwritten the next time. To change the
+arrangement, change the scene (Sequence ▸ Scenes…). Clips of media items no scene mentions are
+never touched.
+
+### Model (schema v14)
+
+- `Sequence::scenes: Vec<Scene>`: `Scene { id, name, slots }`, one `SceneSlot { item, hidden,
+  place, size, margin, shape, radius }` per media item. `place` and `shape` are the `layout.place`
+  / `layout.shape` names (`"bottomRight"`, `"circle"`), stored as strings; `size` / `margin` /
+  `radius` are clamped like the layout commands. The first scene is the **default scene**.
+- `Transcript::scenes: Vec<SceneSpan>`: `SceneSpan { scene, range }`, a media-time range of that
+  transcript's item, sorted and non-overlapping (a new span trims or splits the ones it overlaps).
+  Assigning words makes one span per run of consecutive media words, from the first word's start
+  to the start of the media word after the last one (so the pause after a paragraph keeps its
+  scene).
+
+### Applying
+
+A recompute, not a patch (`filmcraft_engine::scenes::reapply`, pure and idempotent):
+
+1. Each span is mapped to sequence time through the clips that play its media
+   (`filmcraft_edit::transcript::live_ranges`, the mapping the sequence transcript uses).
+2. The scene at a sequence time is the span covering it, else the default scene. For a media item
+   the scene does not mention, the item keeps the slot of the scene before it.
+3. Every video clip of a media item in any scene gets **hold** keyframes at its own start and at
+   every span start or end inside it: Motion `position` and `scale` (`uniform_scale` on) from
+   `filmcraft_edit::layout::place` with the slot's place, size, margin and shape (exactly what
+   `layout.place` / `layout.shape` compute, with the clip's anchor, rotation and Scale to Frame),
+   Opacity `opacity` 100 (0 for a hidden slot), and the `Layout shape` mask path
+   (`shape_path`; where the scene's shape is free but another time has a shape, a plain
+   rectangle of the whole source). When no time has a shape, the layout mask is removed.
+
+`scenes.apply` runs it on demand and adds no undo step when nothing changes. The scene edits below
+and the transcript / take edits that move clips (`transcript.extract` / `lift`, Remove Pauses /
+Fillers, `transcript.restore`, `takes.select` / `next` / `previous` / `cross` / `restore` /
+`detect`) recompute in the same undo step.
+
+### Commands
+
+| Command | Params | Effect | Undo label |
+|---|---|---|---|
+| `scenes.list` | – | `{scenes: [{id, name, index, default, slots: [{item, name, hidden, place, size, margin, shape, radius}]}], spans: [{scene, name, item, start, end, from, to, seqStart}]}` (`from` / `to`: sequence word indices, `null` when none of the span's words is live) | – |
+| `scenes.add` | `name?` (default "Scene N"), `slots?: [{item, hidden?, place?=full, size?, margin?, shape?=free, radius?}]` | Appends a scene (at most 64; 32 slots; one slot per media item; unknown place / shape is refused, numbers are clamped) | Add Scene |
+| `scenes.update` | `scene` (id or name), `name?`, `slots?` | Renames and / or replaces the slots | Update Scene |
+| `scenes.remove` | `scene` | Removes the scene and its spans | Remove Scene |
+| `scenes.assign` | `scene`, `from`, `to?` (sequence word indices, inclusive, like `transcript.extract`) | Assigns the scene to those words | Assign Scene |
+| `scenes.clear` | `from`, `to?` | Removes scene spans from those words | Clear Scene |
+| `scenes.apply` | – | Recompute (see above) → `{changed}` | Apply Scenes |
+| `scenes.defaults` | – | Seeds "Screen with face" (A full, B circle bottom right 25 %), "Face" (B full, A hidden), "Screen" (A full, B hidden) and "Half and half" (A left 50 %, B right 50 %, margin 0), where A (screen) and B (face) are the first media items of the two top-most video tracks with a clip, B the upper one. Names that exist are skipped. | Create Default Scenes |
+
+`filmcraft_engine::scenes::scene_owning(session, clip)` names the scene that arranges a clip's
+media item (the one on at the playhead, else the first that mentions it), for the Program
+monitor to refuse hand drags on scene-owned clips (not wired yet).
+
+### Text panel
+
+- Each Transcript paragraph starts with a scene chip `text.scene.{p}`: the scene at its first word
+  in the scene's colour (a fixed palette by scene index), or "No scene". A click opens a menu:
+  the scenes (`text.scene.{p}.pick.{index}`, assigns the paragraph), No Scene
+  (`text.scene.{p}.none`), Create Default Scenes when there are none
+  (`text.scene.{p}.defaults`), and Scenes… (`text.scene.{p}.manage`).
+- The Scenes… dialog (Sequence ▸ Scenes…, UI command `scenes.dialog`; `UiState::transcript_scenes_dialog`,
+  selection `transcript_scenes_sel`, settable with `ui.set {"menuDialog": {"scenesSelected": n}}`):
+  the list `text.scenes.list.{i}`, Add / Duplicate / Remove / Create Defaults
+  (`text.scenes.add|duplicate|remove|defaults`), per slot of the selected scene the pickers
+  `text.scenes.slot.{j}.place|size|shape` (options `….place.{name}`, `….size.{n}`,
+  `….shape.{name}`) and `text.scenes.slot.{j}.hidden`, Swap A and B (`text.scenes.swap`: the first
+  two slots exchange media in the selected scene) and Close (`text.scenes.close`, or Esc). Each
+  change is one command, so one undo step.
+
+Not yet: the Effect Controls "Set by scene" note and the Program monitor drag guard (design §4),
+animated transitions between scenes.
+
 ## Tracked redaction (`redact.*`)
 
 Draw a box over what to hide; a mosaic with a rectangle mask tracks it across the clip.

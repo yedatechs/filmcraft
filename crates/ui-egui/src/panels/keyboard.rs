@@ -131,6 +131,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("graphics.beginTextEditing", "Begin Text Editing for a Graphic Layer", [], Some("Cmd+Alt+'")),
     // Clip ▸ Layout ▸ Redact Area… is `layout.menu.redact` (panels::layout), which calls this
     uic!("redact.start", "Redact Area…", [], None),
+    uic!("scenes.dialog", "Scenes…", ["Sequence"], None),
     uic!("help.filmcraftHelp", "FilmCraft Help…", ["Help"], Some("F1")),
     uic!("app.quit", "Quit FilmCraft", [], Some("Cmd+Q")),
 ];
@@ -205,6 +206,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             crate::links::open(ctx, HELP_URL);
             Ok(json!({"url": HELP_URL}))
         }
+        "scenes.dialog" => crate::panels::scenes::open_dialog(app),
         "app.quit" => {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             Ok(Value::Null)

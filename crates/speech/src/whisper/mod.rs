@@ -316,7 +316,14 @@ impl Transcriber for Whisper {
             }
             seek += advance;
         }
-        let mut t = Transcript { language: language.unwrap_or_else(|| "en".into()), source: self.id.clone(), speakers: Vec::new(), words, takes: Vec::new() };
+        let mut t = Transcript {
+            language: language.unwrap_or_else(|| "en".into()),
+            source: self.id.clone(),
+            speakers: Vec::new(),
+            words,
+            takes: Vec::new(),
+            scenes: Vec::new(),
+        };
         t.normalize();
         crate::vad::tighten_words(audio, &mut t.words);
         if opts.diarize && !t.words.is_empty() {

@@ -47,7 +47,7 @@ pub fn commands() -> Vec<CommandSpec> {
 
 // ------------------------------------------------------------------ lookup
 
-fn is_graphic(project: &Project, it: &TrackItem) -> bool {
+pub(crate) fn is_graphic(project: &Project, it: &TrackItem) -> bool {
     project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::Graphic { .. }))
 }
 
@@ -95,19 +95,19 @@ fn target_clips(s: &Session, p: &Value, cmd: &str) -> Result<Vec<ClipId>> {
     Ok(clips)
 }
 
-fn frame_of(q: &Sequence) -> (u32, u32) {
+pub(crate) fn frame_of(q: &Sequence) -> (u32, u32) {
     (q.settings.width, q.settings.height)
 }
 
 /// Media time of a clip at timeline time `t` (clamped into the clip, like `effects.setParam`).
-fn media_time(it: &TrackItem, t: Tick) -> Tick {
+pub(crate) fn media_time(it: &TrackItem, t: Tick) -> Tick {
     it.source_time_at(t.clamp(it.start, (it.end() - Tick(1)).max(it.start)))
 }
 
 /// The clip's Motion at media time `mt`, read like `filmcraft_render::motion_matrix`. With
 /// `as_rendered`, a disabled Motion effect counts as the defaults (what the picture shows);
 /// without, its values are read anyway (what a placing edit, which enables Motion, keeps).
-fn pose_of(it: &TrackItem, mt: Tick, as_rendered: bool) -> Pose {
+pub(crate) fn pose_of(it: &TrackItem, mt: Tick, as_rendered: bool) -> Pose {
     let mut pose = Pose { fit: it.scale_to_frame, ..Pose::default() };
     let Some(m) = it.effect("motion").filter(|m| m.enabled || !as_rendered) else { return pose };
     if m.param("position").is_some() {
@@ -174,7 +174,7 @@ fn read_clip(project: &Project, q: &Sequence, c: ClipId, t: Tick, as_rendered: b
 
 /// The effect's parameter `id`, created from the definition's default when an older instance
 /// lacks it (as `effects.setParam` does).
-fn param_mut<'a>(e: &'a mut EffectInstance, id: &str) -> Option<&'a mut Param> {
+pub(crate) fn param_mut<'a>(e: &'a mut EffectInstance, id: &str) -> Option<&'a mut Param> {
     if !e.params.contains_key(id)
         && let Some(d) = e.def().and_then(|d| d.param(id))
     {
@@ -197,7 +197,7 @@ fn set_motion(it: &mut TrackItem, mt: Tick, position: (f64, f64), scale: f64, cm
 
 /// Replace (or with `None` remove) the clip's layout mask. `keep` is the mask object to reuse
 /// (feather, mode…) when one is moved from another clip.
-fn set_layout_mask(it: &mut TrackItem, path: Option<MaskPath>, keep: Option<Mask>, cmd: &str) -> Result<()> {
+pub(crate) fn set_layout_mask(it: &mut TrackItem, path: Option<MaskPath>, keep: Option<Mask>, cmd: &str) -> Result<()> {
     let o = it.effect_mut("opacity").ok_or_else(|| bad(cmd, "the clip has no Opacity effect"))?;
     let at = o.masks.iter().position(|m| m.name == LAYOUT_MASK);
     let Some(path) = path else {

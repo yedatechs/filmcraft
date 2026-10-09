@@ -2508,6 +2508,7 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::transcript::commands());
     v.extend(crate::takes::commands());
     v.extend(crate::layout::commands());
+    v.extend(crate::scenes::commands());
     v.extend(crate::redact::commands());
     v.extend(crate::panels::commands());
     v.extend(crate::scopes::commands());

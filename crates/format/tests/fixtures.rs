@@ -245,3 +245,21 @@ fn v12_minimal_loads_without_take_groups() {
     const { assert!(SCHEMA_VERSION >= 13) };
     assert_eq!(&again.project, p);
 }
+
+/// Schema 13 (before scenes): sequences and transcripts without `scenes` load with none; a saved
+/// file carries them and a v13 build would refuse it.
+#[test]
+fn v13_minimal_loads_without_scenes() {
+    let l = decode(&fixture("v13-minimal.fcproj")).unwrap();
+    assert_eq!(l.schema_version, 13);
+    assert!(l.migrated());
+    let p = &l.project;
+    assert_eq!(p.name, "Before Scenes");
+    let t = &p.transcripts[&ItemId(7)];
+    assert_eq!(t.words.len(), 2);
+    assert!(t.scenes.is_empty());
+    let again = decode(&encode(p, true)).unwrap();
+    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    const { assert!(SCHEMA_VERSION >= 14) };
+    assert_eq!(&again.project, p);
+}

@@ -287,6 +287,7 @@ fn edit_project_and_sequence<R>(s: &mut Session, label: &str, f: impl FnOnce(&mu
             f(p, seq_id, &mut ctx, st)?
         };
         p.next_id = p.next_id.max(next);
+        crate::scenes::reapply(p, seq_id);
         if let Some(q) = p.sequence(seq_id) {
             q.check().map_err(EngineError::Other)?;
         }
@@ -415,7 +416,12 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn select_impl(s: &mut Session, label: &str, id: u64, item: ItemId, g: TakeGroup, chosen: Option<usize>) -> Result<Value> {
     let transcripts = s.project.transcripts.clone();
-    let r = s.edit_sequence(label, |q, ctx, _| switch(q, ctx, &transcripts, item, &g, chosen))?;
+    let sc = crate::scenes::prepare_active(s);
+    let r = s.edit_sequence(label, |q, ctx, _| {
+        let r = switch(q, ctx, &transcripts, item, &g, chosen)?;
+        crate::scenes::reapply_in(q, sc.as_ref());
+        Ok(r)
+    })?;
     if let Some(r) = r {
         s.set_playhead(r.start);
     }
@@ -477,7 +483,12 @@ fn cross(s: &mut Session, p: &Value) -> Result<Value> {
     if live_of(q, item, &take).is_empty() {
         return Err(EngineError::Other("that take is already crossed out".into()));
     }
-    let removed = s.edit_sequence("Cross Out Take", |q, ctx, _| Ok(extract_takes(q, ctx, item, &[&take])))?;
+    let sc = crate::scenes::prepare_active(s);
+    let removed = s.edit_sequence("Cross Out Take", |q, ctx, _| {
+        let removed = extract_takes(q, ctx, item, &[&take]);
+        crate::scenes::reapply_in(q, sc.as_ref());
+        Ok(removed)
+    })?;
     if let Some(at) = removed {
         s.set_playhead(at);
     }
@@ -497,10 +508,13 @@ fn restore(s: &mut Session, p: &Value) -> Result<Value> {
     let at = take_anchor(q, &transcripts, &words, item, &g, &take)
         .ok_or_else(|| EngineError::Other("the take's media is not in the sequence, so there is nowhere to put it back".into()))?;
     let track = group_track(q, &transcripts, &words, item, &g).ok_or_else(|| EngineError::Other("the take's media is not on any audio track".into()))?;
+    let sc = crate::scenes::prepare_active(s);
     let r = s.edit_sequence("Restore Take", |q, ctx, _| {
         // what is already live of this take goes first, so the whole take comes back in one piece
         extract_takes(q, ctx, item, &[&take]);
-        Ok(tx::restore_media(q, item, take.range, at, track, ctx)?)
+        let r = tx::restore_media(q, item, take.range, at, track, ctx)?;
+        crate::scenes::reapply_in(q, sc.as_ref());
+        Ok(r)
     })?;
     s.set_playhead(r.start);
     Ok(json!({"group": g.id, "take": i, "start": r.start.0, "end": r.end().0}))

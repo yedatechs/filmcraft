@@ -9,6 +9,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     crate::panels::clip_dialogs::show(app, ctx);
     crate::panels::menu_dialogs::show(app, ctx);
     crate::panels::text::pauses_dialog(app, ctx);
+    crate::panels::scenes::dialog(app, ctx);
     crate::panels::graphics_templates::show(app, ctx);
     crate::panels::presets::save_dialog(app, ctx);
     crate::panels::audio_fx_editor::show(app, ctx);

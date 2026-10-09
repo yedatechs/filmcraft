@@ -12,6 +12,8 @@
 use filmcraft_time::{Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 
+use crate::scene::{self, SceneSpan};
+
 /// One transcribed word.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Word {
@@ -162,6 +164,10 @@ pub struct Transcript {
     /// re-transcription.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub takes: Vec<TakeGroup>,
+    /// Scenes assigned to media-time spans (schema v14): sorted, non-overlapping
+    /// ([`crate::scene`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scenes: Vec<SceneSpan>,
 }
 
 impl Transcript {
@@ -211,6 +217,7 @@ impl Transcript {
             }
         }
         self.normalize_takes();
+        scene::normalize_spans(&mut self.scenes);
     }
 
     /// Takes sorted by start inside each group, empty or negative takes dropped, empty groups
@@ -230,6 +237,28 @@ impl Transcript {
         }
         self.takes.retain(|g| !g.takes.is_empty());
         self.takes.sort_by_key(|g| (g.range().map(|r| r.start).unwrap_or(Tick::ZERO), g.id));
+    }
+
+    /// Assign `scene` to the media range: the spans it overlaps are trimmed (or split), then it is
+    /// inserted in order.
+    pub fn assign_scene(&mut self, scene: u64, range: TimeRange) {
+        if range.duration <= Tick::ZERO || range.start < Tick::ZERO {
+            return;
+        }
+        scene::cut_spans(&mut self.scenes, range);
+        self.scenes.push(SceneSpan { scene, range });
+        scene::normalize_spans(&mut self.scenes);
+    }
+
+    /// Remove scene spans from the media range (trimming and splitting the ones it overlaps).
+    pub fn clear_scenes(&mut self, range: TimeRange) {
+        scene::cut_spans(&mut self.scenes, range);
+    }
+
+    /// The scene assigned at media time `t`.
+    pub fn scene_at(&self, t: Tick) -> Option<u64> {
+        let i = self.scenes.partition_point(|s| s.range.start <= t);
+        i.checked_sub(1).and_then(|j| self.scenes.get(j)).filter(|s| s.range.contains(t)).map(|s| s.scene)
     }
 
     /// The take group with this id.
@@ -275,7 +304,7 @@ impl Transcript {
                 }
             }
         }
-        Ok(())
+        scene::check_spans(&self.scenes)
     }
 }
 
@@ -371,6 +400,7 @@ mod take_tests {
         // older documents without takes still load; unknown labels are an error, not a crash
         let old: Transcript = serde_json::from_str(r#"{"language":"en","words":[]}"#).unwrap();
         assert!(old.takes.is_empty());
+        assert!(old.scenes.is_empty());
         assert!(serde_json::from_str::<Transcript>(r#"{"takes":[{"id":1,"takes":[{"range":{"start":0,"duration":5},"label":"zzz"}]}]}"#).is_err());
     }
 
@@ -384,5 +414,35 @@ mod take_tests {
         assert_eq!(t.words_within(r(0, 30)), 0..3);
         assert_eq!(t.words_within(r(12, 13)), 1..1);
         assert_eq!(t.words_within(r(100, 200)), 3..3);
+    }
+}
+
+#[cfg(test)]
+mod scene_tests {
+    use super::*;
+
+    fn r(a: i64, b: i64) -> TimeRange {
+        TimeRange::from_bounds(Tick(a), Tick(b))
+    }
+
+    #[test]
+    fn assign_trims_and_scene_at_finds() {
+        let mut t = Transcript::default();
+        t.assign_scene(1, r(0, 100));
+        t.assign_scene(2, r(40, 60));
+        assert_eq!(t.scenes.iter().map(|s| (s.scene, s.range.start.0, s.range.end().0)).collect::<Vec<_>>(), [(1, 0, 40), (2, 40, 60), (1, 60, 100)]);
+        assert_eq!(t.scene_at(Tick(50)), Some(2));
+        assert_eq!(t.scene_at(Tick(99)), Some(1));
+        assert_eq!(t.scene_at(Tick(100)), None);
+        t.clear_scenes(r(0, 50));
+        assert_eq!(t.scene_at(Tick(10)), None);
+        assert_eq!(t.scene_at(Tick(55)), Some(2));
+        t.assign_scene(3, r(-5, 10));
+        t.assign_scene(3, r(5, 5));
+        assert_eq!(t.scenes.len(), 2, "hostile ranges are ignored");
+        t.check().unwrap();
+        let s = serde_json::to_string(&t).unwrap();
+        let back: Transcript = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
     }
 }

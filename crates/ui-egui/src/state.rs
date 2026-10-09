@@ -420,6 +420,12 @@ pub struct UiState {
     /// Text panel ▸ Transcript: the Remove Pauses dialog is open.
     #[serde(default)]
     pub transcript_pause_dialog: bool,
+    /// Text panel ▸ Transcript: the Scenes… dialog is open (`panels::scenes`).
+    #[serde(default)]
+    pub transcript_scenes_dialog: bool,
+    /// Text panel ▸ Scenes… dialog: the selected scene (index in `Sequence::scenes`).
+    #[serde(default)]
+    pub transcript_scenes_sel: usize,
     /// Text panel ▸ Transcript ▸ Takes: only groups flagged "needs re-record".
     #[serde(default)]
     pub transcript_takes_redo_only: bool,
@@ -852,6 +858,8 @@ impl Default for UiState {
             transcript_pause_min: pause_min(),
             transcript_pause_keep: pause_keep(),
             transcript_pause_dialog: false,
+            transcript_scenes_dialog: false,
+            transcript_scenes_sel: 0,
             transcript_takes_redo_only: false,
             transcript_takes_open: None,
             play_after_render: true,

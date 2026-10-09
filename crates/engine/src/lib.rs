@@ -41,6 +41,7 @@ pub mod redact;
 pub mod relink;
 pub mod remix;
 pub mod scene_detect;
+pub mod scenes;
 pub mod scopes;
 pub mod sequence_extras;
 pub mod sequence_tools;
@@ -1089,6 +1090,8 @@ mod relink_tests;
 mod remix_tests;
 #[cfg(test)]
 mod ripple_delete_tests;
+#[cfg(test)]
+mod scenes_tests;
 #[cfg(test)]
 mod scopes_tests;
 #[cfg(test)]

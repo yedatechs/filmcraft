@@ -265,7 +265,15 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                     };
                     (app.ui.transcript_pause_min, app.ui.transcript_pause_keep) = crate::panels::text::clamp_pauses(min, keep);
                 }
-                let rest: Vec<(&String, &Value)> = m.iter().filter(|(k, _)| !pauses.contains(&k.as_str())).collect();
+                // `scenesSelected`: the scene selected in the Scenes… dialog (`panels::scenes`)
+                if let Some(v) = m.get("scenesSelected") {
+                    if !app.ui.transcript_scenes_dialog {
+                        return err("the Scenes dialog is not open");
+                    }
+                    let Some(n) = v.as_u64() else { return err("`menuDialog.scenesSelected` must be a scene index") };
+                    app.ui.transcript_scenes_sel = usize::try_from(n).unwrap_or(usize::MAX);
+                }
+                let rest: Vec<(&String, &Value)> = m.iter().filter(|(k, _)| !pauses.contains(&k.as_str()) && k.as_str() != "scenesSelected").collect();
                 if !rest.is_empty() {
                     let Some(d) = app.ui.extras.dialog.as_mut() else { return err("no menu dialog is open") };
                     for (k, v) in rest {

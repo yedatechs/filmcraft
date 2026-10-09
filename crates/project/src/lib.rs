@@ -20,6 +20,7 @@ pub mod keyframe;
 pub mod mask;
 pub mod mixer;
 pub mod multicam;
+pub mod scene;
 pub mod transcript;
 pub mod vtransition;
 
@@ -39,6 +40,7 @@ pub use keyframe::{Interpolation, Keyframe, Param, ParamValue};
 pub use mask::{Mask, MaskMode, MaskPath, MaskVertex, TrackMethod};
 pub use mixer::{AutomationMode, InputMap, MixerStrip, TrackSend};
 pub use multicam::{Camera, MergedClip, MulticamAudio, MulticamSel, MulticamSource};
+pub use scene::{Scene, SceneSlot, SceneSpan};
 pub use transcript::{Speaker, Transcript, Word};
 
 macro_rules! id_type {
@@ -936,6 +938,10 @@ pub struct Sequence {
     /// Split In/Out points (Markers ▸ Mark Split): per-channel overrides of `mark_in`/`mark_out`.
     #[serde(default, skip_serializing_if = "SplitMarks::is_empty")]
     pub split: SplitMarks,
+    /// Scenes: named arrangements of media items attached to transcript spans (schema v14; see
+    /// [`scene`]). The first one is the default scene.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scenes: Vec<Scene>,
 }
 
 /// Split edit points: separate video and audio In/Out points (Markers ▸ Mark Split). `None` means
@@ -1424,6 +1430,7 @@ impl Project {
             multicam: None,
             merged: None,
             split: SplitMarks::default(),
+            scenes: Vec::new(),
         };
         for i in 0..v {
             let id = TrackId(self.alloc_id());
