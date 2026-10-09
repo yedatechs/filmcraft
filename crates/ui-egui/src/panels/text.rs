@@ -348,12 +348,13 @@ fn cut_span(app: &mut FilmcraftApp, ui: &mut egui::Ui, c: &CutView, actions: &mu
     let mut first: Option<Rect> = None;
     let mut clicked = false;
     if c.words.is_empty() {
-        let resp = ui.add(egui::Label::new(style(&format!("⋯ {:.1} s", c.seconds))).sense(Sense::click())).on_hover_text(hover);
+        let resp =
+            ui.add(egui::Label::new(style(&format!("⋯ {:.1} s", c.seconds))).wrap_mode(egui::TextWrapMode::Extend).sense(Sense::click())).on_hover_text(hover);
         first = Some(resp.rect);
         clicked |= resp.clicked();
     } else {
         for (k, w) in c.words.iter().enumerate() {
-            let resp = ui.add(egui::Label::new(style(w)).sense(Sense::click())).on_hover_text(hover);
+            let resp = ui.add(egui::Label::new(style(w)).wrap_mode(egui::TextWrapMode::Extend).sense(Sense::click())).on_hover_text(hover);
             app.auto.add(&format!("text.transcript.cut.{}.{k}", c.index), resp.rect, w);
             first.get_or_insert(resp.rect);
             clicked |= resp.clicked();
@@ -721,7 +722,9 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     } else if hit {
                         text = text.background_color(t.hover);
                     }
-                    let resp = ui.add(egui::Label::new(text).sense(Sense::click_and_drag()));
+                    // one word, one line: a label that wrapped at a line break got a box spanning
+                    // both lines, so clicks and drags on its neighbours landed on it
+                    let resp = ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend).sense(Sense::click_and_drag()));
                     if take_of_word.get(i).copied().flatten().is_some() {
                         let r = resp.rect;
                         ui.painter().line_segment([pos2(r.min.x, r.max.y), pos2(r.max.x, r.max.y)], Stroke::new(1.0, t.accent));

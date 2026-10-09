@@ -63,6 +63,11 @@ impl Driver {
         self.ok("engine.execute", json!({"command": command, "params": params}))
     }
 
+    fn ids(&mut self, prefix: &str) -> Vec<String> {
+        let v = self.ok("ui.elements", json!({"prefix": prefix}));
+        v.as_array().unwrap().iter().filter_map(|e| e["id"].as_str().map(str::to_string)).collect()
+    }
+
     fn click(&mut self, id: &str) {
         self.ok("ui.click", json!({"id": id}));
         self.frames(3);
@@ -203,4 +208,43 @@ fn selection_after_a_removed_pause_crosses_out_the_right_words() {
     d.ok("ui.key", json!({"key": "Cmd+Backspace"}));
     d.frames(3);
     assert_eq!(d.live_words(), ["yo", "what", "a", "time"]);
+}
+
+#[test]
+fn dragging_in_a_long_wrapped_paragraph_selects_only_the_words_under_the_pointer() {
+    // a paragraph long enough to wrap several lines: a word that lands at a line break used to get
+    // a label box spanning both lines, so a drag over its neighbours selected up to that word
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    d.frames(2);
+    d.click("text.tab.Transcript");
+    let mut probe = Session::default();
+    probe.execute("file.openDemoProject", json!({})).unwrap();
+    let a = probe.active_sequence().unwrap().audio_tracks[0].items[0].clone();
+    let tk = |s: f64| a.source_in.0 + (s * filmcraft_time::TICKS_PER_SECOND as f64).round() as i64;
+    let line = "what a what a time to be alive what a time to be a builder these last three weeks have been crazy anthropic just reset fable usage limits that so now we will get so so now we have three days so now you have three more days to use fable unless they extend fable usage again";
+    let words: Vec<Value> = line
+        .split(' ')
+        .enumerate()
+        .map(|(i, w)| {
+            let s = 0.1 + i as f64 * 0.08;
+            json!({"text": w, "start": tk(s), "end": tk(s + 0.06), "speaker": 0})
+        })
+        .collect();
+    let n = words.len();
+    d.exec("transcript.set", json!({"item": a.item.0, "transcript": {"language": "en", "words": words}}));
+    d.frames(3);
+    assert_eq!(d.ids("text.transcript.word.").len(), n);
+    for (from, to) in [(0usize, 1usize), (1, 2), (5, 6), (12, 14)] {
+        d.ok("ui.drag", json!({"from": {"id": format!("text.transcript.word.{from}")}, "to": {"id": format!("text.transcript.word.{to}")}}));
+        d.frames(2);
+        let st = d.ok("ui.inspect", json!({}));
+        assert_eq!(st["ui"]["transcript_sel"], json!([from, to]), "drag {from}→{to}: {}", st["ui"]["transcript_sel"]);
+    }
+    // every word's box is a single line tall
+    let els = d.ok("ui.elements", json!({"prefix": "text.transcript.word."}));
+    let heights: Vec<f64> = els.as_array().unwrap().iter().filter_map(|e| e["rect"][3].as_f64()).collect();
+    let (min, max) = heights.iter().fold((f64::MAX, 0.0f64), |(lo, hi), h| (lo.min(*h), hi.max(*h)));
+    assert!(max < min * 1.5, "a word box spans more than one line: {min}..{max}");
+    d.snapshot("wrapped-drag");
 }
