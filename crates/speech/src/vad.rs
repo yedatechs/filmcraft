@@ -1,11 +1,14 @@
 //! Energy-based tightening of word bounds.
 //!
 //! Attention alignment places every word boundary on the next word's start, so silence between
-//! words is absorbed into the word before it (and leading silence into the first word). Pause
-//! detection and text-based editing need the silences, so each word's start and end are moved
-//! inward past 10 ms frames whose level is below a threshold set between the clip's noise floor
-//! (10th percentile of the levels of frames above −100 dBFS) and its speech level (95th percentile): 30 % of the way up,
-//! and at least 6 dB above the floor. A word keeps at least 60 ms.
+//! words is absorbed into the word before it (and leading silence into the first word); whisper.cpp
+//! often puts the boundary a frame inside the neighbouring word, so the silence sits *inside* the
+//! span, not at its edge. Pause detection and text-based editing need the silences, so each word is
+//! snapped to the loudest run of voiced 10 ms frames inside its span (runs separated by less than
+//! 150 ms of quiet, a plosive closure, count as one), where voiced means above a threshold set
+//! between the clip's noise floor (10th percentile of the levels of frames above −100 dBFS) and its
+//! speech level (95th percentile): 30 % of the way up, and at least 6 dB above the floor. A word
+//! keeps at least 60 ms; a word with no voiced frame is left alone.
 
 use filmcraft_project::Word;
 
@@ -30,8 +33,13 @@ pub fn threshold(db: &[f32]) -> f32 {
     if db.is_empty() {
         return -60.0;
     }
-    // digital silence (< −100 dBFS) would drag the floor far below the recording's own noise
-    let mut s: Vec<f32> = db.iter().copied().filter(|v| *v > -100.0).collect();
+    // A few frames of digital silence (< −100 dBFS: a fade, a dropout) would drag the floor far
+    // below the recording's own noise, so they are left out. When a good part of the clip is
+    // digital silence (a gated microphone, denoised or synthetic speech), that *is* the floor, and
+    // leaving it out would set the threshold above the speech itself.
+    let silent = db.iter().filter(|v| **v <= -100.0).count();
+    let gated = silent.saturating_mul(20) >= db.len();
+    let mut s: Vec<f32> = db.iter().copied().filter(|v| gated || *v > -100.0).map(|v| v.max(-100.0)).collect();
     if s.is_empty() {
         return -60.0;
     }
@@ -41,7 +49,10 @@ pub fn threshold(db: &[f32]) -> f32 {
     (floor + 0.3 * (speech - floor)).max(floor + 6.0)
 }
 
-/// Move word bounds inward past silent frames (see the module docs).
+/// Quiet stretches shorter than this inside a word do not split it (a stop consonant's closure).
+const MAX_GAP_FRAMES: usize = 15;
+
+/// Snap each word to the loudest voiced run inside its span (see the module docs).
 pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
     let db = frame_db(audio);
     if db.is_empty() {
@@ -55,17 +66,42 @@ pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
         if b <= a + MIN_WORD_FRAMES {
             continue;
         }
-        let mut s = a;
-        while s + MIN_WORD_FRAMES < b && db[s] < th {
-            s += 1;
+        let Some(frames) = db.get(a..b) else { continue };
+        // voiced runs, merging gaps shorter than MAX_GAP_FRAMES; keep the one with the most energy
+        let mut best: Option<(usize, usize, f64)> = None;
+        let mut run: Option<(usize, usize, f64)> = None;
+        let mut quiet = 0usize;
+        for (i, &lvl) in frames.iter().enumerate() {
+            if lvl >= th {
+                let e = 10f64.powf((lvl as f64) / 10.0);
+                run = Some(match run {
+                    Some((s0, _, sum)) => (s0, i + 1, sum + e),
+                    None => (i, i + 1, e),
+                });
+                quiet = 0;
+            } else if let Some(r) = run {
+                quiet += 1;
+                if quiet >= MAX_GAP_FRAMES {
+                    if best.is_none_or(|(_, _, bs)| r.2 > bs) {
+                        best = Some(r);
+                    }
+                    run = None;
+                    quiet = 0;
+                }
+            }
         }
-        let mut e = b;
-        while e > s + MIN_WORD_FRAMES && db[e - 1] < th {
-            e -= 1;
+        if let Some(r) = run
+            && best.is_none_or(|(_, _, bs)| r.2 > bs)
+        {
+            best = Some(r);
         }
         // nothing voiced at all: leave the word alone
-        if (s..e).all(|f| db[f] < th) {
-            continue;
+        let Some((s, e, _)) = best else { continue };
+        let (mut s, mut e) = (a + s, a + e);
+        if e < s + MIN_WORD_FRAMES {
+            // too short to be a word on its own: pad to the minimum inside the original span
+            e = (s + MIN_WORD_FRAMES).min(b);
+            s = e.saturating_sub(MIN_WORD_FRAMES).max(a);
         }
         if s > a {
             w.start = filmcraft_time::Tick(s as i64 * frame_ticks);
@@ -93,5 +129,22 @@ mod tests {
         assert_eq!(w[0].start, seconds_tick(0.5));
         assert_eq!(w[0].end, seconds_tick(1.0));
         assert_eq!((w[1].start, w[1].end), (seconds_tick(2.0), seconds_tick(2.5)));
+    }
+
+    /// whisper.cpp puts a word's start a frame inside the previous word's voiced tail, with the
+    /// pause after it: the word must still snap to its own voiced run, and a short quiet gap
+    /// inside a word (a stop consonant) must not split it.
+    #[test]
+    fn boundary_inside_the_neighbour_and_internal_stops() {
+        // tone 0.0–1.0 ("channel"), silence 1.0–1.9, tone 1.9–2.1, 80 ms closure, tone 2.18–2.6 ("welcome")
+        let mut audio: Vec<f32> = vec![0.0; 48_000];
+        for i in (0..16_000).chain(30_400..33_600).chain(34_880..41_600) {
+            audio[i] = 0.3 * (i as f32 * 0.2).sin();
+        }
+        let mut w = vec![Word::new("channel", seconds_tick(0.0), seconds_tick(0.99)), Word::new("welcome", seconds_tick(0.99), seconds_tick(2.6))];
+        tighten_words(&audio, &mut w);
+        assert_eq!((w[0].start, w[0].end), (seconds_tick(0.0), seconds_tick(0.99)), "the first word is all voiced");
+        assert_eq!(w[1].start, seconds_tick(1.9), "the pause and the neighbour's tail are dropped");
+        assert_eq!(w[1].end, seconds_tick(2.6), "the 80 ms closure does not split the word");
     }
 }

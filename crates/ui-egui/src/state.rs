@@ -408,6 +408,15 @@ pub struct UiState {
     /// Text panel ▸ Transcript: search text.
     #[serde(default)]
     pub transcript_search: String,
+    /// Text panel ▸ Transcript: the Takes list is shown below the words.
+    #[serde(default)]
+    pub transcript_show_takes: bool,
+    /// Text panel ▸ Transcript ▸ Takes: only groups flagged "needs re-record".
+    #[serde(default)]
+    pub transcript_takes_redo_only: bool,
+    /// Text panel ▸ Transcript ▸ Takes: the expanded group (take group id).
+    #[serde(default)]
+    pub transcript_takes_open: Option<u64>,
     /// Preferences ▸ Playback: play the rendered range when a preview render finishes.
     #[serde(default = "yes")]
     pub play_after_render: bool,
@@ -812,6 +821,9 @@ impl Default for UiState {
             caption_search: String::new(),
             transcript_sel: None,
             transcript_search: String::new(),
+            transcript_show_takes: false,
+            transcript_takes_redo_only: false,
+            transcript_takes_open: None,
             play_after_render: true,
             mixer_fx_open: false,
             mixer_hidden: Vec::new(),

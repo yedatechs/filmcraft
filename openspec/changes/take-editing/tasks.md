@@ -27,10 +27,10 @@
 
 ## 5. Text panel
 
-- [ ] 5.1 Crossed-out cut spans inline (click restores), wordless pauses, automation ids
-- [ ] 5.2 Take chips and underline on live takes; `[` `]` cycling
-- [ ] 5.3 Takes list with preview, select, label, cross/restore, redo filter
-- [ ] 5.4 Toolbar: Detect Takes, Restore All Cuts
+- [x] 5.1 Crossed-out cut spans inline (click restores), wordless pauses, automation ids
+- [x] 5.2 Take chips and underline on live takes; Alt+[ / Alt+] cycling
+- [x] 5.3 Takes list with preview, select, label, cross/restore, redo filter
+- [x] 5.4 Toolbar: Detect Takes, Restore All Cuts
 
 ## 6. Acceptance (owner)
 
