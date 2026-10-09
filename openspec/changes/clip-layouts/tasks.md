@@ -1,7 +1,7 @@
 ## 1. Pause threshold (F8a)
 
-- [ ] 1.1 `transcript.pauses {minSeconds, keepSeconds}` preview command with tests
-- [ ] 1.2 Text panel Remove Pauses button + dialog (live count, Apply), values remembered in UiState; menu entry opens the dialog; headless test; `docs/transcripts.md`
+- [x] 1.1 `transcript.pauses {minSeconds, keepSeconds}` preview command with tests
+- [x] 1.2 Text panel Remove Pauses button + dialog (live count, Apply), values remembered in UiState; menu entry opens the dialog; headless test; `docs/transcripts.md`
 
 ## 2. Layout engine (F9.1)
 
