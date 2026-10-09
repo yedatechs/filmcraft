@@ -62,6 +62,91 @@ pub struct Speaker {
     pub name: String,
 }
 
+/// How a take sounded (Text panel ▸ Takes; `takes.label`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TakeLabel {
+    Good,
+    Best,
+    Flat,
+    Stumble,
+    WrongEnergy,
+}
+
+impl TakeLabel {
+    pub const ALL: [TakeLabel; 5] = [TakeLabel::Good, TakeLabel::Best, TakeLabel::Flat, TakeLabel::Stumble, TakeLabel::WrongEnergy];
+
+    /// The camelCase name used in commands (`"wrongEnergy"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            TakeLabel::Good => "good",
+            TakeLabel::Best => "best",
+            TakeLabel::Flat => "flat",
+            TakeLabel::Stumble => "stumble",
+            TakeLabel::WrongEnergy => "wrongEnergy",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<TakeLabel> {
+        TakeLabel::ALL.iter().copied().find(|l| l.name().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// One pass at a line: a media-time range of the recording.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Take {
+    /// Media time covered by this pass.
+    pub range: TimeRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<TakeLabel>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl Default for Take {
+    fn default() -> Self {
+        Self { range: TimeRange::new(Tick::ZERO, Tick::ZERO), label: None, note: String::new() }
+    }
+}
+
+impl Take {
+    pub fn new(range: TimeRange) -> Self {
+        Self { range, ..Default::default() }
+    }
+}
+
+/// A line the speaker recorded more than once: its takes in media order. Which take is in the
+/// cut is not stored; it follows from which take's media the timeline plays (`takes.list`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TakeGroup {
+    /// Project-wide id (`Project::alloc_id`), stable across edits.
+    pub id: u64,
+    /// Takes in media order (at least one after normalisation).
+    pub takes: Vec<Take>,
+    /// Marked "needs re-record".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub redo: bool,
+    /// Made or corrected by hand: kept when takes are detected again.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
+}
+
+impl TakeGroup {
+    /// Media time from the first take's start to the last take's end.
+    pub fn range(&self) -> Option<TimeRange> {
+        let a = self.takes.iter().map(|t| t.range.start).min()?;
+        let b = self.takes.iter().map(|t| t.range.end()).max()?;
+        Some(TimeRange::from_bounds(a, b.max(a)))
+    }
+}
+
+/// Longest note kept on a take or group.
+const MAX_NOTE: usize = 2000;
+
 /// The transcript of one media item.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -73,6 +158,10 @@ pub struct Transcript {
     pub speakers: Vec<Speaker>,
     /// Words in time order, non-overlapping.
     pub words: Vec<Word>,
+    /// Lines recorded more than once (schema v13). Media time, so they survive trims and
+    /// re-transcription.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub takes: Vec<TakeGroup>,
 }
 
 impl Transcript {
@@ -121,6 +210,44 @@ impl Transcript {
                 self.speakers.push(Speaker { name: format!("Speaker {n}") });
             }
         }
+        self.normalize_takes();
+    }
+
+    /// Takes sorted by start inside each group, empty or negative takes dropped, empty groups
+    /// dropped, groups sorted by their first take, notes bounded.
+    pub fn normalize_takes(&mut self) {
+        for g in &mut self.takes {
+            g.takes.retain(|t| t.range.duration > Tick::ZERO && t.range.start >= Tick::ZERO);
+            g.takes.sort_by_key(|t| (t.range.start, t.range.duration));
+            for t in &mut g.takes {
+                if t.note.chars().count() > MAX_NOTE {
+                    t.note = t.note.chars().take(MAX_NOTE).collect();
+                }
+            }
+            if g.note.chars().count() > MAX_NOTE {
+                g.note = g.note.chars().take(MAX_NOTE).collect();
+            }
+        }
+        self.takes.retain(|g| !g.takes.is_empty());
+        self.takes.sort_by_key(|g| (g.range().map(|r| r.start).unwrap_or(Tick::ZERO), g.id));
+    }
+
+    /// The take group with this id.
+    pub fn take_group(&self, id: u64) -> Option<&TakeGroup> {
+        self.takes.iter().find(|g| g.id == id)
+    }
+
+    pub fn take_group_mut(&mut self, id: u64) -> Option<&mut TakeGroup> {
+        self.takes.iter_mut().find(|g| g.id == id)
+    }
+
+    /// Indices of the words whose midpoint lies in the media range (what a take or a cut "says").
+    pub fn words_within(&self, r: TimeRange) -> std::ops::Range<usize> {
+        let cand = self.words_in(r);
+        let mid = |w: &Word| Tick(w.start.0 + (w.end.0.saturating_sub(w.start.0)) / 2);
+        let a = cand.start + self.words.get(cand.clone()).map(|ws| ws.iter().take_while(|w| mid(w) < r.start).count()).unwrap_or(0);
+        let b = cand.end - self.words.get(cand.clone()).map(|ws| ws.iter().rev().take_while(|w| mid(w) >= r.end()).count()).unwrap_or(0);
+        a..b.max(a)
     }
 
     /// Validate the invariants [`Transcript::normalize`] establishes.
@@ -136,6 +263,16 @@ impl Transcript {
                 && s as usize >= self.speakers.len()
             {
                 return Err(format!("word {i} has speaker {s}, but there are {} speakers", self.speakers.len()));
+            }
+        }
+        for (gi, g) in self.takes.iter().enumerate() {
+            if g.takes.is_empty() {
+                return Err(format!("take group {gi} (id {}) has no takes", g.id));
+            }
+            for (ti, t) in g.takes.iter().enumerate() {
+                if t.range.start < Tick::ZERO || t.range.duration <= Tick::ZERO {
+                    return Err(format!("take {ti} of group {} has an empty or negative range", g.id));
+                }
             }
         }
         Ok(())
@@ -171,5 +308,81 @@ mod tests {
         assert_eq!(t.words[0].normalized(), "um");
         assert_eq!(t.words[1].normalized(), "don't");
         assert_eq!(t.text(), "Um, Don't! go");
+    }
+}
+
+#[cfg(test)]
+mod take_tests {
+    use super::*;
+
+    fn r(a: i64, b: i64) -> TimeRange {
+        TimeRange::from_bounds(Tick(a), Tick(b))
+    }
+
+    #[test]
+    fn takes_normalize_sort_drop_and_bound() {
+        let mut t = Transcript::default();
+        t.takes.push(TakeGroup {
+            id: 7,
+            takes: vec![Take::new(r(50, 60)), Take::new(r(10, 20)), Take::new(r(30, 30)), Take::new(r(-5, 5))],
+            ..Default::default()
+        });
+        t.takes.push(TakeGroup { id: 3, takes: vec![], ..Default::default() });
+        t.takes.push(TakeGroup {
+            id: 1,
+            takes: vec![Take { range: r(0, 5), label: Some(TakeLabel::Best), note: "x".repeat(5000) }],
+            redo: true,
+            ..Default::default()
+        });
+        t.normalize();
+        assert_eq!(t.takes.iter().map(|g| g.id).collect::<Vec<_>>(), [1, 7]);
+        assert_eq!(t.takes[1].takes.iter().map(|k| k.range.start.0).collect::<Vec<_>>(), [10, 50]);
+        assert_eq!(t.takes[0].takes[0].note.chars().count(), MAX_NOTE);
+        assert_eq!(t.takes[1].range(), Some(r(10, 60)));
+        t.check().unwrap();
+        // check rejects what normalize would have fixed
+        let mut bad = Transcript::default();
+        bad.takes.push(TakeGroup { id: 1, takes: vec![Take::new(r(5, 5))], ..Default::default() });
+        assert!(bad.check().unwrap_err().contains("empty or negative"));
+        bad.takes[0].takes.clear();
+        assert!(bad.check().unwrap_err().contains("no takes"));
+    }
+
+    #[test]
+    fn take_labels_round_trip_and_serde_is_compact() {
+        for l in TakeLabel::ALL {
+            assert_eq!(TakeLabel::from_name(l.name()), Some(l));
+        }
+        assert_eq!(TakeLabel::from_name(" WRONGENERGY "), Some(TakeLabel::WrongEnergy));
+        assert_eq!(TakeLabel::from_name("meh"), None);
+        let mut t = Transcript::default();
+        t.words.push(Word::new("hi", Tick(0), Tick(10)));
+        let plain = serde_json::to_string(&t).unwrap();
+        assert!(!plain.contains("takes"), "{plain}");
+        t.takes.push(TakeGroup {
+            id: 2,
+            takes: vec![Take { range: r(0, 10), label: Some(TakeLabel::WrongEnergy), note: String::new() }],
+            ..Default::default()
+        });
+        let s = serde_json::to_string(&t).unwrap();
+        assert!(s.contains("\"wrongEnergy\"") && !s.contains("\"redo\"") && !s.contains("\"note\""), "{s}");
+        let back: Transcript = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, t);
+        // older documents without takes still load; unknown labels are an error, not a crash
+        let old: Transcript = serde_json::from_str(r#"{"language":"en","words":[]}"#).unwrap();
+        assert!(old.takes.is_empty());
+        assert!(serde_json::from_str::<Transcript>(r#"{"takes":[{"id":1,"takes":[{"range":{"start":0,"duration":5},"label":"zzz"}]}]}"#).is_err());
+    }
+
+    #[test]
+    fn words_within_uses_midpoints() {
+        let t = Transcript {
+            words: vec![Word::new("a", Tick(0), Tick(10)), Word::new("b", Tick(10), Tick(20)), Word::new("c", Tick(20), Tick(30))],
+            ..Default::default()
+        };
+        assert_eq!(t.words_within(r(5, 25)), 0..2, "a (midpoint 5) is in, c (midpoint 25) is out");
+        assert_eq!(t.words_within(r(0, 30)), 0..3);
+        assert_eq!(t.words_within(r(12, 13)), 1..1);
+        assert_eq!(t.words_within(r(100, 200)), 3..3);
     }
 }

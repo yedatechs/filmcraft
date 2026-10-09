@@ -227,3 +227,21 @@ fn v10_minimal_loads_with_m3_11_defaults() {
     assert_eq!(again.schema_version, SCHEMA_VERSION);
     assert_eq!(&again.project, p);
 }
+
+/// Schema 12 (before take editing): transcripts without `takes` load with none; a saved file
+/// carries the groups and a v12 build would refuse it.
+#[test]
+fn v12_minimal_loads_without_take_groups() {
+    let l = decode(&fixture("v12-minimal.fcproj")).unwrap();
+    assert_eq!(l.schema_version, 12);
+    assert!(l.migrated());
+    let p = &l.project;
+    assert_eq!(p.name, "Before Takes");
+    let t = &p.transcripts[&ItemId(7)];
+    assert_eq!(t.words.len(), 2);
+    assert!(t.takes.is_empty());
+    let again = decode(&encode(p, true)).unwrap();
+    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    const { assert!(SCHEMA_VERSION >= 13) };
+    assert_eq!(&again.project, p);
+}

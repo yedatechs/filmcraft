@@ -19,6 +19,7 @@
 
 pub mod captions;
 pub mod multicam;
+pub mod takes;
 pub mod through;
 pub mod transcript;
 
