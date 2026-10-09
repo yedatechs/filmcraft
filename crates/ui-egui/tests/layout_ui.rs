@@ -200,8 +200,9 @@ fn program_monitor_layouts() {
     d.ok("ui.menu.invoke", json!({"id": "layout.menu.place.topLeft"}));
     let i = d.inspect();
     assert_eq!((i["at"].clone(), i["shape"].clone()), (json!("topLeft"), json!("circle")), "{i}");
-    // Redact Area… only says it is coming
+    // Redact Area… turns the picture into a draw surface (panels::redact)
     d.ok("ui.menu.invoke", json!({"id": "layout.menu.redact"}));
     d.frames(2);
-    assert!(d.ok("ui.inspect", json!({})).to_string().contains("Redact Area"));
+    assert_eq!(d.ids("program.redact.draw"), vec!["program.redact.draw".to_string()]);
+    assert!(d.ok("ui.inspect", json!({})).to_string().contains("Drag a box"));
 }

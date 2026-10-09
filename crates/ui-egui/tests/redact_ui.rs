@@ -90,11 +90,12 @@ fn drag_a_box_on_the_program_picture_adds_a_tracked_redaction() {
         s.execute("file.openDemoProject", json!({})).unwrap();
         s.active_sequence().unwrap().video_tracks[0].items[0].id.0
     };
-    // the entry is in Clip ▸ Layout
+    // the entry is in Clip ▸ Layout (the Layout menu's `layout.menu.redact`, which runs `redact.start`)
     let menu = d.ok("ui.menu.list", json!({}));
-    let entry = menu.as_array().unwrap().iter().find(|m| m["id"] == "redact.start").expect("redact.start in the menus").clone();
+    let entry = menu.as_array().unwrap().iter().find(|m| m["id"] == "layout.menu.redact").expect("layout.menu.redact in the menus").clone();
     assert_eq!(entry["path"], json!(["Clip", "Layout"]));
     assert_eq!(entry["label"], "Redact Area…");
+    assert!(!menu.as_array().unwrap().iter().any(|m| m["id"] == "redact.start"), "only one Redact Area… entry");
 
     // Esc leaves the draw mode
     assert!(d.ids("program.redact.draw").is_empty(), "no draw mode yet");
