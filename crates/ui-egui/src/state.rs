@@ -480,6 +480,10 @@ pub struct UiState {
     pub redact_draw: bool,
     #[serde(default)]
     pub redact_style: Option<String>,
+    /// Program monitor clip layouts: the first-selection hint, the cached `layout.inspect`, the
+    /// previous click (cycling). Not saved.
+    #[serde(skip)]
+    pub layout: crate::panels::layout::LayoutUi,
     /// Effect presets: the preset being renamed / the Save Preset dialog (open when Some).
     #[serde(default)]
     pub save_preset: Option<SavePresetDraft>,
@@ -868,6 +872,7 @@ impl Default for UiState {
             mask_pen: None,
             redact_draw: false,
             redact_style: None,
+            layout: Default::default(),
             save_preset: None,
             audio_fx_editors: Vec::new(),
             sync_dialog: None,

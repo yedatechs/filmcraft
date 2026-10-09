@@ -32,3 +32,10 @@ dialogs `guides.add.vertical|horizontal|position|ok|cancel`, `guides.save.name|o
 `guides.manage.row.<n>|apply|delete|close`.
 
 Redact Area… (`redact.start`, Clip ▸ Layout) turns the Program picture into a draw surface (`program.redact.draw`): drag a box to add a tracked mosaic; see [layouts.md](layouts.md#tracked-redaction-redact).
+## Selecting and moving video clips in the Program monitor
+
+With the Selection tool, a click on the Program picture that hits no graphic selects the top-most
+video clip under the pointer (a second click on the same spot selects the one below it). The
+selected clip shows its box with eight handles: drag inside to move it (snapping to the frame
+edges, centre and guides like graphics), drag a handle to scale it, and right-click the box for
+the Layout menu (place, size, shape, swap). See [Clip layouts › In the app](layouts.md#in-the-app).

@@ -144,6 +144,26 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("app.settings.plugins", "Plugins…", ["Edit", "Preferences"], None),
     uic!("app.settings.timeline", "Timeline…", ["Edit", "Preferences"], None),
     uic!("app.settings.trim", "Trim…", ["Edit", "Preferences"], None),
+    uic!("layout.menu.place.topLeft", "Top Left", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.top", "Top", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.topRight", "Top Right", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.left", "Left", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.center", "Center", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.right", "Right", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.bottomLeft", "Bottom Left", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.bottom", "Bottom", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.bottomRight", "Bottom Right", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.place.full", "Full", ["Clip", "Layout", "Place"], None),
+    uic!("layout.menu.size.20", "20%", ["Clip", "Layout", "Size"], None),
+    uic!("layout.menu.size.25", "25%", ["Clip", "Layout", "Size"], None),
+    uic!("layout.menu.size.33", "33%", ["Clip", "Layout", "Size"], None),
+    uic!("layout.menu.size.50", "50%", ["Clip", "Layout", "Size"], None),
+    uic!("layout.menu.shape.circle", "Circle", ["Clip", "Layout", "Shape"], None),
+    uic!("layout.menu.shape.rounded", "Rounded", ["Clip", "Layout", "Shape"], None),
+    uic!("layout.menu.shape.square", "Square", ["Clip", "Layout", "Shape"], None),
+    uic!("layout.menu.shape.free", "Free", ["Clip", "Layout", "Shape"], None),
+    uic!("layout.menu.swap", "Swap With Clip Below", ["Clip", "Layout"], None),
+    uic!("layout.menu.redact", "Redact Area…", ["Clip", "Layout"], None),
 ];
 
 pub fn panel_command_id(p: PanelKind) -> String {
@@ -198,6 +218,9 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
         return Ok(Value::Null);
     }
     if let Some(r) = crate::panels::workspaces::route(app, id, &params) {
+        return r;
+    }
+    if let Some(r) = crate::panels::layout::route(app, id, &params) {
         return r;
     }
     if let Some(t) = id.strip_prefix("tool.") {
@@ -458,6 +481,10 @@ pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
             "app.language.portuguese" => it.checked = Some(app.ui.language == crate::i18n::Language::PtBr),
             _ => {}
         }
+        if it.id.starts_with("layout.menu.") {
+            it.checked = crate::panels::layout::checked(app, &it.id);
+            it.enabled = crate::panels::layout::enabled(app, &it.id);
+        }
         if it.id.starts_with("view.") {
             it.checked = crate::panels::monitor_view::checked(app, &it.id).or(crate::panels::menu_dialogs::checked(app, &it.id));
             it.enabled &= crate::panels::monitor_view::enabled(app, &it.id);
@@ -595,6 +622,8 @@ pub fn external_commands() -> Vec<filmcraft_engine::shortcuts::CommandInfo> {
 
 /// Draw the in-window menu bar.
 pub fn menu_bar(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
+    // the Clip ▸ Layout check marks read the selected clip's layout
+    crate::panels::layout::refresh(app);
     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("interface-language"), app.ui.language));
     let items = menu_items(app);
     let ctx = ui.ctx().clone();

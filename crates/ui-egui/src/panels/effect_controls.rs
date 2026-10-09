@@ -160,6 +160,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             if crate::panels::masks::maskable(e) {
                 crate::panels::masks::effect_rows(app, bui, body, clip, idx, e, mt_now, &mut actions, &lane, &lx, &it);
             }
+            // one-click layouts: nine places and four shapes
+            if e.effect == "motion" && kind == filmcraft_project::TrackKind::Video {
+                let (r, _) = bui.allocate_exact_size(vec2(body.width(), ROW_H + 2.0), Sense::hover());
+                bui.painter().text(pos2(r.min.x + 40.0, r.center().y), Align2::LEFT_CENTER, "Layout", Tokens::ui(12.0), t.text);
+                let x0 = r.min.x + (r.width() * 0.5).max(150.0);
+                crate::panels::layout::controls_row(app, bui, r, x0, clip, "effectControls", &mut actions);
+            }
         }
     });
     let _ = scroll_out;
@@ -633,6 +640,8 @@ pub fn properties_panel(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     actions.push(("effects.toggleAnimation".into(), json!({"clip": clip.0, "effect": "motion", "param": p})));
                 }
             }
+            let r = row(&mut bui, "Layout");
+            crate::panels::layout::controls_row(app, &mut bui, r, r.min.x + 150.0, clip, "properties", &mut actions);
             let r = row(&mut bui, "Opacity");
             let mut vui = bui.new_child(
                 egui::UiBuilder::new()
