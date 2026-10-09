@@ -63,15 +63,40 @@ is the top clip; right-click → place bottom right → `layout.inspect` says `b
 
 ## 4. Scenes (`crates/engine/src/scenes.rs`, project schema v14) — after §2 and §3 land
 
-A scene is `{id, name, label colour, clips: [{item (media item), place, shape}]}` on the sequence
-(`Sequence::scenes`), plus assignments `{scene, item (transcript's media item), media range}`
-stored beside take groups on the transcript, so they move with the words. `scenes.apply` writes
-Motion keyframes (hold interpolation) at the start of each assigned span on the clips showing that
-media; `scenes.assign {scene, from, to}` (word indices) and `scenes.clear`. The Text panel shows a
-scene strip above each paragraph; clicking a scene chip switches that span. Defaults seeded from
-the owner's preference: "Screen with face" (screen full, camera circle bottom right 25 %),
-"Face" (camera full), "Screen" (screen full), "Half and half". Detailed spec to follow in
-`specs/scenes/spec.md` once §2 is in; this section records the decision.
+Contract in `specs/scenes/spec.md`. Decisions:
+
+- **Model.** `Sequence::scenes: Vec<Scene>` with `Scene { id: u64, name, slots: Vec<SceneSlot> }`,
+  `SceneSlot { item: ItemId (media item), hidden: bool, place: Place, size: f64, margin: f64, shape:
+  Shape, radius: f64 }` (the `Place` / `Shape` ids from `filmcraft_edit::layout`, serialised as
+  their camelCase names). `Transcript::scenes: Vec<SceneSpan>` with `SceneSpan { scene: u64, range:
+  TimeRange (media time) }`, normalised like take groups (sorted, non-overlapping; a new span
+  trims the ones it overlaps). Schema v14: `v13_to_v14` is a no-op (both fields default), with a
+  `v13-minimal.fcproj` fixture and a load test, as `26972f7` did for v13.
+- **Apply = recompute, not patch.** Position, scale, the `Layout shape` mask path and opacity of
+  every clip whose media item appears in any scene are owned by the scenes: `scenes.apply` rebuilds
+  those keyframe lists from the spans (hold interpolation, one keyframe per span start that
+  intersects the clip, plus one at the clip's start). Users change the arrangement by changing the
+  scene, not the clip; `docs/layouts.md` says so plainly and the Effect Controls Transform row shows
+  "Set by scene <name>" for such clips. Clips of media items in no scene are never touched.
+- **Media time → sequence time.** A span `[a, b)` on the transcript's item T maps to the union of
+  `[clip.start + (a − clip.source_in) … ]` over the enabled clips of T, clipped to each clip; the
+  slot keyframes go on every clip of each slot's item overlapping that sequence range.
+- **Re-apply hook.** `Session::edit` gets a post-edit maintenance call: when the project's active
+  sequence has scenes and the label is one of the transcript / takes edits (the modules pass a flag
+  by calling `scenes::reapply(pr)` at the end of their edit closure; no new engine-wide hook), the
+  scenes are re-applied inside the same closure, so one undo step covers both. Fable wires the
+  calls in `transcript.rs` (`remove_ranges`, `restore`) and `takes.rs` (`select`, `cross`,
+  `restore`).
+- **Defaults.** `scenes.defaults` looks at the two top-most video tracks' first media items: the
+  lower track is the screen (A), the upper the face (B). "Screen with face": A full, B circle
+  bottom right 25 %. "Face": B full, A hidden. "Screen": A full, B hidden. "Half and half": A left
+  50 % margin 0, B right 50 % margin 0. The dialog lets the user swap A and B.
+- **UI.** The scene chip sits at the start of each paragraph in the Transcript tab (left of the
+  speaker line), drawn in the scene's colour (a fixed palette by scene index). The dialog is a
+  menu dialog (`ui.set {menuDialog: …}` settable) opened from the chip menu and from Sequence ▸
+  Scenes…. Program monitor: nothing new; the handles from §3 keep working but a drag on a
+  scene-owned clip asks "This clip's layout is set by the scene <name>. Edit the scene?" (Yes opens
+  the dialog, No does nothing) rather than writing keyframes the next apply would discard.
 
 ## 5. Tracked redaction (`crates/engine/src/redact.rs`, `panels/redact.rs`)
 
