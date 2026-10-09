@@ -383,14 +383,13 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(r)
 }
 
-fn list(s: &mut Session, p: &Value) -> Result<Value> {
-    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+/// The sequence's take groups as `takes.list` reports them (sorted by timeline position), for
+/// hosts that draw them every frame: `id`, `item`, media `start`/`end`, `active`, `redo`,
+/// `manual`, `note`, `at`, and `takes` (`index`, `start`, `end`, `seconds`, `text`, `words`,
+/// `label`, `note`, `live`). Filters: a label every kept group has on some take, the redo flag.
+pub fn groups_json(s: &Session, label: Option<TakeLabel>, redo: Option<bool>) -> Vec<Value> {
+    let Some(q) = s.active_sequence() else { return Vec::new() };
     let words = sequence_words(s);
-    let label = match str_p(p, "label") {
-        Some(l) => Some(TakeLabel::from_name(l).ok_or_else(|| bad("takes.list", format!("unknown label `{l}`")))?),
-        None => None,
-    };
-    let redo = bool_p(p, "redo");
     let mut groups = Vec::new();
     for item in sequence_items(s) {
         let Some(t) = s.project.transcripts.get(&item) else { continue };
@@ -402,6 +401,15 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     groups.sort_by_key(|g| (g["at"].as_i64().unwrap_or(i64::MAX), g["start"].as_i64().unwrap_or(0)));
+    groups
+}
+
+fn list(s: &mut Session, p: &Value) -> Result<Value> {
+    let label = match str_p(p, "label") {
+        Some(l) => Some(TakeLabel::from_name(l).ok_or_else(|| bad("takes.list", format!("unknown label `{l}`")))?),
+        None => None,
+    };
+    let groups = groups_json(s, label, bool_p(p, "redo"));
     Ok(json!({"groups": groups, "labels": TakeLabel::ALL.iter().map(|l| l.name()).collect::<Vec<_>>()}))
 }
 
