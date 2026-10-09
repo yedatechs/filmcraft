@@ -470,6 +470,11 @@ fn restore_beside(app: &mut FilmcraftApp, cur: usize) -> Result<Value, String> {
     let count = span.words.len();
     let first = span.after_word.map_or(0, |w| w + 1);
     let r = app.session.execute("transcript.restore", json!({"cut": ci})).map_err(|e| e.to_string())?;
+    app.session.log.push(
+        filmcraft_engine::panels::Level::Info,
+        "text.toggleCut",
+        format!("no selection, caret word {cur} → transcript.restore cut {ci} (after word {:?}, {count} words) → {r}", span.after_word),
+    );
     app.ui.transcript_sel = (count > 0).then_some((first, first + count - 1));
     let words = filmcraft_engine::transcript::sequence_words(&app.session);
     let text: Vec<&str> = words.get(first..first + count).into_iter().flatten().map(|w| w.text.as_str()).collect();
@@ -535,12 +540,16 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
         // nothing selected, crossed-out text beside the playhead word comes back, selected, so ⌘⌫
         // again crosses it out.
         "toggleCut" => {
+            // every ⌘⌫ leaves a line in the Events panel (Window ▸ Events): what was selected,
+            // what ran and what the engine answered, so a surprising result can be traced
+            let log = |app: &mut FilmcraftApp, msg: String| app.session.log.push(filmcraft_engine::panels::Level::Info, "text.toggleCut", msg);
             if let Some((a0, b0)) = app.ui.transcript_sel {
                 let (a, b) = (a0.min(b0), a0.max(b0));
                 let (at, end) = (words.get(a).map(|w| w.start), words.get(b).map(|w| w.end));
                 let text: Vec<&str> = words.get(a..=b).into_iter().flatten().map(|w| w.text.as_str()).collect();
                 let ph = app.session.playhead();
                 let r = app.session.execute("transcript.extract", json!({"from": a, "to": b})).map_err(|e| e.to_string())?;
+                log(app, format!("selection [{a}, {b}] \"{}\" → transcript.extract → {r}", text.join(" ")));
                 app.ui.transcript_sel = None;
                 // the playhead stays where it was (so Play still starts where the user left it);
                 // only a playhead inside the removed words moves to the cut point
