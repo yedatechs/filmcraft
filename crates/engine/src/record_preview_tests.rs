@@ -296,8 +296,29 @@ fn record_preview_rotate_turns_the_picture_clockwise() {
     assert_eq!(read_synthetic_index(&back, fr.width, fr.height).map(|i| i + 1), Some(fr.index));
 }
 
+/// The `tkhd` matrix of a recording's (only) track, read from the bytes (version 0 header: the
+/// matrix is 40 bytes after the box type), and the size the importer reports for the file.
+pub(crate) fn file_rotation(path: &str) -> ([i32; 9], (u32, u32)) {
+    let data: Arc<[u8]> = std::fs::read(path).unwrap().into();
+    let at = data.windows(4).position(|w| w == b"tkhd").unwrap() + 4 + 40;
+    let m: Vec<i32> = data[at..at + 36].chunks(4).map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let src = filmcraft_codecs::mp4::Mp4Source::open("r.mov", data).unwrap();
+    let v = filmcraft_media::MediaSource::info(&src).video.clone().unwrap();
+    (m.try_into().unwrap(), (v.width, v.height))
+}
+
+/// The `tkhd` matrices of a `w × h` picture turned 90° / 270° clockwise.
+pub(crate) fn turned(deg: u32, w: i32, h: i32) -> [i32; 9] {
+    match deg {
+        90 => [0, 0x10000, 0, -0x10000, 0, 0, h << 16, 0, 0x4000_0000],
+        180 => [-0x10000, 0, 0, 0, -0x10000, 0, w << 16, h << 16, 0x4000_0000],
+        270 => [0, -0x10000, 0, 0x10000, 0, 0, 0, w << 16, 0x4000_0000],
+        _ => [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x4000_0000],
+    }
+}
+
 #[test]
-fn record_a_rotated_camera_turns_and_fits_its_clip() {
+fn record_a_rotated_camera_writes_the_turn_into_the_file() {
     use crate::record::SyntheticFactory as F;
     let dir = tmp("rotate");
     let (mut s, _) = session((320, 180));
@@ -305,7 +326,7 @@ fn record_a_rotated_camera_turns_and_fits_its_clip() {
         let p = json!({"camera": {"device": F::CAMERA, "rotate": bad}, "dir": dir.to_string_lossy()});
         assert!(s.execute("record.start", p.clone()).is_err(), "{p}");
     }
-    // with the screen leading: the 16:9 camera turned 90° is fitted inside the 16:9 frame
+    // with the screen leading: the camera turned 90° is an upright 180 × 320 clip by itself
     s.execute(
         "record.start",
         json!({"screen": {"display": F::DISPLAY}, "camera": {"device": F::CAMERA, "width": 320, "height": 180, "rotate": 90}, "dir": dir.to_string_lossy()}),
@@ -319,13 +340,30 @@ fn record_a_rotated_camera_turns_and_fits_its_clip() {
     let id = filmcraft_project::ClipId(v["clips"]["camera"]["clip"].as_u64().unwrap());
     let cam = q.find_item(id).unwrap().1.clone();
     let m = cam.effect("motion").unwrap();
-    assert_eq!(m.f64_at("rotation", Tick::ZERO), 90.0);
-    assert_eq!(m.f64_at("scale", Tick::ZERO), 56.25);
+    assert_eq!(m.f64_at("rotation", Tick::ZERO), 0.0, "nothing is added to the clip");
+    assert_eq!(m.f64_at("scale", Tick::ZERO), 100.0, "Default Media Scaling is None");
+    let media = s.project.resolve_media(cam.item).unwrap().1.info.video.clone().unwrap();
+    assert_eq!((media.width, media.height), (180, 320), "the item is upright");
     let file = v["files"][1].as_str().unwrap();
+    assert_eq!(file_rotation(file), (turned(90, 320, 180), (180, 320)));
     let side: serde_json::Value = serde_json::from_slice(&std::fs::read(file.replace(".mov", ".recording.json")).unwrap()).unwrap();
     assert_eq!(side["rotate"], 90, "{side}");
-    assert_eq!((side["width"].as_u64(), side["height"].as_u64()), (Some(320), Some(180)), "the file stays as captured");
-    // the camera alone, turned: an upright sequence it fills (100 %); the setting is the default
+    assert_eq!((side["width"].as_u64(), side["height"].as_u64()), (Some(320), Some(180)), "the pictures stay as captured");
+    // Set to Frame Size fits the portrait clip like any other
+    s.prefs.media.default_media_scaling = "setToFrameSize".into();
+    s.execute(
+        "record.start",
+        json!({"screen": {"display": F::DISPLAY}, "camera": {"device": F::CAMERA, "width": 320, "height": 180, "rotate": 90}, "dir": dir.to_string_lossy()}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let id = filmcraft_project::ClipId(v["clips"]["camera"]["clip"].as_u64().unwrap());
+    let m = q.find_item(id).unwrap().1.effect("motion").unwrap().clone();
+    assert_eq!((m.f64_at("rotation", Tick::ZERO), m.f64_at("scale", Tick::ZERO)), (0.0, 56.3));
+    s.prefs.media.default_media_scaling = "none".into();
+    // the camera alone, turned: an upright sequence it fills; the setting is the default
     s.execute("record.settings", json!({"set": {"cameraRotate": 270}})).unwrap();
     assert!(s.execute("record.settings", json!({"set": {"cameraRotate": 45}})).is_err());
     s.execute("record.start", json!({"camera": {"device": F::CAMERA, "width": 320, "height": 180}, "dir": dir.to_string_lossy()})).unwrap();
@@ -335,6 +373,7 @@ fn record_a_rotated_camera_turns_and_fits_its_clip() {
     assert_eq!((q.settings.width, q.settings.height), (180, 320));
     let id = filmcraft_project::ClipId(v["clips"]["camera"]["clip"].as_u64().unwrap());
     let m = q.find_item(id).unwrap().1.effect("motion").unwrap().clone();
-    assert_eq!((m.f64_at("rotation", Tick::ZERO), m.f64_at("scale", Tick::ZERO)), (270.0, 100.0));
+    assert_eq!((m.f64_at("rotation", Tick::ZERO), m.f64_at("scale", Tick::ZERO)), (0.0, 100.0));
+    assert_eq!(file_rotation(v["files"][0].as_str().unwrap()), (turned(270, 320, 180), (180, 320)));
     std::fs::remove_dir_all(&dir).ok();
 }

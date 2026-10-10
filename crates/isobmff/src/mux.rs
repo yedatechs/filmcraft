@@ -46,11 +46,15 @@ pub struct TrackConfig {
     pub media_start: Option<i64>,
     /// `hdlr` name; a sensible default is used when `None`.
     pub handler_name: Option<String>,
+    /// Display rotation in degrees clockwise (0, 90, 180 or 270; anything else is 0), written as
+    /// the `tkhd` matrix the way iPhones write portrait video: the samples stay as coded and the
+    /// presentation size in `tkhd` stays the coded size. Read back by `Track::display_rotation`.
+    pub rotation: u16,
 }
 
 impl TrackConfig {
     pub fn new(entry: SampleEntry, timescale: u32) -> Self {
-        TrackConfig { entry, timescale, language: "und".into(), edits: Vec::new(), media_start: None, handler_name: None }
+        TrackConfig { entry, timescale, language: "und".into(), edits: Vec::new(), media_start: None, handler_name: None, rotation: 0 }
     }
 }
 
@@ -151,6 +155,24 @@ fn rescale(v: u64, from: u32, to: u32) -> u64 {
 
 const MATRIX: [i32; 9] = [0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x4000_0000];
 
+/// The `tkhd` matrix that turns a `w × h` (coded) picture `rotation` degrees clockwise for display
+/// (ISO/IEC 14496-12 §8.3.2, y pointing down: p′ = a·p + c·q + x, q′ = b·p + d·q + y), translated
+/// so the turned picture starts at the origin, as iPhones write it:
+/// 90° {0, 1, 0, −1, 0, 0, h, 0, 1}, 180° {−1, 0, 0, 0, −1, 0, w, h, 1},
+/// 270° {0, −1, 0, 1, 0, 0, 0, w, 1}; 0° (and any other value) is the identity.
+fn rotation_matrix(rotation: u16, w: u32, h: u32) -> [i32; 9] {
+    const ONE: i32 = 0x10000;
+    const W: i32 = 0x4000_0000;
+    // translations are 16.16 fixed point: sizes above 32767 cannot be expressed (and no picture is)
+    let fx = |v: u32| i32::try_from(v.min(0x7FFF)).unwrap_or(0) << 16;
+    match rotation {
+        90 => [0, ONE, 0, -ONE, 0, 0, fx(h), 0, W],
+        180 => [-ONE, 0, 0, 0, -ONE, 0, fx(w), fx(h), W],
+        270 => [0, -ONE, 0, ONE, 0, 0, 0, fx(w), W],
+        _ => MATRIX,
+    }
+}
+
 fn write_ftyp(b: &mut BoxBuf, brand: Brand) {
     let m = b.start(b"ftyp");
     match brand {
@@ -240,9 +262,6 @@ fn write_trak(b: &mut BoxBuf, t: &WTrack, movie_ts: u32, qt: bool, shift: u64, f
     b.u16(0);
     b.i16(if t.handler == Handler::Audio { 0x100 } else { 0 });
     b.u16(0);
-    for v in MATRIX {
-        b.i32(v);
-    }
     let (w, h) = match &t.cfg.entry.video {
         Some(v) => {
             let w = match v.pixel_aspect {
@@ -253,6 +272,10 @@ fn write_trak(b: &mut BoxBuf, t: &WTrack, movie_ts: u32, qt: bool, shift: u64, f
         }
         None => (0, 0),
     };
+    let matrix = if t.handler == Handler::Video { rotation_matrix(t.cfg.rotation, w, h) } else { MATRIX };
+    for v in matrix {
+        b.i32(v);
+    }
     b.u32(w << 16);
     b.u32(h << 16);
     b.end(m);
@@ -924,6 +947,30 @@ mod tests {
             assert_eq!(f.read_sample(out.as_slice(), 1, 3).unwrap(), vec![3u8; 400]);
             if fast {
                 assert!(f.moov_offset < t.samples[0].offset);
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_roundtrips_through_the_demuxer() {
+        for (deg, turns) in [(0u16, 0u8), (90, 1), (180, 2), (270, 3), (45, 0), (360, 0)] {
+            let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+            let mut cfg = TrackConfig::new(avc_entry(), 30);
+            cfg.rotation = deg;
+            let v = w.add_track(cfg).unwrap();
+            w.write_sample(v, WriteSample { data: &[1; 10], duration: 1, composition_offset: 0, is_sync: true }).unwrap();
+            let out = w.finish().unwrap().into_inner();
+            let f = crate::open(out.as_slice()).unwrap();
+            let t = &f.tracks[0];
+            assert_eq!(t.display_rotation(), Some(turns), "{deg}°");
+            // the presentation size stays the coded size (as iPhone files have it)
+            assert_eq!((t.width, t.height), (64, 48), "{deg}°");
+            let m = t.matrix;
+            match turns {
+                1 => assert_eq!(m, [0, 0x10000, 0, -0x10000, 0, 0, 48 << 16, 0, 0x4000_0000]),
+                2 => assert_eq!(m, [-0x10000, 0, 0, 0, -0x10000, 0, 64 << 16, 48 << 16, 0x4000_0000]),
+                3 => assert_eq!(m, [0, -0x10000, 0, 0x10000, 0, 0, 0, 64 << 16, 0x4000_0000]),
+                _ => assert_eq!(m, MATRIX),
             }
         }
     }

@@ -98,6 +98,8 @@ pub struct MovRecorder {
     width: u32,
     height: u32,
     rate: FrameRate,
+    /// Display rotation (degrees clockwise) written into the track header (see [`Self::set_rotation`]).
+    rotation: u16,
     /// Before the first packet: the open file (the writer needs the encoder's first parameter sets).
     file: Option<BufWriter<File>>,
     mux: Option<Mp4Writer<BufWriter<File>>>,
@@ -193,6 +195,7 @@ impl MovRecorder {
             width,
             height,
             rate,
+            rotation: 0,
             file: Some(BufWriter::with_capacity(1 << 20, file)),
             mux: None,
             track: 0,
@@ -202,6 +205,23 @@ impl MovRecorder {
             frames: 0,
             bytes: 0,
         })
+    }
+
+    /// Show the recording turned `degrees` clockwise (0, 90, 180 or 270; anything else is 0): the
+    /// pictures are encoded as captured and the turn is the `tkhd` matrix, as iPhones write
+    /// portrait video, so every player and FilmCraft's importer shows them upright. The file has
+    /// one matrix: a change after the first picture has been written is ignored (returns false).
+    pub fn set_rotation(&mut self, degrees: u16) -> bool {
+        if self.mux.is_some() {
+            return false;
+        }
+        self.rotation = if matches!(degrees, 90 | 180 | 270) { degrees } else { 0 };
+        true
+    }
+
+    /// The display rotation written into the file (degrees clockwise).
+    pub fn rotation(&self) -> u16 {
+        self.rotation
     }
 
     /// "VideoToolbox H.264", "VideoToolbox HEVC", "FilmCraft H.264" or "FilmCraft ProRes 422".
@@ -275,6 +295,7 @@ impl MovRecorder {
             let timescale = u32::try_from(self.rate.num).map_err(|_| ExportError::Encode("invalid frame rate".into()))?;
             let mut cfg = TrackConfig::new(self.enc.sample_entry(), timescale);
             cfg.handler_name = Some("FilmCraft Recording".into());
+            cfg.rotation = self.rotation;
             self.track = mux.add_track(cfg).map_err(|e| ExportError::Io(e.to_string()))?;
             self.mux = Some(mux);
         }
@@ -365,6 +386,33 @@ mod tests {
         // HEVC without the hardware encoder is refused (the engine falls back to H.264)
         let enc = CaptureEncoding { codec: CaptureCodec::Hevc, hardware: false, ..Default::default() };
         assert!(MovRecorder::create_with(&dir.join("x.mov"), 64, 32, FrameRate::new(30, 1), &enc).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recorder_rotation_is_the_track_matrix() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-recorder-rotation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let px = vec![90u8; 64 * 32 * 4];
+        for (deg, turns) in [(0u16, 0u8), (90, 1), (180, 2), (270, 3)] {
+            let path = dir.join(format!("r{deg}.mov"));
+            let mut r = MovRecorder::create(&path, 64, 32, FrameRate::new(30, 1), false).unwrap();
+            assert!(r.set_rotation(deg));
+            for k in 0..3 {
+                r.push(&px, k).unwrap();
+            }
+            assert!(!r.set_rotation(0), "the matrix is fixed once the first picture is written");
+            assert_eq!(r.rotation(), deg);
+            r.finish(3).unwrap();
+            let data: std::sync::Arc<[u8]> = std::fs::read(&path).unwrap().into();
+            let mp4 = filmcraft_isobmff::open(&*data).unwrap();
+            assert_eq!(mp4.tracks[0].display_rotation(), Some(turns));
+            // the importer shows it upright: a quarter turn swaps the reported size, like an iPhone clip
+            let src = filmcraft_codecs::mp4::Mp4Source::open("r.mov", data).unwrap();
+            let v = filmcraft_media::MediaSource::info(&src).video.clone().unwrap();
+            let want = if turns % 2 == 1 { (32, 64) } else { (64, 32) };
+            assert_eq!((v.width, v.height), want, "{deg}°");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

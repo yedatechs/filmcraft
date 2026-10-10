@@ -140,25 +140,6 @@ pub fn oriented(f: &PreviewFrame, mirror: bool, rotate: u32) -> PreviewFrame {
     PreviewFrame { width: ow as u32, height: oh as u32, rgba: out, time_ns: f.time_ns, index: f.index }
 }
 
-/// The Motion of a camera clip turned `rotate` degrees clockwise (0 / 90 / 180 / 270): the
-/// rotation, and the scale that fits the turned picture (`size`, the file's) inside the sequence
-/// frame (`frame`) without cropping, never enlarging it (a 90° 1920 × 1080 camera in a 1920 × 1080
-/// sequence: 56.25 %, a portrait picture with bars at the sides). 0 leaves the clip as it is.
-pub fn rotate_clip(ti: &mut filmcraft_project::TrackItem, rotate: u32, size: Option<(u32, u32)>, frame: (u32, u32)) {
-    use filmcraft_project::{Param, ParamValue};
-    if !matches!(rotate, 90 | 180 | 270) {
-        return;
-    }
-    let (w, h) = size.unwrap_or(frame);
-    let (rw, rh) = if rotate == 180 { (w, h) } else { (h, w) };
-    let fit = (f64::from(frame.0) / f64::from(rw.max(1))).min(f64::from(frame.1) / f64::from(rh.max(1))).min(1.0);
-    let scale = if fit.is_finite() && fit > 0.0 { (fit * 100.0 * 100.0).round() / 100.0 } else { 100.0 };
-    if let Some(m) = ti.effects.iter_mut().find(|e| e.effect == "motion") {
-        m.params.insert("rotation".into(), Param::new(ParamValue::Float(f64::from(rotate))));
-        m.params.insert("scale".into(), Param::new(ParamValue::Float(scale)));
-    }
-}
-
 /// A recording attached to a tap: its sink and the nanoseconds from the tap's clock start to the
 /// recording's.
 type Attached = Option<(FrameSink, u64)>;

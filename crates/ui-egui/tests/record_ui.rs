@@ -524,7 +524,7 @@ fn the_border_frames_the_screen_follows_the_recording_and_an_area_can_be_drawn()
 }
 
 #[test]
-fn rotate_turns_the_camera_preview_and_lands_on_the_clip() {
+fn rotate_turns_the_camera_preview_and_is_written_into_the_file() {
     let dir = tmp("rotate");
     let mut d = Driver::new(&dir);
     d.ok("ui.menu.invoke", json!({"id": "window.record"}));
@@ -542,8 +542,17 @@ fn rotate_turns_the_camera_preview_and_lands_on_the_clip() {
     let s = &d.harness.state().session;
     let q = s.active_sequence().unwrap();
     assert_eq!((q.settings.width, q.settings.height), (180, 320), "the turned camera alone: an upright sequence");
-    let m = q.video_tracks[0].items[0].effect("motion").unwrap();
-    assert_eq!(m.f64_at("rotation", filmcraft_engine::time::Tick::ZERO), 90.0);
+    let it = &q.video_tracks[0].items[0];
+    let m = it.effect("motion").unwrap();
+    assert_eq!(m.f64_at("rotation", filmcraft_engine::time::Tick::ZERO), 0.0, "nothing is added to the clip");
+    // the file's track header turns it (as iPhones do): the item is upright by itself
+    let v = s.project.resolve_media(it.item).unwrap().1.info.video.clone().unwrap();
+    assert_eq!((v.width, v.height), (180, 320));
+    let filmcraft_project::MediaRef::File { path } = s.project.resolve_media(it.item).unwrap().1.media.clone() else { panic!("not a file") };
+    let data = std::fs::read(&path).unwrap();
+    let at = data.windows(4).position(|w| w == b"tkhd").unwrap() + 4 + 40;
+    let matrix: Vec<i32> = data[at..at + 36].chunks(4).map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+    assert_eq!(matrix, [0, 0x10000, 0, -0x10000, 0, 0, 180 << 16, 0, 0x4000_0000], "90° clockwise");
     // the Settings section has the default for new rows
     d.click("record.panel.settings");
     assert!(d.element("record.panel.settings.cameraRotate").is_some());

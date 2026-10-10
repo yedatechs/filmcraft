@@ -1759,7 +1759,7 @@ fn start_video(
     if src.kind == SourceKind::Camera && fmt.fps != req.fps {
         notes.push(format!("the camera delivers {} fps, not the {} asked for", fmt.fps, req.fps));
     }
-    let (rec, fps) = match open_recorder(&path, w, h, fmt.fps.clamp(1, 60), enc, &mut notes) {
+    let (mut rec, fps) = match open_recorder(&path, w, h, fmt.fps.clamp(1, 60), enc, &mut notes) {
         Ok(r) => r,
         Err(e) => {
             input.stop();
@@ -1767,6 +1767,10 @@ fn start_video(
             return Err(format!("{label} encoder: {e}"));
         }
     };
+    // a turned camera: the file's track header says so (as iPhones do); the pictures stay as captured
+    if src.kind == SourceKind::Camera {
+        rec.set_rotation(u16::try_from(rotate).unwrap_or(0));
+    }
     let (q, st, stop, o) = (queue.clone(), stats.clone(), stop_ns.clone(), origin.clone());
     let rate = FrameRate::new(i64::from(fps), 1);
     let worker = std::thread::Builder::new()
@@ -2519,7 +2523,7 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
             if d.rotate != 0 {
                 o.insert(
                     "rotate_note".into(),
-                    json!(format!("the file is as the camera saw it; the clip's Motion turns it {}° and scales it to fit", d.rotate)),
+                    json!(format!("the file's track header turns it {}° clockwise (as iPhones do); the pictures are as the camera saw them and nothing is added to the clip", d.rotate)),
                 );
             }
         }
@@ -2772,15 +2776,13 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f6
     let lead = videos.first().or(audios.first()).and_then(|k| item(*k));
     let info = |it: Option<ItemId>| it.and_then(|i| s.project.item(i)).and_then(|i| i.as_media()).map(|m| m.info.clone());
     let mut settings = info(lead).map(|i| crate::commands::default_seq_settings_for(&i)).unwrap_or_default();
-    // a camera turned on its side leads (no screen): the sequence stands upright like it
-    let rotation = |k: Src| done.iter().find(|d| d.src == k).map_or(0, |d| d.rotate);
-    if videos.first().is_some_and(|k| rotation(*k) % 180 == 90) {
-        std::mem::swap(&mut settings.width, &mut settings.height);
-    }
+    // a turned camera's file is upright by itself (its track header): a camera on its side that
+    // leads (no screen) gives an upright sequence like any portrait clip
     if let Some(a) = info(audios.first().and_then(|k| item(*k))).and_then(|i| i.audio) {
         settings.sample_rate = a.sample_rate.max(8000);
     }
     let mirrored: Vec<Src> = done.iter().filter(|d| d.mirror).map(|d| d.src).collect();
+    let scaling = s.prefs.media.default_media_scaling.clone();
     let comment = {
         let cams: Vec<String> = done
             .iter()
@@ -2813,8 +2815,13 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f6
                 {
                     ti.effects.insert(0, flip);
                 }
-                let size = pr.resolve_media(it).and_then(|(_, m, _)| m.info.video.as_ref().map(|v| (v.width, v.height)));
-                crate::record_preview::rotate_clip(&mut ti, rotation(*k), size, (settings.width, settings.height));
+                // fitted like any clip of another size (Settings ▸ Media ▸ Default Media Scaling)
+                let frame = (settings.width, settings.height);
+                if let Some(size) = pr.resolve_media(it).and_then(|(_, m, _)| m.info.video.as_ref().map(|v| (v.width, v.height)))
+                    && size != frame
+                {
+                    crate::settings::apply_media_scaling(&mut ti, &scaling, frame, size);
+                }
                 clips.push((*k, ti.id, ti.start));
                 v_items.push(ti);
             }
