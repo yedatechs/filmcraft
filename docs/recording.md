@@ -22,7 +22,7 @@ Window ▸ Record, or the red dot at the right end of the Program monitor's tran
 | Microphone rows | per microphone: Off, Default Input (Settings ▸ Audio Hardware, or the Voice-Over source), or a device; `−` |
 | + Camera / + Microphone | add a row (at most four of each); a new camera row takes the next camera not chosen yet and the camera defaults of the settings |
 | Name | the recording's name (empty: `Recording <n>`) |
-| ● Record / ■ Stop 00:12 | starts (after the countdown); becomes Stop with the elapsed time |
+| ● Record / ■ Stop 00:12 | starts (after the countdown); reads `Starting screen capture…` (disabled) until every source is live, then becomes Stop with the elapsed time |
 | Cancel | stops and deletes the files (or cancels the countdown) |
 | Refresh | lists the devices again (a camera plugged in, a window opened, a display woken) |
 | Settings ▸ | the recording settings below, the same values as Settings ▸ Recording |
@@ -30,7 +30,12 @@ Window ▸ Record, or the red dot at the right end of the Program monitor's tran
 While recording the panel stays open, shows frames and dropped frames per video source and the
 microphone level, and the status bar reads `Recording · 00:12 · screen 360 f / camera 358 f`.
 During the countdown the button and the status bar read `Recording in 3…`; the button or Esc
-cancels it. The first time the panel opens it picks the first display, the first camera and the
+cancels it. After it (or at once without one) the sources start, and until every one of them
+delivers, the button (disabled) and the status bar read `Starting screen capture…` (`Starting the
+camera…`, `Starting the microphone…` without a screen); Cancel stops them. This usually takes
+well under a second; the first screen recording after FilmCraft starts can take several seconds
+(macOS starts its screen-capture helper), and FilmCraft waits up to 20 s. `Recording · 00:00`
+appears when the recording begins. The first time the panel opens it picks the first display, the first camera and the
 default microphone. A refused start (a permission, a missing device, the same camera twice) is
 shown in red in the panel. There are no keyboard shortcuts for recording.
 
@@ -92,15 +97,20 @@ directory (the same rule as voice-over):
 {
   "version": 1, "recording": "Recording 3", "source": "screen", "index": 1, "file": "Recording 3 - Screen.mov",
   "device": {"id": "1", "name": "Built-in Display"},
-  "clock_start_ns": 1791631234567890123, "first_sample_ns": 41000000, "last_sample_ns": 3041000000,
+  "clock_start_ns": 1791631234567890123, "first_sample_ns": 12000000, "last_sample_ns": 3012000000,
+  "warmup_ns": 410000000,
   "dropped": 0, "bytes": 5123456, "frames": 90, "width": 1920, "height": 1080, "fps": 30,
   "encoder": "VideoToolbox H.264", "bitrate_kbps": 20000, "quality": "high", "keyframe_seconds": 2,
   "hardware_encoder": true, "show_cursor": true, "resolution": "native", "events": []
 }
 ```
 
-`clock_start_ns` is the wall-clock time when the recording started (the same in every sidecar of
-one recording); `first_sample_ns` / `last_sample_ns` are on the recording clock, relative to it.
+`clock_start_ns` is the wall-clock time when the recording began, the instant every source was
+live (the same in every sidecar of one recording, and `clockStartNs` of `record.start`);
+`first_sample_ns` / `last_sample_ns` are on the recording clock, relative to it, so
+`first_sample_ns` is under one frame for every source. `warmup_ns` is how long the source took
+from its start to its first frame or audio block (a microphone typically 0.5–0.7 s, the screen
+0.2–0.9 s, more the first time).
 `source` is `screen`, `camera`, `mic` or `systemAudio`, `index` its number among the sources of that
 kind (Camera 2 has `2`). A camera's sidecar also has `camera_offset_ms` and `mirror` (+
 `mirror_note`); audio sidecars have `sample_rate`, `requested_sample_rate`, `channels`, `format`
@@ -115,10 +125,20 @@ filled with silence so the file stays on the clock.
 
 ## Sync
 
-Every frame and every block of audio is stamped on one clock taken when recording starts. Each
-source starts in the new sequence at its first sample time minus the earliest first sample time,
-at the next frame boundary with the clip's source In moved by the difference (the same placement
-Merge Clips uses), so media time 0 of each file lands exactly where it was captured.
+All tracks start together, as in other screen recorders: `record.start` starts every screen,
+camera and microphone, waits until each one has delivered its first frame or audio block, and
+the recording begins at the **latest** of those first samples. Every frame and every block of
+audio is stamped on one clock; media time 0 of every file is that same instant. What a source
+captured before it (a screen that was live while the microphone was still opening) is left out:
+frames before the encoder (not counted as dropped), audio to the sample. So every clip starts at
+0 in the new sequence, and `warmup_ns` in each sidecar shows how long each source took.
+
+The wait is at most 20 s overall (`START_TIMEOUT`; the platform gives ScreenCaptureKit's
+`startCapture` and the camera session's start as long, and 5 s to listing and permission calls).
+A source that delivers nothing in that time fails the start with its name, for example
+"microphone 'Yeti Stereo Microphone' delivered no audio within 20 s"; the other sources are
+stopped and their files deleted. System audio is not waited for (nothing may be playing): it is
+filled with silence from the start.
 
 Tracks: the screen on V1, then the cameras in row order (V2, V3…; without a screen the first
 camera is on V1), the microphones in row order on A1, A2…, the system audio on the next audio
@@ -126,7 +146,8 @@ track. The sequence takes the screen's size and rate (else the first camera's) a
 microphone's sample rate.
 
 The clock cannot see delay inside a camera (a USB webcam may deliver a frame 50–150 ms after the
-light hit the sensor). Each camera row's Offset … ms (`cameraOffsetsMs`, one per camera; the
+light hit the sensor): that is all the camera offset is for now, since the start latency of every
+source is taken care of. Each camera row's Offset … ms (`cameraOffsetsMs`, one per camera; the
 scalar `cameraOffsetMs` applies to every camera without its own) moves that camera: a negative
 value moves it earlier, the usual fix when the face is late. If that would start a camera before
 0, everything moves so the earliest clip starts at 0. The value is kept in the camera's sidecar
@@ -161,13 +182,13 @@ also says so when macOS lists no display because the display is asleep or the sc
 | Command | Params | Result |
 |---|---|---|
 | `record.devices` | – | `{displays: [{id, name, width, height}], windows: [{id, title, app}], cameras: [{id, name, formats: [{width, height, fps}]}], microphones: [name], factory, permissions: {screen, camera, microphone}, systemAudio, error?}` |
-| `record.start` | `screen?: {display: id} \| {window: id}` (+ `fps?` 1–60, `resolution?`, `cursor?`, `systemAudio?`), `cameras?: [{device: id, quality?, width?, height?, fps?, mirror?}]` (or `camera: {…}`), `mics?: [{device?: name}]` (or `mic: {…}`), `name?`, `dir?`, `countdown?` (0–10 s), `settings?` (any of the settings fields, for this recording only) | `{recording, name, clockStartNs, dir, files: [{kind, key, path, sidecar}], notes}`; with a countdown `{recording: false, countdown}` |
-| `record.status` | – | `{recording, name?, elapsed, sources: [{kind, key, device, frames, dropped, bytes, level?}], stopAfterMinutes, notes, error?}`; during a countdown `{recording: false, countdown: {seconds, remaining}}`; also runs what is due (the countdown's start, Stop after) and reports it as `event` |
+| `record.start` | `screen?: {display: id} \| {window: id}` (+ `fps?` 1–60, `resolution?`, `cursor?`, `systemAudio?`), `cameras?: [{device: id, quality?, width?, height?, fps?, mirror?}]` (or `camera: {…}`), `mics?: [{device?: name}]` (or `mic: {…}`), `name?`, `dir?`, `countdown?` (0–10 s), `wait?` (default true), `settings?` (any of the settings fields, for this recording only) | once every source is live: `{recording, name, clockStartNs, dir, files: [{kind, key, path, sidecar}], warmupNs: {key: ns}, notes}`; with a countdown `{recording: false, countdown}`; with `wait: false` at once `{recording: false, starting: true, label}` (the outcome comes as a `started` / `startFailed` event of `record.status`) |
+| `record.status` | – | `{recording, name?, elapsed, sources: [{kind, key, device, frames, dropped, bytes, level?}], stopAfterMinutes, notes, error?}`; during a countdown `{recording: false, countdown: {seconds, remaining}}`; while the sources start `{recording: false, starting: true, label: "Starting screen capture…"}`; also runs what is due (a finished start, the countdown's start, Stop after) and reports it as `event` |
 | `record.stop` | `discard?`, `cameraOffsetMs?` (−5000…5000), `cameraOffsetsMs?: [..]` | `{placed, name, sequence, opened, items: {screen?, camera?, camera2?, mic?, mic2?, systemAudio?}, clips: {key: {clip, start}}, offsets: {key: ticks}, cameras, mics, cameraOffsetsMs, files, errors, notes}`; during a countdown `{placed: false, cancelled: true}` |
-| `record.cancel` | – | `{placed: false, discarded: true}` (`cancelled: true` for a countdown) |
+| `record.cancel` | – | `{placed: false, discarded: true}` (`cancelled: true` for a countdown or a start whose sources are starting) |
 | `record.settings` | `{get: true}` or `{set: {field: value, …}}` (merged) | `{settings: {…}, hevcAvailable, systemAudioAvailable}` |
 
-`record.start` is refused while recording or counting down, during a voice-over, with no source,
+`record.start` is refused while recording, starting or counting down, during a voice-over, with no source,
 for an unknown display / window / camera / microphone, the same camera or microphone twice, more
 than four cameras or microphones, `fps` outside 1–60, a size outside 16–8192, a `countdown` outside
 0–10, a bad `settings` value, or a name that is empty, longer than 100 characters, or has `/`, `\`,
@@ -175,7 +196,10 @@ than four cameras or microphones, `fps` outside 1–60, a size outside 16–8192
 voice-over cannot start while recording (they share the microphone). The countdown and Stop after
 run in the host's frame loop (the desktop app) or when `record.status` is polled (CLI, MCP,
 control channel). `record.start` counts down only when given `countdown`: the panel passes the
-setting, agents start at once. In headless sessions (CLI, MCP, tests) the sources are synthetic:
+setting, agents start at once. Without `wait: false`, `record.start` returns when every source
+is live (or the start failed), usually within a second and at most 20 s; the panel and a
+counted-down start use `wait: false`, so the app never waits for the sources. `record.cancel` /
+`record.stop` while the sources start stop them and delete the files. In headless sessions (CLI, MCP, tests) the sources are synthetic:
 `synthetic:display` (1280 × 720, with a 440 Hz tone as system audio), `synthetic:window`,
 `synthetic:camera` and `synthetic:camera2` (640 × 360) and the `Synthetic Input` and
 `Synthetic Input 2` microphones; their frames carry the frame index in the top row so tests check

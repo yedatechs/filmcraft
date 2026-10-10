@@ -81,8 +81,13 @@ pub enum Synthetic {
 /// A deterministic input for headless sessions and tests.
 pub struct SyntheticInput {
     pub signal: Synthetic,
+    /// Behave like a live device that delivers its first sample this long after `start` (start
+    /// latency in tests; `Duration::MAX` = never): `read` then returns only what such a device
+    /// would have captured by now. None: `read` generates exactly what is asked.
+    pub start_delay: Option<std::time::Duration>,
     rate: u32,
     pos: usize,
+    started: Option<web_time::Instant>,
 }
 
 impl SyntheticInput {
@@ -90,7 +95,11 @@ impl SyntheticInput {
     /// A second device name (recordings with two microphones); it produces the same signal.
     pub const DEVICE2: &'static str = "Synthetic Input 2";
     pub fn new(signal: Synthetic) -> Self {
-        Self { signal, rate: 48_000, pos: 0 }
+        Self { signal, start_delay: None, rate: 48_000, pos: 0, started: None }
+    }
+    /// [`Self::clicks`] delivering its first sample `delay` after the start.
+    pub fn delayed(delay: std::time::Duration) -> Self {
+        Self { start_delay: Some(delay), ..Self::clicks() }
     }
     /// Clicks every quarter second at 48 kHz.
     pub fn clicks() -> Self {
@@ -111,9 +120,18 @@ impl AudioInput for SyntheticInput {
     fn start(&mut self, device: &str, sample_rate: u32) -> std::result::Result<InputFormat, String> {
         self.rate = sample_rate.max(1);
         self.pos = 0;
+        self.started = Some(web_time::Instant::now());
         Ok(InputFormat { sample_rate: self.rate, channels: self.channels(device) })
     }
     fn read(&mut self, frames: usize) -> Vec<Vec<f32>> {
+        let frames = match (self.start_delay, self.started) {
+            (Some(delay), Some(t0)) => {
+                let live = t0.elapsed().saturating_sub(delay);
+                let captured = (live.as_secs_f64() * f64::from(self.rate)) as usize;
+                if t0.elapsed() < delay { 0 } else { frames.min(captured.saturating_sub(self.pos)) }
+            }
+            _ => frames,
+        };
         let p0 = self.pos;
         self.pos += frames;
         match &self.signal {
@@ -283,7 +301,7 @@ fn can_start(s: &Session) -> std::result::Result<(), String> {
     if s.voiceover.recording() {
         return Err("a voice-over is already recording".into());
     }
-    if s.record.recording() {
+    if s.record.recording() || s.record.starting.is_some() {
         return Err("a recording (Window ▸ Record) is using the microphone".into());
     }
     if s.active_sequence().is_some_and(|q| q.audio_tracks.is_empty()) {

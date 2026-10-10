@@ -158,9 +158,21 @@ pub fn register() -> bool {
     }
 }
 
-/// How long an asynchronous OS call (content enumeration, stream start / stop) may take before
-/// it is reported as failed: never a hang.
+/// How long an asynchronous OS call (content enumeration, permission calls, stream stop) may take
+/// before it is reported as failed: never a hang.
 pub const OS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a stream or session start (ScreenCaptureKit `startCapture`, the camera session's
+/// `startRunning`) may take: the first `startCapture` in a process warms up ScreenCaptureKit's
+/// helper and can take more than 5 s; later ones take well under a second. The engine waits as
+/// long, overall, for every source to deliver.
+pub const START_TIMEOUT: std::time::Duration = filmcraft_engine::record::START_TIMEOUT;
+
+/// "did not answer within 20 s".
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn waited(t: std::time::Duration) -> String {
+    format!("did not answer within {} s", t.as_secs_f64())
+}
 
 #[cfg(test)]
 mod tests {
@@ -178,6 +190,15 @@ mod tests {
         let e = permission_error(Need::Microphone, Permission::Denied).unwrap();
         assert!(e.message.contains("▸ Microphone"), "{}", e.message);
         assert_eq!(permission_error(Need::Camera, Permission::Unavailable).unwrap().kind, CaptureErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn start_and_os_timeouts_are_distinct() {
+        assert_eq!(OS_TIMEOUT, std::time::Duration::from_secs(5));
+        assert_eq!(START_TIMEOUT, std::time::Duration::from_secs(20));
+        assert_ne!(OS_TIMEOUT, START_TIMEOUT);
+        assert_eq!(waited(START_TIMEOUT), "did not answer within 20 s");
+        assert_eq!(waited(OS_TIMEOUT), "did not answer within 5 s");
     }
 
     #[test]

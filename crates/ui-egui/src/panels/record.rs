@@ -183,6 +183,9 @@ pub fn status_line(app: &FilmcraftApp) -> Option<String> {
     if let Some(left) = app.session.record.countdown_left() {
         return Some(countdown_text(left));
     }
+    if let Some(l) = app.session.record.starting_label() {
+        return Some(l.to_string());
+    }
     if !app.session.record.recording() {
         return None;
     }
@@ -282,6 +285,10 @@ pub fn toggle(app: &mut FilmcraftApp) {
         cancel(app);
         return;
     }
+    if app.session.record.starting.is_some() {
+        // the button is disabled while the sources start; Cancel stops them
+        return;
+    }
     if app.session.record.recording() {
         let p = stop_params(&app.ui.record);
         match app.session.execute("record.stop", p) {
@@ -302,18 +309,21 @@ pub fn toggle(app: &mut FilmcraftApp) {
     }
     let mut p = start_params(&app.ui.record);
     let countdown = app.session.prefs.recording.countdown_seconds;
-    if countdown > 0
-        && let Some(o) = p.as_object_mut()
-    {
-        o.insert("countdown".into(), json!(countdown));
+    if let Some(o) = p.as_object_mut() {
+        // the sources start on their own thread: the frame loop shows "Starting screen capture…"
+        o.insert("wait".into(), json!(false));
+        if countdown > 0 {
+            o.insert("countdown".into(), json!(countdown));
+        }
     }
     match app.session.execute("record.start", p) {
         Ok(v) => {
             app.ui.record.error.clear();
             app.ui.record.last.clear();
-            app.ui.status = match v["countdown"].as_u64() {
-                Some(n) => countdown_text(n as f64),
-                None => format!("Recording {}", v["name"].as_str().unwrap_or("")),
+            app.ui.status = match (v["countdown"].as_u64(), v["label"].as_str()) {
+                (Some(n), _) => countdown_text(n as f64),
+                (None, Some(l)) => l.to_string(),
+                (None, None) => format!("Recording {}", v["name"].as_str().unwrap_or("")),
             };
         }
         Err(e) => {
@@ -324,12 +334,19 @@ pub fn toggle(app: &mut FilmcraftApp) {
 }
 
 pub fn cancel(app: &mut FilmcraftApp) {
-    if !app.session.record.recording() && app.session.record.countdown.is_none() {
+    let starting = app.session.record.starting.is_some();
+    if !app.session.record.recording() && app.session.record.countdown.is_none() && !starting {
         return;
     }
     match app.session.execute("record.cancel", json!({})) {
         Ok(v) => {
-            app.ui.record.last = if v["cancelled"] == true { "Countdown cancelled".into() } else { "Recording discarded".into() };
+            app.ui.record.last = if starting {
+                "Start cancelled".into()
+            } else if v["cancelled"] == true {
+                "Countdown cancelled".into()
+            } else {
+                "Recording discarded".into()
+            };
             app.ui.status = app.ui.record.last.clone();
         }
         Err(e) => app.ui.record.error = e.to_string(),
@@ -367,16 +384,22 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             return;
         }
     }
+    let starting_label = app.session.record.starting_label().map(str::to_string);
+    if starting_label.is_some() {
+        app.ui.record.live = status_line(app).unwrap_or_default();
+        app.ui.record.open = true;
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
     let recording = app.session.record.recording();
     if recording {
         app.ui.record.live = status_line(app).unwrap_or_default();
         app.ui.record.open = true;
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
-    } else if !counting && !app.ui.record.live.is_empty() {
+    } else if !counting && starting_label.is_none() && !app.ui.record.live.is_empty() {
         // stopped from elsewhere (`record.stop` over the control channel)
         app.ui.record.live.clear();
     }
-    let recording = recording || counting;
+    let recording = recording || counting || starting_label.is_some();
     if !app.ui.record.open {
         return;
     }
@@ -500,15 +523,20 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let label = if let Some(left) = countdown_left {
+                let label = if let Some(l) = &starting_label {
+                    l.clone()
+                } else if let Some(left) = countdown_left {
                     format!("{}  (Cancel)", countdown_text(left))
                 } else if recording {
                     format!("■  Stop  {}", mmss(st.as_ref().and_then(|s| s["elapsed"].as_f64()).unwrap_or(0.0)))
                 } else {
                     "●  Record".to_string()
                 };
-                let b =
-                    ui.add(egui::Button::new(RichText::new(&label).color(Color32::WHITE).size(16.0)).fill(RED).corner_radius(18.0).min_size(vec2(150.0, 36.0)));
+                // disabled while the sources start (Cancel stops them)
+                let b = ui.add_enabled(
+                    starting_label.is_none(),
+                    egui::Button::new(RichText::new(&label).color(Color32::WHITE).size(16.0)).fill(RED).corner_radius(18.0).min_size(vec2(150.0, 36.0)),
+                );
                 elems.push(("record.panel.record".into(), b.rect, label));
                 if b.clicked() {
                     do_toggle = true;

@@ -6,7 +6,7 @@
 //! | command | does |
 //! |---|---|
 //! | `record.devices` | displays, windows, cameras, microphones and the permission states |
-//! | `record.start` | start recording the chosen sources; returns the files it writes and the clock start |
+//! | `record.start` | start the chosen sources; the recording begins when every one is live (its files, the clock start) |
 //! | `record.status` | elapsed time and per-source frames / dropped / bytes (and the mic level) |
 //! | `record.stop` | finish the files, import them and build the synced sequence (or `discard`) |
 //! | `record.cancel` | stop and delete the files |
@@ -44,8 +44,15 @@ use filmcraft_export::recorder::{CaptureCodec, CaptureEncoding, MovRecorder};
 
 // ------------------------------------------------------------------------------------- clock
 
-/// The one clock of a recording: a monotonic instant taken at `record.start`, plus the wall-clock
-/// time at that instant (`clock_start_ns` in the sidecars). Sample times are nanoseconds since it.
+/// How long `record.start` waits, overall, for every source to start and deliver its first
+/// frame or audio block. The platform uses it for stream / session starts too (ScreenCaptureKit's
+/// first `startCapture` in a process warms up its helper and can take several seconds).
+pub const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The one clock of a recording: a monotonic instant plus the wall-clock time at that instant
+/// (`clock_start_ns` in the sidecars). Sample times are nanoseconds since it. Sources are started
+/// on a clock taken at `record.start`; the recording's own clock is that one shifted to the
+/// instant every source was live ([`Self::shifted`]).
 #[derive(Clone, Copy, Debug)]
 pub struct RecordClock {
     start: web_time::Instant,
@@ -68,6 +75,11 @@ impl RecordClock {
     /// Wall-clock nanoseconds since the UNIX epoch at the clock start.
     pub fn unix_start_ns(&self) -> u64 {
         self.unix_ns
+    }
+    /// The same clock started `ns` later.
+    pub fn shifted(&self, ns: u64) -> Self {
+        let start = self.start.checked_add(std::time::Duration::from_nanos(ns)).unwrap_or(self.start);
+        Self { start, unix_ns: self.unix_ns.saturating_add(ns) }
     }
 }
 
@@ -570,6 +582,9 @@ impl<T> BoundedQueue<T> {
         self.q.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
         self.cv.notify_all();
     }
+    pub fn is_closed(&self) -> bool {
+        self.q.lock().unwrap_or_else(PoisonError::into_inner).1
+    }
     pub fn len(&self) -> usize {
         self.q.lock().unwrap_or_else(PoisonError::into_inner).0.len()
     }
@@ -650,9 +665,13 @@ pub struct SourceStats {
     pub frames: AtomicU64,
     pub dropped: AtomicU64,
     pub bytes: AtomicU64,
-    /// First / last sample time on the recording clock (`u64::MAX` = none yet).
+    /// First / last sample time written, on the recording clock (`u64::MAX` = none yet).
     pub first_ns: AtomicU64,
     pub last_ns: AtomicU64,
+    /// When the source was asked to start and when it delivered its first sample, on the start
+    /// clock (`u64::MAX` = not yet): the difference is its warm-up (`warmup_ns`).
+    pub started_ns: AtomicU64,
+    pub raw_first_ns: AtomicU64,
     /// Microphone peak of the last block (f32 bits).
     pub level: AtomicU32,
 }
@@ -665,6 +684,8 @@ impl Default for SourceStats {
             bytes: AtomicU64::new(0),
             first_ns: AtomicU64::new(NONE),
             last_ns: AtomicU64::new(NONE),
+            started_ns: AtomicU64::new(NONE),
+            raw_first_ns: AtomicU64::new(NONE),
             level: AtomicU32::new(0),
         }
     }
@@ -676,6 +697,34 @@ impl SourceStats {
     }
     fn last(&self) -> Option<u64> {
         Some(self.last_ns.load(Ordering::Acquire)).filter(|v| *v != NONE)
+    }
+    /// The first sample's time on the start clock (None: nothing delivered yet).
+    fn raw_first(&self) -> Option<u64> {
+        Some(self.raw_first_ns.load(Ordering::Acquire)).filter(|v| *v != NONE)
+    }
+    /// Note the first delivered sample (later calls keep the first).
+    fn delivered(&self, raw_ns: u64) {
+        let _ = self.raw_first_ns.compare_exchange(NONE, raw_ns, Ordering::AcqRel, Ordering::Acquire);
+    }
+    /// How long the source took from its start to its first sample.
+    fn warmup(&self) -> Option<u64> {
+        let started = self.started_ns.load(Ordering::Acquire);
+        self.raw_first().filter(|_| started != NONE).map(|f| f.saturating_sub(started))
+    }
+}
+
+/// Wait until the recording's start (`origin`, on the start clock) is known; None when `gone()`
+/// first (the start failed or was cancelled).
+fn wait_origin(origin: &AtomicU64, gone: impl Fn() -> bool) -> Option<u64> {
+    loop {
+        let o = origin.load(Ordering::Acquire);
+        if o != NONE {
+            return Some(o);
+        }
+        if gone() {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -743,7 +792,12 @@ struct AudioSource {
 pub struct Active {
     pub name: String,
     pub dir: PathBuf,
+    /// The recording's clock: starts when every source is live (media time 0 of every file).
     pub clock: RecordClock,
+    /// The clock the sources were started on (their sample times), and the recording's start
+    /// on it (`origin`, `u64::MAX` until every source is live).
+    raw: RecordClock,
+    origin: Arc<AtomicU64>,
     video: Vec<VideoSource>,
     mics: Vec<MicSource>,
     system_audio: Option<AudioSource>,
@@ -786,6 +840,10 @@ pub struct Recorder {
     pub active: Option<Active>,
     /// A start counting down (`record.start {countdown}`); [`tick`] starts it when due.
     pub countdown: Option<Countdown>,
+    /// A start whose sources are starting (`record.status` `starting`); [`tick`] collects it.
+    pub starting: Option<Starting>,
+    /// Replaces [`START_TIMEOUT`] (tests).
+    pub start_timeout: Option<std::time::Duration>,
     /// Replaces the wall clock of the countdown and Stop after, in milliseconds (tests).
     pub test_clock_ms: Option<Arc<AtomicU64>>,
     /// What [`tick`] did last (a delayed start, its failure, a Stop after), for the hosts.
@@ -795,6 +853,10 @@ pub struct Recorder {
 impl Recorder {
     pub fn recording(&self) -> bool {
         self.active.is_some()
+    }
+    /// "Starting screen capture…" while the sources of a start are starting (None otherwise).
+    pub fn starting_label(&self) -> Option<&str> {
+        self.starting.as_ref().map(|s| s.label.as_str())
     }
     /// Seconds left before a counting-down start (None: no countdown).
     pub fn countdown_left(&self) -> Option<f64> {
@@ -872,25 +934,34 @@ fn slot_of(ns: u64, rate: FrameRate) -> i64 {
     ((ns as i128 * num + den * 500_000_000) / (den * 1_000_000_000)).clamp(0, i64::MAX as i128) as i64
 }
 
+/// Encodes a video source's frames. It starts when the recording's start (`origin`) is known:
+/// frames captured before it are left out (not counted as dropped), the first frame kept is
+/// frame 0 (it stands for the instant the recording began, less than a frame earlier) and every
+/// later frame sits at its time since the start.
 fn video_worker(
     mut rec: filmcraft_export::recorder::MovRecorder,
     queue: Arc<FrameQueue>,
     stats: Arc<SourceStats>,
     stop_ns: Arc<AtomicU64>,
+    origin: Arc<AtomicU64>,
     rate: FrameRate,
 ) -> std::result::Result<Finished, String> {
+    let Some(origin) = wait_origin(&origin, || queue.is_closed()) else {
+        return Err("stopped before the recording began".into());
+    };
     let (w, h) = rec.size();
     let mut rgba = Vec::new();
-    let mut first = None;
     loop {
         let f = match queue.pop(std::time::Duration::from_millis(100)) {
             None => break,
             Some(None) => continue,
             Some(Some(f)) => f,
         };
-        let t0 = *first.get_or_insert(f.time_ns);
-        let slot = slot_of(f.time_ns.saturating_sub(t0), rate);
-        if rec.last_slot().is_some_and(|l| slot <= l) || f.time_ns < t0 {
+        let Some(rel) = f.time_ns.checked_sub(origin) else {
+            continue; // captured while the other sources were starting
+        };
+        let slot = if rec.last_slot().is_none() { 0 } else { slot_of(rel, rate) };
+        if rec.last_slot().is_some_and(|l| slot <= l) {
             continue; // two frames inside one frame period
         }
         if !to_rgba(&f, w, h, &mut rgba) {
@@ -899,21 +970,21 @@ fn video_worker(
         }
         rec.push(&rgba, slot).map_err(|e| e.to_string())?;
         if stats.first().is_none() {
-            stats.first_ns.store(t0, Ordering::Release);
+            stats.first_ns.store(rel, Ordering::Release);
         }
-        stats.last_ns.store(f.time_ns, Ordering::Release);
+        stats.last_ns.store(rel, Ordering::Release);
         stats.frames.fetch_add(1, Ordering::Relaxed);
         stats.bytes.store(rec.bytes(), Ordering::Relaxed);
     }
     let encoder = rec.encoder_name().to_string();
     let kbps = rec.kbps();
     let frames = rec.frames();
-    let Some(t0) = first.filter(|_| frames > 0) else {
+    if frames == 0 {
         return Err("no frames were captured".into());
-    };
+    }
     let end = stop_ns.load(Ordering::Acquire);
     let last_slot = rec.last_slot().unwrap_or(0);
-    let end_slot = if end == NONE { last_slot + 1 } else { slot_of(end.saturating_sub(t0), rate).max(last_slot + 1) };
+    let end_slot = if end == NONE { last_slot + 1 } else { slot_of(end.saturating_sub(origin), rate).max(last_slot + 1) };
     let bytes = rec.finish(end_slot).map_err(|e| e.to_string())?;
     let fps = (rate.num.max(1) / rate.den.max(1)) as u32;
     Ok(Finished { frames, bytes, encoder, width: w, height: h, fps, kbps, ..Default::default() })
@@ -995,6 +1066,13 @@ fn pick_channels(got: &[Vec<f32>], channel: usize, stereo: bool) -> Vec<Vec<f32>
     }
 }
 
+/// Most microphone audio kept while waiting for the other sources: the recording begins when the
+/// last source delivers, so older samples are never needed.
+const MIC_LEAD_MAX_SECONDS: u64 = 2;
+
+/// Records a microphone. Until every source is live (`origin` known) it reads the device as it
+/// delivers and keeps the last [`MIC_LEAD_MAX_SECONDS`]; then it trims that to the sample at the
+/// recording's start and goes on writing on the recording clock.
 #[allow(clippy::too_many_arguments)]
 fn mic_worker(
     input: &mut Box<dyn AudioInput>,
@@ -1002,13 +1080,113 @@ fn mic_worker(
     channel: usize,
     opts: AudioOpts,
     clock: RecordClock,
-    first_ns: u64,
     stats: &SourceStats,
     stop_ns: &AtomicU64,
+    origin: &AtomicU64,
 ) -> std::result::Result<Finished, String> {
     let rate = u64::from(wav.rate.max(1));
     let mut gain = opts.auto_gain.then(|| AutoGain::new(wav.rate));
-    let due = |ns: u64| -> u64 { (u128::from(ns.saturating_sub(first_ns)) * u128::from(rate) / 1_000_000_000).min(u128::from(u64::MAX)) as u64 };
+    let ns_of = |n: u64| -> u64 { (u128::from(n) * 1_000_000_000 / u128::from(rate)).min(u128::from(u64::MAX)) as u64 };
+    let n_of = |ns: u64| -> u64 { (u128::from(ns) * u128::from(rate) / 1_000_000_000).min(u128::from(u64::MAX)) as u64 };
+    let started = stats.started_ns.load(Ordering::Acquire);
+    let started = if started == NONE { 0 } else { started };
+    // warm-up: the device's first samples, while the other sources start
+    let mut read = 0u64;
+    let mut lead: Vec<Vec<f32>> = Vec::new();
+    let mut lead_start = NONE;
+    let o = loop {
+        let o = origin.load(Ordering::Acquire);
+        if o != NONE {
+            break Some(o);
+        }
+        if stop_ns.load(Ordering::Acquire) != NONE {
+            break None;
+        }
+        let want = n_of(clock.now_ns().saturating_sub(started)).saturating_sub(read);
+        if want > 0 {
+            let got = input.read(want.min(rate * 2) as usize);
+            if let Some(e) = input.error() {
+                input.stop();
+                return Err(format!("microphone failed: {e}"));
+            }
+            let chans = pick_channels(&got, channel, opts.stereo);
+            let n = chans.iter().map(Vec::len).min().unwrap_or(0);
+            if n > 0 {
+                read += n as u64;
+                if lead_start == NONE {
+                    // the block ends now: its first sample is its length earlier
+                    lead_start = clock.now_ns().saturating_sub(ns_of(n as u64)).max(started);
+                    stats.delivered(lead_start);
+                }
+                let peak = chans.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+                stats.level.store(peak.to_bits(), Ordering::Relaxed);
+                if lead.is_empty() {
+                    lead = chans
+                        .into_iter()
+                        .map(|mut c| {
+                            c.truncate(n);
+                            c
+                        })
+                        .collect();
+                } else {
+                    for (l, c) in lead.iter_mut().zip(chans) {
+                        l.extend_from_slice(c.get(..n).unwrap_or(&c));
+                    }
+                }
+                let len = lead.first().map_or(0, Vec::len);
+                let cap = (rate * MIC_LEAD_MAX_SECONDS) as usize;
+                if len > cap {
+                    let d = len - cap;
+                    for l in &mut lead {
+                        l.drain(..d.min(l.len()));
+                    }
+                    lead_start = lead_start.saturating_add(ns_of(d as u64));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let Some(o) = o else {
+        input.stop();
+        let _ = wav.finish();
+        return Err("stopped before the recording began".into());
+    };
+    let mut put = |wav: &mut WavStream, mut chans: Vec<Vec<f32>>| -> std::result::Result<(), String> {
+        // the meter shows the input as it is, never the auto gain
+        let peak = chans.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+        stats.level.store(peak.to_bits(), Ordering::Relaxed);
+        if let Some(g) = gain.as_mut() {
+            g.process(&mut chans);
+        }
+        wav.write(&chans)?;
+        stats.bytes.store(wav.bytes(), Ordering::Relaxed);
+        stats.frames.store(wav.frames, Ordering::Relaxed);
+        if wav.frames > 0 {
+            stats.last_ns.store(ns_of(wav.frames), Ordering::Release);
+        }
+        Ok(())
+    };
+    // the lead, trimmed to the sample at the start (or, when the estimate of the device's first
+    // sample is a little after it, preceded by that much silence)
+    if lead_start != NONE && !lead.is_empty() {
+        if lead_start < o {
+            let d = n_of(o - lead_start) as usize;
+            for l in &mut lead {
+                l.drain(..d.min(l.len()));
+            }
+            stats.first_ns.store(0, Ordering::Release);
+        } else {
+            let pad = n_of(lead_start - o).min(rate) as usize;
+            if pad > 0 {
+                put(&mut wav, vec![vec![0.0; pad]; lead.len()])?;
+            }
+            stats.first_ns.store(lead_start - o, Ordering::Release);
+        }
+        put(&mut wav, std::mem::take(&mut lead))?;
+    } else {
+        stats.first_ns.store(0, Ordering::Release);
+    }
+    let due = |ns: u64| -> u64 { n_of(ns.saturating_sub(o)) };
     loop {
         let end = stop_ns.load(Ordering::Acquire);
         let now = if end == NONE { clock.now_ns() } else { end };
@@ -1018,20 +1196,9 @@ fn mic_worker(
             if let Some(e) = input.error() {
                 return Err(format!("microphone failed: {e}"));
             }
-            if !got.is_empty() {
-                let mut chans = pick_channels(&got, channel, opts.stereo);
-                // the meter shows the input as it is, never the auto gain
-                let peak = chans.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
-                stats.level.store(peak.to_bits(), Ordering::Relaxed);
-                if let Some(g) = gain.as_mut() {
-                    g.process(&mut chans);
-                }
-                wav.write(&chans)?;
-                stats.bytes.store(wav.bytes(), Ordering::Relaxed);
-                stats.frames.store(wav.frames, Ordering::Relaxed);
-                if wav.frames > 0 {
-                    stats.last_ns.store(first_ns.saturating_add(wav.frames * 1_000_000_000 / rate), Ordering::Release);
-                }
+            let chans = pick_channels(&got, channel, opts.stereo);
+            if chans.iter().map(Vec::len).min().unwrap_or(0) > 0 {
+                put(&mut wav, chans)?;
             }
         }
         if end != NONE {
@@ -1054,10 +1221,18 @@ fn mic_worker(
     Ok(Finished { frames: samples, bytes, sample_rate, samples, channels, format: format.id(), auto_gain: opts.auto_gain, notes, ..Default::default() })
 }
 
-/// Writes the system audio blocks of a screen into a WAV, filling gaps (nothing played) with
-/// silence so the file stays on the recording clock.
-fn system_audio_worker(queue: Arc<BoundedQueue<CapturedAudio>>, mut wav: WavStream, stats: Arc<SourceStats>) -> std::result::Result<Finished, String> {
-    let mut first: Option<u64> = None;
+/// Writes the system audio blocks of a screen into a WAV from the recording's start (`origin`):
+/// what was captured before it is trimmed to the sample, and gaps (nothing played, or nothing
+/// yet at the start) are filled with silence so the file stays on the recording clock.
+fn system_audio_worker(
+    queue: Arc<BoundedQueue<CapturedAudio>>,
+    mut wav: WavStream,
+    stats: Arc<SourceStats>,
+    origin: Arc<AtomicU64>,
+) -> std::result::Result<Finished, String> {
+    let Some(origin) = wait_origin(&origin, || queue.is_closed()) else {
+        return Err("stopped before the recording began".into());
+    };
     loop {
         let b = match queue.pop(std::time::Duration::from_millis(100)) {
             None => break,
@@ -1067,22 +1242,36 @@ fn system_audio_worker(queue: Arc<BoundedQueue<CapturedAudio>>, mut wav: WavStre
         if b.channels.is_empty() || b.sample_rate == 0 {
             continue;
         }
-        let t0 = match first {
-            Some(t) => t,
+        if wav.frames == 0 {
+            // the file takes the rate and channels the system delivers
+            wav.rate = b.sample_rate.clamp(8_000, 192_000);
+            wav.channels = (b.channels.len() as u16).clamp(1, 2);
+        }
+        let rate = u64::from(wav.rate);
+        let mut chans = b.channels;
+        let rel = match b.time_ns.checked_sub(origin) {
+            Some(r) => r,
             None => {
-                // the file takes the rate and channels the system delivers
-                wav.rate = b.sample_rate.clamp(8_000, 192_000);
-                wav.channels = (b.channels.len() as u16).clamp(1, 2);
-                stats.first_ns.store(b.time_ns, Ordering::Release);
-                first = Some(b.time_ns);
-                b.time_ns
+                // captured before the start: keep the part after it
+                let skip = (u128::from(origin - b.time_ns) * u128::from(rate)).div_ceil(1_000_000_000).min(usize::MAX as u128) as usize;
+                if skip >= chans.iter().map(Vec::len).min().unwrap_or(0) {
+                    continue;
+                }
+                for c in &mut chans {
+                    c.drain(..skip.min(c.len()));
+                }
+                0
             }
         };
-        let rate = u64::from(wav.rate);
-        let expected = t0.saturating_add(wav.frames.saturating_mul(1_000_000_000) / rate);
-        if b.time_ns > expected.saturating_add(50_000_000) {
+        if stats.first().is_none() {
+            stats.first_ns.store(rel, Ordering::Release);
+        }
+        let expected = wav.frames.saturating_mul(1_000_000_000) / rate;
+        // the first block is put exactly where it was captured; later, only real gaps are filled
+        let tolerance = if wav.frames == 0 { 0 } else { 50_000_000 };
+        if rel > expected.saturating_add(tolerance) {
             // silence up to this block, at most a minute per gap
-            let gap = ((b.time_ns - expected) as u128 * u128::from(rate) / 1_000_000_000).min(u128::from(rate) * 60) as usize;
+            let gap = (u128::from(rel - expected) * u128::from(rate) / 1_000_000_000).min(u128::from(rate) * 60) as usize;
             let mut left = gap;
             while left > 0 {
                 let n = left.min(wav.rate as usize);
@@ -1090,11 +1279,11 @@ fn system_audio_worker(queue: Arc<BoundedQueue<CapturedAudio>>, mut wav: WavStre
                 left -= n;
             }
         }
-        wav.write(&b.channels)?;
+        wav.write(&chans)?;
         stats.frames.store(wav.frames, Ordering::Relaxed);
         stats.bytes.store(wav.bytes(), Ordering::Relaxed);
-        stats.last_ns.store(t0.saturating_add(wav.frames.saturating_mul(1_000_000_000) / rate), Ordering::Release);
-        let peak = b.channels.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
+        stats.last_ns.store(wav.frames.saturating_mul(1_000_000_000) / rate, Ordering::Release);
+        let peak = chans.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
         stats.level.store(peak.to_bits(), Ordering::Relaxed);
     }
     let samples = wav.frames;
@@ -1186,6 +1375,9 @@ fn can_start(s: &Session) -> std::result::Result<(), String> {
     if s.record.countdown.is_some() {
         return Err("a recording is already counting down".into());
     }
+    if s.record.starting.is_some() {
+        return Err("a recording is already starting".into());
+    }
     if s.voiceover.recording() {
         return Err("a voice-over is recording".into());
     }
@@ -1193,7 +1385,7 @@ fn can_start(s: &Session) -> std::result::Result<(), String> {
 }
 
 fn is_recording(s: &Session) -> std::result::Result<(), String> {
-    if s.record.recording() || s.record.countdown.is_some() { Ok(()) } else { Err("nothing is recording".into()) }
+    if s.record.recording() || s.record.countdown.is_some() || s.record.starting.is_some() { Ok(()) } else { Err("nothing is recording".into()) }
 }
 
 fn devices(s: &mut Session, _p: &Value) -> Result<Value> {
@@ -1205,9 +1397,10 @@ fn devices(s: &mut Session, _p: &Value) -> Result<Value> {
         }
         Err(e) => (VideoDevices::default(), Some(e.message)),
     };
-    let microphones = match &s.record.active {
-        Some(a) => a.microphones.clone(),
-        None => s.voiceover.input.get_or_insert_with(|| Box::new(SyntheticInput::clicks())).devices(),
+    let microphones = match (&s.record.active, &s.record.starting) {
+        (Some(a), _) => a.microphones.clone(),
+        (None, Some(st)) => st.microphones.clone(),
+        (None, None) => s.voiceover.input.get_or_insert_with(|| Box::new(SyntheticInput::clicks())).devices(),
     };
     Ok(json!({
         "displays": dev.displays,
@@ -1379,9 +1572,9 @@ fn plan(s: &Session, p: &Value) -> Result<Plan> {
     Ok(Plan { screen, cameras, mics, settings })
 }
 
-/// Stop every started source of a failed start and delete its files; the session's mic input
-/// goes back.
-fn abort(s: &mut Session, mut a: Active) {
+/// Stop every started source of a failed (or cancelled) start and delete its files; returns the
+/// session's microphone input when it was handed to the recording.
+fn abort(mut a: Active) -> Option<Box<dyn AudioInput>> {
     a.stop_ns.store(0, Ordering::Release);
     for v in &mut a.video {
         v.input.stop();
@@ -1396,15 +1589,17 @@ fn abort(s: &mut Session, mut a: Active) {
             let _ = w.join();
         }
     }
+    let mut back = None;
     for m in &mut a.mics {
         if let Some(w) = m.worker.take()
             && let Ok((input, _)) = w.join()
             && m.session_input
         {
-            s.voiceover.input = Some(input);
+            back = Some(input);
         }
     }
     remove_files(&a.files());
+    back
 }
 
 /// What a video source is and where it goes.
@@ -1450,18 +1645,32 @@ fn open_recorder(path: &Path, w: u32, h: u32, fps: u32, enc: CaptureEncoding, no
     rec.map(|r| (r, fps)).map_err(|e| e.to_string())
 }
 
-fn start_video(mut input: Box<dyn VideoInput>, setup: VideoSetup, clock: RecordClock, stop_ns: &Arc<AtomicU64>) -> Result<VideoSource> {
+/// Start a video source on the start clock: its frames wait in its queue until the recording's
+/// start (`origin`) is known, and frames captured before that start are left out.
+fn start_video(
+    mut input: Box<dyn VideoInput>,
+    setup: VideoSetup,
+    clock: RecordClock,
+    stop_ns: &Arc<AtomicU64>,
+    origin: &Arc<AtomicU64>,
+) -> std::result::Result<VideoSource, String> {
     let VideoSetup { src, req, path, device_id, device_name, mirror, enc } = setup;
     let queue = Arc::new(FrameQueue::new(4));
     let stats = Arc::new(SourceStats::default());
-    let (q, st) = (queue.clone(), stats.clone());
+    let (q, st, o) = (queue.clone(), stats.clone(), origin.clone());
     let sink: FrameSink = Arc::new(move |f| {
-        if q.push(f) {
+        st.delivered(f.time_ns);
+        let start = o.load(Ordering::Acquire);
+        if start == NONE {
+            // warming up: older frames make room silently (they precede the start anyway)
+            q.push(f);
+        } else if f.time_ns >= start && q.push(f) {
             st.dropped.fetch_add(1, Ordering::Relaxed);
         }
     });
     let label = src.key();
-    let fmt = input.start(&req, clock, sink).map_err(|e| EngineError::Other(format!("{label}: {e}")))?;
+    stats.started_ns.store(clock.now_ns(), Ordering::Release);
+    let fmt = input.start(&req, clock, sink).map_err(|e| format!("{label}: {e}"))?;
     let (w, h) = (fmt.width, fmt.height);
     // a source that could not scale itself is scaled in software (see `to_rgba`)
     let (w, h) = req.max_height.and_then(|mh| crate::record_settings::downscale((w, h), mh)).unwrap_or((w, h));
@@ -1475,18 +1684,18 @@ fn start_video(mut input: Box<dyn VideoInput>, setup: VideoSetup, clock: RecordC
         Err(e) => {
             input.stop();
             let _ = std::fs::remove_file(&path);
-            return Err(EngineError::Other(format!("{label} encoder: {e}")));
+            return Err(format!("{label} encoder: {e}"));
         }
     };
-    let (q, st, stop) = (queue.clone(), stats.clone(), stop_ns.clone());
+    let (q, st, stop, o) = (queue.clone(), stats.clone(), stop_ns.clone(), origin.clone());
     let rate = FrameRate::new(i64::from(fps), 1);
     let worker = std::thread::Builder::new()
         .name(format!("filmcraft-record-{label}"))
         .spawn(move || {
-            std::panic::catch_unwind(AssertUnwindSafe(|| video_worker(rec, q, st, stop, rate)))
+            std::panic::catch_unwind(AssertUnwindSafe(|| video_worker(rec, q, st, stop, o, rate)))
                 .unwrap_or_else(|p| Err(format!("the encoder crashed: {}", panic_text(&p))))
         })
-        .map_err(|e| EngineError::Other(format!("{label}: cannot start the encoder thread: {e}")));
+        .map_err(|e| format!("{label}: cannot start the encoder thread: {e}"));
     let worker = match worker {
         Ok(w) => w,
         Err(e) => {
@@ -1500,14 +1709,22 @@ fn start_video(mut input: Box<dyn VideoInput>, setup: VideoSetup, clock: RecordC
 
 /// Ask a screen input for its system audio, into `path`; None when it cannot (the start goes on
 /// without it and says so).
-fn start_system_audio(input: &mut Box<dyn VideoInput>, path: &Path, rs: &RecordingSettings) -> std::result::Result<Option<AudioSource>, String> {
+fn start_system_audio(
+    input: &mut Box<dyn VideoInput>,
+    path: &Path,
+    rs: &RecordingSettings,
+    clock: RecordClock,
+    origin: &Arc<AtomicU64>,
+) -> std::result::Result<Option<AudioSource>, String> {
     let channels = if rs.stereo() { 2 } else { 1 };
     let format = WavFormat::from_id(&rs.audio_format);
     let queue: Arc<BoundedQueue<CapturedAudio>> = Arc::new(BoundedQueue::new(512));
     let stats = Arc::new(SourceStats::default());
-    let (q, st) = (queue.clone(), stats.clone());
+    stats.started_ns.store(clock.now_ns(), Ordering::Release);
+    let (q, st, o) = (queue.clone(), stats.clone(), origin.clone());
     let sink: AudioSink = Arc::new(move |b| {
-        if q.push(b) {
+        st.delivered(b.time_ns);
+        if q.push(b) && o.load(Ordering::Acquire) != NONE {
             st.dropped.fetch_add(1, Ordering::Relaxed);
         }
     });
@@ -1515,61 +1732,60 @@ fn start_system_audio(input: &mut Box<dyn VideoInput>, path: &Path, rs: &Recordi
         return Ok(None);
     }
     let wav = WavStream::create(path, rs.sample_rate, channels, format).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (q, st) = (queue.clone(), stats.clone());
+    let (q, st, o) = (queue.clone(), stats.clone(), origin.clone());
     let worker = std::thread::Builder::new()
         .name("filmcraft-record-system-audio".into())
         .spawn(move || {
-            std::panic::catch_unwind(AssertUnwindSafe(|| system_audio_worker(q, wav, st)))
+            std::panic::catch_unwind(AssertUnwindSafe(|| system_audio_worker(q, wav, st, o)))
                 .unwrap_or_else(|p| Err(format!("the system audio recorder crashed: {}", panic_text(&p))))
         })
         .map_err(|e| format!("system audio: cannot start the recording thread: {e}"))?;
     Ok(Some(AudioSource { src: Src::new(SourceKind::SystemAudio, 0), queue, stats, worker: Some(worker), path: path.to_path_buf() }))
 }
 
-/// Start the microphone `device` into `path` (`input` moves onto the recording thread).
+/// Start the microphone `device` into `path` on the start clock (`input` moves onto the
+/// recording thread; it comes back with the error when the start fails).
 #[allow(clippy::too_many_arguments)]
 fn start_mic(
-    s: &Session,
     mut input: Box<dyn AudioInput>,
     src: Src,
     device: &str,
     path: PathBuf,
     clock: RecordClock,
     stop_ns: &Arc<AtomicU64>,
+    origin: &Arc<AtomicU64>,
     rs: &RecordingSettings,
-) -> std::result::Result<(MicSource, Option<String>), (Box<dyn AudioInput>, EngineError)> {
+    input_channel: u32,
+) -> std::result::Result<(MicSource, Option<String>), (Box<dyn AudioInput>, String)> {
     let label = src.key();
+    let stats = Arc::new(SourceStats::default());
+    stats.started_ns.store(clock.now_ns(), Ordering::Release);
     let fmt = match input.start(device, rs.sample_rate) {
         Ok(f) => f,
         Err(e) => {
             return Err((
                 input,
-                EngineError::Other(format!(
-                    "{label}: {e} (on macOS, allow FilmCraft or the terminal that launched it in System Settings ▸ Privacy & Security ▸ Microphone)"
-                )),
+                format!("{label}: {e} (on macOS, allow FilmCraft or the terminal that launched it in System Settings ▸ Privacy & Security ▸ Microphone)"),
             ));
         }
     };
     let note = (fmt.sample_rate != rs.sample_rate).then(|| format!("the device records at {} Hz, not the {} Hz asked for", fmt.sample_rate, rs.sample_rate));
-    let first_ns = clock.now_ns();
-    let channel = (s.prefs.voice_over.input_channel as usize).min(usize::from(fmt.channels.max(1)) - 1);
+    let channel = (input_channel as usize).min(usize::from(fmt.channels.max(1)) - 1);
     let opts = AudioOpts { rate: fmt.sample_rate.max(1), stereo: rs.stereo(), format: WavFormat::from_id(&rs.audio_format), auto_gain: rs.auto_gain };
     let wav = match WavStream::create(&path, opts.rate, if opts.stereo { 2 } else { 1 }, opts.format) {
         Ok(w) => w,
         Err(e) => {
             input.stop();
-            return Err((input, EngineError::Other(format!("{}: {e}", path.display()))));
+            return Err((input, format!("{}: {e}", path.display())));
         }
     };
-    let stats = Arc::new(SourceStats::default());
-    stats.first_ns.store(first_ns, Ordering::Release);
-    let (st, stop) = (stats.clone(), stop_ns.clone());
+    let (st, stop, o) = (stats.clone(), stop_ns.clone(), origin.clone());
     // the input moves to the thread and comes back from it; if the thread cannot start, the
     // input is lost with it, so a spare is made first for the session
     let spare = input.spawn();
     let spawned = std::thread::Builder::new().name(format!("filmcraft-record-{label}")).spawn(move || {
         let mut input = input;
-        let r = std::panic::catch_unwind(AssertUnwindSafe(|| mic_worker(&mut input, wav, channel, opts, clock, first_ns, &st, &stop)))
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| mic_worker(&mut input, wav, channel, opts, clock, &st, &stop, &o)))
             .unwrap_or_else(|p| Err(format!("the microphone recorder crashed: {}", panic_text(&p))));
         (input, r)
     });
@@ -1585,9 +1801,7 @@ fn start_mic(
             },
             note,
         )),
-        Err(e) => {
-            Err((spare.unwrap_or_else(|| Box::new(SyntheticInput::clicks())), EngineError::Other(format!("{label}: cannot start the recording thread: {e}"))))
-        }
+        Err(e) => Err((spare.unwrap_or_else(|| Box::new(SyntheticInput::clicks())), format!("{label}: cannot start the recording thread: {e}"))),
     }
 }
 
@@ -1634,10 +1848,192 @@ fn resolve_devices(s: &mut Session, plan: &Plan, f: &Arc<dyn VideoInputFactory>)
     Ok((screen_name, camera_names, microphones))
 }
 
+/// A `record.start` whose sources are starting on their own thread: `record.status` says
+/// `starting`, [`tick`] (or a waiting `record.start`) collects it.
+pub struct Starting {
+    /// What the hosts show ("Starting screen capture…").
+    pub label: String,
+    /// The microphone names (the session's input is with the starting recording).
+    microphones: Vec<String>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<StartOutcome>>,
+    /// A fresh input of the session's kind, for the session when the start thread lost its own.
+    spare: Option<Box<dyn AudioInput>>,
+}
+
+impl Starting {
+    fn finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+    fn join(&mut self) -> StartOutcome {
+        match self.handle.take().map(|h| h.join()) {
+            Some(Ok(o)) => o,
+            Some(Err(p)) => StartOutcome { session_input: None, result: Err(format!("the recording start crashed: {}", panic_text(&p))) },
+            None => StartOutcome { session_input: None, result: Err("the recording did not start".into()) },
+        }
+    }
+}
+
+/// What the start thread hands back: the recording (every source live), or why it failed (its
+/// sources stopped and files deleted), with the session's microphone input when it holds it.
+struct StartOutcome {
+    session_input: Option<Box<dyn AudioInput>>,
+    result: std::result::Result<Active, String>,
+}
+
+/// A microphone to start: its input (the session's for the first), its source and device name.
+type MicStart = (Box<dyn AudioInput>, Src, String);
+
+/// Everything the start thread needs.
+struct StartJob {
+    active: Active,
+    screen: Option<(Box<dyn VideoInput>, VideoSetup, bool)>,
+    cameras: Vec<(Box<dyn VideoInput>, VideoSetup)>,
+    mics: Vec<MicStart>,
+    input_channel: u32,
+    timeout: std::time::Duration,
+    cancel: Arc<AtomicBool>,
+}
+
+/// A source in words: `screen`, `camera 2`, `microphone`…
+fn spoken(src: Src) -> String {
+    let k = match src.kind {
+        SourceKind::Screen => "screen",
+        SourceKind::Camera => "camera",
+        SourceKind::Mic => "microphone",
+        SourceKind::SystemAudio => "system audio",
+    };
+    if src.n == 0 { k.to_string() } else { format!("{k} {}", src.n + 1) }
+}
+
+/// Wait until every screen, camera and microphone delivered its first sample; returns the
+/// latest of those times (on the start clock): the recording's start. System audio is not
+/// waited for (nothing may be playing); it is filled with silence from the start.
+fn await_live(a: &Active, deadline: web_time::Instant, timeout: std::time::Duration, cancel: &AtomicBool) -> std::result::Result<u64, String> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err("the recording was cancelled while it was starting".into());
+        }
+        let mut latest = 0u64;
+        let mut waiting: Option<String> = None;
+        for v in &a.video {
+            if let Some(e) = v.input.error() {
+                return Err(format!("{}: {e}", v.src.key()));
+            }
+            if v.worker.as_ref().is_some_and(|w| w.is_finished()) {
+                return Err(format!("{}: the encoder stopped", v.src.key()));
+            }
+            match v.stats.raw_first() {
+                Some(t) => latest = latest.max(t),
+                None => {
+                    waiting.get_or_insert_with(|| format!("{} '{}' delivered no frames", spoken(v.src), v.device_name));
+                }
+            }
+        }
+        for m in &a.mics {
+            if m.worker.as_ref().is_some_and(|w| w.is_finished()) {
+                return Err(format!("{} '{}' stopped before it delivered audio", spoken(m.src), m.device));
+            }
+            match m.stats.raw_first() {
+                Some(t) => latest = latest.max(t),
+                None => {
+                    waiting.get_or_insert_with(|| format!("{} '{}' delivered no audio", spoken(m.src), m.device));
+                }
+            }
+        }
+        let Some(w) = waiting else { return Ok(latest) };
+        if web_time::Instant::now() >= deadline {
+            return Err(format!("{w} within {} s", timeout.as_secs_f64()));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// The start thread: start every source on the start clock, wait until each one delivers, then
+/// begin the recording at the latest first sample.
+fn run_start(job: StartJob) -> StartOutcome {
+    let StartJob { mut active, screen, cameras, mics, input_channel, timeout, cancel } = job;
+    let began = web_time::Instant::now();
+    let deadline = began.checked_add(timeout).unwrap_or(began);
+    let (raw, stop_ns, origin) = (active.raw, active.stop_ns.clone(), active.origin.clone());
+    let rs = active.settings.clone();
+    let (dir, name) = (active.dir.clone(), active.name.clone());
+    let fail = |a: Active, pending: Vec<MicStart>, msg: String| -> StartOutcome {
+        let back = abort(a);
+        let unstarted = pending.into_iter().find(|m| m.1.n == 0).map(|m| m.0);
+        StartOutcome { session_input: back.or(unstarted), result: Err(msg) }
+    };
+    if let Some((mut input, setup, system_audio)) = screen {
+        if system_audio {
+            let path = dir.join(file_name(&name, Src::new(SourceKind::SystemAudio, 0)));
+            match start_system_audio(&mut input, &path, &rs, raw, &origin) {
+                Ok(Some(a)) => active.system_audio = Some(a),
+                Ok(None) => active.notes.push("system audio is not available for this screen".into()),
+                Err(e) => active.notes.push(format!("system audio: {e}")),
+            }
+        }
+        match start_video(input, setup, raw, &stop_ns, &origin) {
+            Ok(v) => active.video.push(v),
+            Err(e) => return fail(active, mics, e),
+        }
+    }
+    for (input, setup) in cameras {
+        if cancel.load(Ordering::Acquire) {
+            return fail(active, mics, "the recording was cancelled while it was starting".into());
+        }
+        match start_video(input, setup, raw, &stop_ns, &origin) {
+            Ok(v) => active.video.push(v),
+            Err(e) => return fail(active, mics, e),
+        }
+    }
+    let mut pending = mics;
+    while !pending.is_empty() {
+        let (input, src, device) = pending.remove(0);
+        let path = dir.join(file_name(&name, src));
+        match start_mic(input, src, &device, path, raw, &stop_ns, &origin, &rs, input_channel) {
+            Ok((mut m, note)) => {
+                m.session_input = src.n == 0;
+                if let Some(note) = note {
+                    active.notes.push(format!("{}: {note}", src.key()));
+                }
+                active.mics.push(m);
+            }
+            Err((input, e)) => {
+                if src.n == 0 {
+                    pending.insert(0, (input, src, device));
+                }
+                return fail(active, pending, e);
+            }
+        }
+    }
+    match await_live(&active, deadline, timeout, &cancel) {
+        Ok(o) => {
+            origin.store(o, Ordering::Release);
+            active.clock = raw.shifted(o);
+            StartOutcome { session_input: None, result: Ok(active) }
+        }
+        Err(e) => fail(active, Vec::new(), e),
+    }
+}
+
+/// What the hosts show while the sources start.
+fn starting_label(plan: &Plan) -> String {
+    if plan.screen.is_some() {
+        "Starting screen capture…".into()
+    } else if plan.cameras.len() > 1 {
+        "Starting the cameras…".into()
+    } else if !plan.cameras.is_empty() {
+        "Starting the camera…".into()
+    } else {
+        "Starting the microphone…".into()
+    }
+}
+
 fn start(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "record.start";
     can_start(s).map_err(|e| bad(cmd, e))?;
     let countdown = countdown_of(p, cmd)?;
+    let wait = bool_of(p, "wait", cmd, true)?;
     let plan = plan(s, p)?;
     let name = match str_p(p, "name") {
         Some(n) => Some(check_name(n).map_err(|e| bad(cmd, e))?),
@@ -1646,7 +2042,7 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
     let f = factory(s);
     let (screen_name, camera_names, microphones) = resolve_devices(s, &plan, &f)?;
     if countdown > 0 {
-        // checked now, started by `tick` when the countdown is over
+        // checked now, started by `tick` when the countdown is over (before any source starts)
         let mut params = p.clone();
         if let Some(o) = params.as_object_mut() {
             o.remove("countdown");
@@ -1677,58 +2073,47 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
     let dir = record_dir(s, p, &rs);
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
     let name = pick_name(s, &dir, name.as_deref(), &srcs);
-    let clock = RecordClock::new();
-    let stop_ns = Arc::new(AtomicU64::new(NONE));
-    let mut active = Active {
+    let raw = RecordClock::new();
+    let active = Active {
         name: name.clone(),
         dir: dir.clone(),
-        clock,
+        clock: raw,
+        raw,
+        origin: Arc::new(AtomicU64::new(NONE)),
         video: Vec::new(),
         mics: Vec::new(),
         system_audio: None,
-        stop_ns: stop_ns.clone(),
-        microphones,
+        stop_ns: Arc::new(AtomicU64::new(NONE)),
+        microphones: microphones.clone(),
         settings: rs.clone(),
         notes: Vec::new(),
-        started_ms: s.record.now_ms(),
+        started_ms: 0,
         stop_after_ms: (rs.stop_after_minutes > 0).then(|| u64::from(rs.stop_after_minutes) * 60_000),
     };
     let enc = encoding_of(&rs);
-    // screen (and its system audio)
-    if let Some(sp) = &plan.screen {
-        let src = Src::new(SourceKind::Screen, 0);
-        let id = match &sp.target {
-            ScreenTarget::Display(d) | ScreenTarget::Window(d) => d.clone(),
-        };
-        let setup = VideoSetup {
-            src,
-            req: sp.req,
-            path: dir.join(file_name(&name, src)),
-            device_id: id,
-            device_name: screen_name.clone().unwrap_or_default(),
-            mirror: false,
-            enc,
-        };
-        let r = f.open_screen(&sp.target).map_err(|e| EngineError::Other(format!("screen: {e}"))).and_then(|mut input| {
-            if sp.system_audio {
-                let path = dir.join(file_name(&name, Src::new(SourceKind::SystemAudio, 0)));
-                match start_system_audio(&mut input, &path, &rs) {
-                    Ok(Some(a)) => active.system_audio = Some(a),
-                    Ok(None) => active.notes.push("system audio is not available for this screen".into()),
-                    Err(e) => active.notes.push(format!("system audio: {e}")),
-                }
-            }
-            start_video(input, setup, clock, &stop_ns)
-        });
-        match r {
-            Ok(v) => active.video.push(v),
-            Err(e) => {
-                abort(s, active);
-                return Err(e);
-            }
+    // the inputs are opened here (permission checks, device lookups: quick, and refused at once);
+    // they start on the start thread
+    let screen = match &plan.screen {
+        Some(sp) => {
+            let src = Src::new(SourceKind::Screen, 0);
+            let id = match &sp.target {
+                ScreenTarget::Display(d) | ScreenTarget::Window(d) => d.clone(),
+            };
+            let setup = VideoSetup {
+                src,
+                req: sp.req,
+                path: dir.join(file_name(&name, src)),
+                device_id: id,
+                device_name: screen_name.clone().unwrap_or_default(),
+                mirror: false,
+                enc,
+            };
+            let input = f.open_screen(&sp.target).map_err(|e| EngineError::Other(format!("screen: {e}")))?;
+            Some((input, setup, sp.system_audio))
         }
-    }
-    // cameras
+        None => None,
+    };
+    let mut cameras = Vec::new();
     for (n, (c, cname)) in plan.cameras.iter().zip(&camera_names).enumerate() {
         let src = Src::new(SourceKind::Camera, n);
         let setup = VideoSetup {
@@ -1740,72 +2125,151 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
             mirror: c.mirror,
             enc,
         };
-        let r = f
-            .open_camera(&c.device)
-            .map_err(|e| EngineError::Other(format!("{}: {e}", src.key())))
-            .and_then(|input| start_video(input, setup, clock, &stop_ns));
-        match r {
-            Ok(v) => active.video.push(v),
-            Err(e) => {
-                abort(s, active);
-                return Err(e);
-            }
-        }
+        let input = f.open_camera(&c.device).map_err(|e| EngineError::Other(format!("{}: {e}", src.key())))?;
+        cameras.push((input, setup));
     }
     // microphones: the first on the session's input, the others on inputs made for them
     let mut extra = extra_inputs.into_iter();
+    let mut mics: Vec<MicStart> = Vec::new();
     for (n, device) in plan.mics.iter().enumerate() {
-        let src = Src::new(SourceKind::Mic, n);
-        let path = dir.join(file_name(&name, src));
         let input = if n == 0 {
             s.voiceover.input.take().unwrap_or_else(|| Box::new(SyntheticInput::clicks()))
         } else {
             extra.next().unwrap_or_else(|| Box::new(SyntheticInput::clicks()))
         };
-        match start_mic(s, input, src, device, path, clock, &stop_ns, &rs) {
-            Ok((mut m, note)) => {
-                m.session_input = n == 0;
-                if let Some(note) = note {
-                    active.notes.push(format!("{}: {note}", src.key()));
-                }
-                active.mics.push(m);
-            }
-            Err((input, e)) => {
-                if n == 0 {
-                    s.voiceover.input = Some(input);
-                }
-                abort(s, active);
-                return Err(e);
-            }
-        }
+        mics.push((input, Src::new(SourceKind::Mic, n), device.clone()));
     }
-    let files: Vec<Value> = active
+    let spare = mics.first().and_then(|m| m.0.spawn());
+    let label = starting_label(&plan);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = StartJob {
+        active,
+        screen,
+        cameras,
+        mics,
+        input_channel: s.prefs.voice_over.input_channel,
+        timeout: s.record.start_timeout.unwrap_or(START_TIMEOUT),
+        cancel: cancel.clone(),
+    };
+    let handle = std::thread::Builder::new().name("filmcraft-record-start".into()).spawn(move || {
+        std::panic::catch_unwind(AssertUnwindSafe(|| run_start(job)))
+            .unwrap_or_else(|p| StartOutcome { session_input: None, result: Err(format!("the recording start crashed: {}", panic_text(&p))) })
+    });
+    let handle = match handle {
+        Ok(h) => h,
+        Err(e) => {
+            if s.voiceover.input.is_none() {
+                s.voiceover.input = spare;
+            }
+            return Err(EngineError::Other(format!("cannot start the recording thread: {e}")));
+        }
+    };
+    s.record.starting = Some(Starting { label: label.clone(), microphones, cancel, handle: Some(handle), spare });
+    s.record.last_event = None;
+    if !wait {
+        return Ok(json!({"recording": false, "starting": true, "label": label}));
+    }
+    match s.record.starting.take() {
+        Some(st) => finish_start(s, st),
+        None => Err(EngineError::Other("the recording did not start".into())),
+    }
+}
+
+/// Collect a finished start: the recording runs (its clock starts now for the hosts), or the
+/// error. The session gets its microphone input back on failure.
+fn finish_start(s: &mut Session, mut st: Starting) -> Result<Value> {
+    let o = st.join();
+    if let Some(i) = o.session_input {
+        s.voiceover.input = Some(i);
+    }
+    let mut a = match o.result {
+        Ok(a) => a,
+        Err(e) => {
+            if s.voiceover.input.is_none() {
+                s.voiceover.input = st.spare.take();
+            }
+            return Err(EngineError::Other(e));
+        }
+    };
+    a.started_ms = s.record.now_ms();
+    let files: Vec<Value> = a
         .files()
         .iter()
         .map(|(k, f)| json!({"kind": k.kind.name(), "key": k.key(), "path": f.to_string_lossy(), "sidecar": sidecar_path(f).to_string_lossy()}))
         .collect();
-    let clock_start = clock.unix_start_ns();
-    let notes = active.notes.clone();
-    s.record.active = Some(active);
+    let mut warmup = serde_json::Map::new();
+    for (k, st) in a.video.iter().map(|v| (v.src, &v.stats)).chain(a.mics.iter().map(|m| (m.src, &m.stats))) {
+        warmup.insert(k.key(), json!(st.warmup()));
+    }
+    let v = json!({
+        "recording": true,
+        "name": a.name,
+        "clockStartNs": a.clock.unix_start_ns(),
+        "dir": a.dir.to_string_lossy(),
+        "files": files,
+        "notes": a.notes,
+        "warmupNs": warmup,
+    });
+    s.record.active = Some(a);
     s.record.last_event = None;
-    Ok(json!({"recording": true, "name": name, "clockStartNs": clock_start, "dir": dir.to_string_lossy(), "files": files, "notes": notes}))
+    Ok(v)
 }
 
-/// Run what is due: a counted-down start, a Stop after. The hosts call it every frame; headless
-/// sessions through `record.status`. Returns what happened (also kept in
+/// Cancel a start whose sources are starting: wait for its thread (it stops at once unless an OS
+/// start is still pending, at most [`START_TIMEOUT`]), stop the sources and delete the files.
+fn cancel_start(s: &mut Session) -> Option<Value> {
+    let mut st = s.record.starting.take()?;
+    st.cancel.store(true, Ordering::Release);
+    let o = st.join();
+    if let Some(i) = o.session_input {
+        s.voiceover.input = Some(i);
+    }
+    if let Ok(a) = o.result
+        && let Some(i) = abort(a)
+    {
+        s.voiceover.input = Some(i);
+    }
+    if s.voiceover.input.is_none() {
+        s.voiceover.input = st.spare.take();
+    }
+    Some(json!({"recording": false, "placed": false, "discarded": true, "cancelled": true}))
+}
+
+/// Run what is due: a finished start, a counted-down start, a Stop after. The hosts call it
+/// every frame; headless sessions through `record.status`. Returns what happened (also kept in
 /// [`Recorder::last_event`]).
 pub fn tick(s: &mut Session) -> Option<Value> {
-    let now = s.record.now_ms();
-    if let Some(c) = s.record.countdown.clone()
-        && now >= c.due_ms
+    if s.record.starting.as_ref().is_some_and(Starting::finished)
+        && let Some(st) = s.record.starting.take()
     {
-        s.record.countdown = None;
-        let ev = match start(s, &c.params) {
+        let ev = match finish_start(s, st) {
             Ok(v) => json!({"event": "started", "result": v}),
             Err(e) => json!({"event": "startFailed", "error": e.to_string()}),
         };
         s.record.last_event = Some(ev.clone());
         return Some(ev);
+    }
+    let now = s.record.now_ms();
+    if let Some(c) = s.record.countdown.clone()
+        && now >= c.due_ms
+    {
+        s.record.countdown = None;
+        // the sources start now, on their own thread (the frame loop never waits for them)
+        let mut params = c.params.clone();
+        if let Some(o) = params.as_object_mut() {
+            o.insert("wait".into(), json!(false));
+        }
+        match start(s, &params) {
+            Ok(_) => {
+                s.record.last_event = None;
+                return None;
+            }
+            Err(e) => {
+                let ev = json!({"event": "startFailed", "error": e.to_string()});
+                s.record.last_event = Some(ev.clone());
+                return Some(ev);
+            }
+        }
     }
     let due = s.record.active.as_ref().and_then(|a| a.stop_after_ms.map(|l| now.saturating_sub(a.started_ms) >= l)).unwrap_or(false);
     if due {
@@ -1823,6 +2287,10 @@ pub fn tick(s: &mut Session) -> Option<Value> {
 fn status_json(s: &Session) -> Value {
     let Some(a) = &s.record.active else {
         let mut v = json!({"recording": false, "sources": []});
+        if let (Some(o), Some(st)) = (v.as_object_mut(), &s.record.starting) {
+            o.insert("starting".into(), json!(true));
+            o.insert("label".into(), json!(st.label));
+        }
         if let (Some(o), Some(c)) = (v.as_object_mut(), &s.record.countdown) {
             o.insert("countdown".into(), json!({"seconds": c.seconds, "remaining": s.record.countdown_left().unwrap_or(0.0)}));
         }
@@ -1899,6 +2367,8 @@ struct Done {
     mirror: bool,
     first_ns: u64,
     last_ns: u64,
+    /// From the source's start to its first sample.
+    warmup_ns: Option<u64>,
     dropped: u64,
     fin: Finished,
     notes: Vec<String>,
@@ -1916,6 +2386,7 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
         "clock_start_ns": clock.unix_start_ns(),
         "first_sample_ns": d.first_ns,
         "last_sample_ns": d.last_ns,
+        "warmup_ns": d.warmup_ns,
         "dropped": d.dropped,
         "bytes": d.fin.bytes,
         "events": [],
@@ -1963,7 +2434,8 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
 
 /// Stop every source and collect what each produced (`Err`: that source's failure).
 fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Result<Done, String>>) {
-    let stop = a.clock.now_ns();
+    // sample times are on the start clock
+    let stop = a.raw.now_ns();
     a.stop_ns.store(stop, Ordering::Release);
     let mut out = Vec::new();
     for v in &mut a.video {
@@ -1988,6 +2460,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             mirror: v.mirror,
             first_ns: v.stats.first().unwrap_or(0),
             last_ns: v.stats.last().unwrap_or(0),
+            warmup_ns: v.stats.warmup(),
             dropped: v.stats.dropped.load(Ordering::Relaxed),
             fin,
             notes: v.notes.clone(),
@@ -2012,6 +2485,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             mirror: false,
             first_ns: m.stats.first().unwrap_or(0),
             last_ns: m.stats.last().unwrap_or(0),
+            warmup_ns: m.stats.warmup(),
             dropped: 0,
             notes: a.notes.iter().filter_map(|n| n.strip_prefix(&format!("{}: ", m.src.key())).map(str::to_string)).collect(),
             fin,
@@ -2033,6 +2507,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             mirror: false,
             first_ns: sa.stats.first().unwrap_or(0),
             last_ns: sa.stats.last().unwrap_or(0),
+            warmup_ns: sa.stats.warmup(),
             dropped: sa.stats.dropped.load(Ordering::Relaxed),
             fin,
             notes: Vec::new(),
@@ -2118,6 +2593,11 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
     if s.record.active.is_none() && s.record.countdown.take().is_some() {
         return Ok(json!({"recording": false, "placed": false, "cancelled": true}));
     }
+    if s.record.active.is_none()
+        && let Some(v) = cancel_start(s)
+    {
+        return Ok(v);
+    }
     let a = s.record.active.take().ok_or_else(|| bad(cmd, "nothing is recording"))?;
     let (a, results) = finish_all(s, a);
     let files = a.files();
@@ -2178,7 +2658,8 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f6
         let item = crate::commands::import_streamed(s, &d.path.to_string_lossy(), Some(bin))?;
         items.push((d.src, item));
     }
-    let firsts: Vec<(u64, i64)> = done.iter().zip(offsets_ms).map(|(d, o)| (d.first_ns, (o * 1e6).round() as i64)).collect();
+    // media time 0 of every file is the recording's start: only the camera offsets move a clip
+    let firsts: Vec<(u64, i64)> = done.iter().zip(offsets_ms).map(|(_, o)| (0, (o * 1e6).round() as i64)).collect();
     let offsets: Vec<(Src, i64)> = done.iter().map(|d| d.src).zip(sync_offsets_by(&firsts)).collect();
     let off = |k: Src| offsets.iter().find(|o| o.0 == k).map(|o| Tick::from_units(o.1, 1_000_000_000));
     let item = |k: Src| items.iter().find(|i| i.0 == k).map(|i| i.1);
@@ -2299,6 +2780,11 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f6
 fn cancel(s: &mut Session, _p: &Value) -> Result<Value> {
     if s.record.active.is_none() && s.record.countdown.take().is_some() {
         return Ok(json!({"recording": false, "placed": false, "discarded": true, "cancelled": true}));
+    }
+    if s.record.active.is_none()
+        && let Some(v) = cancel_start(s)
+    {
+        return Ok(v);
     }
     stop(s, &json!({"discard": true}))
 }

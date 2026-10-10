@@ -49,6 +49,45 @@ fn secs(t: Tick) -> f64 {
     t.seconds()
 }
 
+/// One frame at 30 fps, in ns.
+const FRAME_NS: u64 = 33_333_334;
+
+/// Where the moving white bar of a synthetic frame starts (`synthetic_frame` draws it at
+/// `(capture time / 10 ms) mod span`): every synthetic source draws it from the same start clock,
+/// so two frames captured together show it at the same place.
+fn bar_x(luma: &[u8], w: u32, h: u32) -> Option<usize> {
+    let (wu, hu) = (w as usize, h as usize);
+    let row = luma.get(hu * 3 / 4 * wu..hu * 3 / 4 * wu + wu)?;
+    row.iter().position(|&l| l > 180)
+}
+
+/// The capture times (as bar positions) of what two clips show at sequence time `t` differ by
+/// at most `frames` frames (the bar moves 100 px per second).
+fn same_moment(s: &mut Session, v: &Value, a: &str, b: &str, t: f64, frames: f64) {
+    let mut at = Vec::new();
+    for kind in [a, b] {
+        let c = clip(s, v, kind);
+        let item = filmcraft_project::ItemId(v["items"][kind].as_u64().unwrap());
+        let src = s.media.source_for(&s.project, item, &*s.services).unwrap();
+        let m = Tick::from_seconds_f64(t) - c.start + c.source_in;
+        let f = src.video_frame(FrameRequest::full(m)).unwrap();
+        let span = (f.width as usize).saturating_sub((f.width as usize / 32).max(2)).max(1);
+        at.push((bar_x(&f.luma8(), f.width, f.height).unwrap(), span));
+    }
+    let span = at[0].1;
+    let d = (at[0].0 as i64 - at[1].0 as i64).rem_euclid(span as i64) as f64;
+    let d = d.min(span as f64 - d);
+    assert!(d <= frames * 100.0 / 30.0 + 1.5, "at {t} s {a} shows the bar at {} and {b} at {}", at[0].0, at[1].0);
+}
+
+/// The burnt-in index of the frame a clip's file shows at media time `m` seconds.
+fn index_at(s: &mut Session, v: &Value, kind: &str, m: f64) -> u64 {
+    let item = filmcraft_project::ItemId(v["items"][kind].as_u64().unwrap());
+    let src = s.media.source_for(&s.project, item, &*s.services).unwrap();
+    let f = src.video_frame(FrameRequest::full(Tick::from_seconds_f64(m))).unwrap();
+    read_synthetic_index(&f.luma8(), f.width, f.height).unwrap()
+}
+
 #[test]
 fn devices_in_a_headless_session_are_synthetic() {
     let mut s = Session::default();
@@ -91,9 +130,13 @@ fn three_sources_three_files_one_synced_sequence() {
     }
     assert_eq!(sides[0]["encoder"], "FilmCraft H.264");
     assert_eq!(sides[2]["sample_rate"], 48_000);
-    let first = |i: usize| sides[i]["first_sample_ns"].as_u64().unwrap() as f64 / 1e9;
-    let skew = first(1) - first(0);
-    assert!((0.29..0.36).contains(&skew), "camera starts ~300 ms late: {skew}");
+    // the recording begins when the late camera is live: every file starts then
+    for sd in &sides {
+        assert!(sd["first_sample_ns"].as_u64().unwrap() < FRAME_NS, "{sd}");
+    }
+    let warm = |i: usize| sides[i]["warmup_ns"].as_u64().unwrap() as f64 / 1e9;
+    assert!((0.29..0.40).contains(&warm(1)), "the camera took ~300 ms to deliver: {}", warm(1));
+    assert!(warm(0) < 0.1 && warm(2) < 0.1, "{} {}", warm(0), warm(2));
     // one new sequence, opened, with the three clips
     let seqs: Vec<_> = s.project.items.values().filter(|i| i.as_sequence().is_some()).collect();
     assert_eq!(seqs.len(), seqs_before + 1);
@@ -109,14 +152,11 @@ fn three_sources_three_files_one_synced_sequence() {
     let (screen, camera, mic) = (clip(&s, &v, "screen"), clip(&s, &v, "camera"), clip(&s, &v, "mic"));
     assert_eq!(q.video_tracks[0].items[0].id, screen.id);
     assert_eq!(q.video_tracks[1].items[0].id, camera.id);
-    assert_eq!(screen.start, Tick::ZERO);
-    let frame = 1.0 / 30.0;
-    let cam_at = secs(camera.start) - secs(camera.source_in);
-    assert!((cam_at - skew).abs() < 0.002, "camera media time 0 lands at its first sample: {cam_at} vs {skew}");
-    assert!((secs(camera.start) - skew).abs() <= frame + 0.001);
-    assert!(secs(mic.start) - secs(mic.source_in) <= 0.05, "the mic starts with the screen");
-    // the files decode with our decoders and last about 2 s
-    for (kind, want) in [("screen", 2.0), ("camera", 1.7), ("mic", 2.0)] {
+    for c in [&screen, &camera, &mic] {
+        assert_eq!((c.start, c.source_in), (Tick::ZERO, Tick::ZERO), "every clip starts at 0");
+    }
+    // the files decode with our decoders and last about 2 s (from the moment all three were live)
+    for (kind, want) in [("screen", 2.0), ("camera", 2.0), ("mic", 2.0)] {
         let item = filmcraft_project::ItemId(v["items"][kind].as_u64().unwrap());
         let info = s.project.item(item).unwrap().as_media().unwrap().info.clone();
         let d = secs(info.duration);
@@ -124,19 +164,12 @@ fn three_sources_three_files_one_synced_sequence() {
         assert_eq!(s.project.item(item).unwrap().metadata.get("Recording Source").map(String::as_str), Some(kind));
     }
     // sync by pixel: what screen and camera show at the same sequence time was captured together
-    let period = 1.0 / 30.0;
-    for t in [1.0, 1.5] {
-        let mut when = Vec::new();
-        for (kind, c, side) in [("screen", &screen, &sides[0]), ("camera", &camera, &sides[1])] {
-            let item = filmcraft_project::ItemId(v["items"][kind].as_u64().unwrap());
-            let src = s.media.source_for(&s.project, item, &*s.services).unwrap();
-            let m = Tick::from_seconds_f64(t) - c.start + c.source_in;
-            let f = src.video_frame(FrameRequest::full(m)).unwrap();
-            let k = read_synthetic_index(&f.luma8(), f.width, f.height).unwrap();
-            when.push(side["first_sample_ns"].as_u64().unwrap() as f64 / 1e9 + k as f64 * period);
-        }
-        assert!((when[0] - when[1]).abs() <= 2.0 * period + 0.001, "at {t}s screen shows {} and camera {}", when[0], when[1]);
+    for t in [0.0, 1.0, 1.5] {
+        same_moment(&mut s, &v, "screen", "camera", t, 2.0);
     }
+    // the screen's first ~300 ms (before the camera was live) are not in its file
+    let k = index_at(&mut s, &v, "screen", 0.0);
+    assert!((8..=12).contains(&k), "the screen file starts at its frame {k}, ~300 ms in");
     // the mic is back with the voice-over
     assert!(s.voiceover.input.is_some());
     std::fs::remove_dir_all(&dir).ok();
@@ -152,9 +185,9 @@ fn camera_offset_moves_the_camera_and_undo_takes_it_all_back() {
     let screen = clip(&s, &v, "screen");
     let camera = clip(&s, &v, "camera");
     let files: Vec<String> = v["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
-    let skew = (sidecar(&files[1])["first_sample_ns"].as_u64().unwrap() as f64 - sidecar(&files[0])["first_sample_ns"].as_u64().unwrap() as f64) / 1e9;
+    // every file starts at the recording's start: only the offset moves the camera
     let cam_at = secs(camera.start) - secs(camera.source_in) - (secs(screen.start) - secs(screen.source_in));
-    assert!((cam_at - (skew + 0.2)).abs() < 0.002, "camera moved by 200 ms: {cam_at} vs {skew}");
+    assert!((cam_at - 0.2).abs() < 0.002, "camera moved by 200 ms: {cam_at}");
     assert_eq!(sidecar(&files[1])["camera_offset_ms"], 200.0);
     assert_eq!(s.active_sequence().unwrap().markers[0].comment, "camera offset 200 ms");
     // one undo step: sequence, items and bin are gone; the files stay
@@ -309,10 +342,10 @@ fn two_cameras_and_two_mics_each_get_a_file_and_a_track() {
     assert_eq!(sides[1]["camera_offset_ms"], 0.0);
     assert_eq!(sides[4]["index"], 2);
     assert!(sides.iter().all(|sd| sd["clock_start_ns"] == sides[0]["clock_start_ns"]));
-    let first = |i: usize| sides[i]["first_sample_ns"].as_u64().unwrap() as f64 / 1e9;
-    let (skew1, skew2) = (first(1) - first(0), first(2) - first(0));
-    assert!((0.09..0.16).contains(&skew1), "{skew1}");
-    assert!((0.39..0.46).contains(&skew2), "{skew2}");
+    assert!(sides.iter().all(|sd| sd["first_sample_ns"].as_u64().unwrap() < FRAME_NS), "{sides:?}");
+    let warm = |i: usize| sides[i]["warmup_ns"].as_u64().unwrap() as f64 / 1e9;
+    assert!((0.09..0.2).contains(&warm(1)), "{}", warm(1));
+    assert!((0.39..0.5).contains(&warm(2)), "{}", warm(2));
     // V1 screen, V2 camera, V3 camera 2; A1 mic, A2 mic 2
     let q = s.active_sequence().unwrap();
     assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (3, 2));
@@ -327,8 +360,11 @@ fn two_cameras_and_two_mics_each_get_a_file_and_a_track() {
         let c = clip(&s, &v, key);
         secs(c.start) - secs(c.source_in)
     };
-    assert!((at("camera") - skew1).abs() < 0.002, "camera at its first sample: {} vs {skew1}", at("camera"));
-    assert!((at("camera2") - (skew2 + 0.1)).abs() < 0.002, "camera 2 moved by its own 100 ms: {} vs {skew2}", at("camera2"));
+    assert!(at("camera").abs() < 0.002, "camera at the start: {}", at("camera"));
+    assert!((at("camera2") - 0.1).abs() < 0.002, "camera 2 moved by its own 100 ms: {}", at("camera2"));
+    for key in ["screen", "mic", "mic2"] {
+        assert!(at(key).abs() < 0.002, "{key} at the start: {}", at(key));
+    }
     assert_eq!(q.markers[0].comment, "camera 2 offset 100 ms");
     assert_eq!(v["cameras"], json!(["camera", "camera2"]));
     assert_eq!(v["mics"], json!(["mic", "mic2"]));
@@ -537,8 +573,15 @@ fn countdown_uses_the_synthetic_clock_and_can_be_cancelled() {
     let st = s.execute("record.status", json!({})).unwrap();
     assert_eq!((st["recording"].as_bool(), st["countdown"]["remaining"].as_f64()), (Some(false), Some(1.0)));
     clock.store(4_000, Ordering::Release);
+    // the countdown is over: the sources start (on their own thread), then the recording begins
     let st = s.execute("record.status", json!({})).unwrap();
-    assert_eq!(st["recording"], true, "{st}");
+    assert!(st["starting"] == true || st["recording"] == true, "{st}");
+    let t0 = std::time::Instant::now();
+    while !s.record.recording() && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+        s.execute("record.status", json!({})).unwrap();
+    }
+    assert!(s.record.recording());
     assert_eq!(s.record.last_event.as_ref().unwrap()["event"], "started");
     std::thread::sleep(Duration::from_millis(300));
     let v = s.execute("record.stop", json!({})).unwrap();
@@ -608,4 +651,118 @@ fn auto_gain_moves_toward_minus_18_dbfs_at_2_db_per_second() {
     let mut b = vec![vec![1.5f32, f32::NAN, -2.0]];
     g.process(&mut b);
     assert!(b[0].iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+}
+
+// ------------------------------------------------------------------------------------- start sync
+
+#[test]
+fn every_source_is_live_before_the_clock_starts() {
+    let dir = tmp("live");
+    let mut s = Session::default();
+    // the screen delivers at once, the camera after 300 ms, the microphone after 700 ms
+    s.record.factory = Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), camera_delay_ms: 300, ..Default::default() }));
+    s.voiceover.input = Some(Box::new(crate::voiceover::SyntheticInput::delayed(Duration::from_millis(700))));
+    let r = s
+        .execute(
+            "record.start",
+            json!({"screen": {"display": SyntheticFactory::DISPLAY}, "camera": {"device": SyntheticFactory::CAMERA}, "mic": {"device": "Synthetic Input"}, "dir": dir.to_string_lossy()}),
+        )
+        .unwrap();
+    let warm = |k: &str| r["warmupNs"][k].as_u64().unwrap() as f64 / 1e9;
+    assert!(warm("screen") < 0.1, "{r}");
+    assert!((0.29..0.42).contains(&warm("camera")), "{r}");
+    assert!((0.69..0.85).contains(&warm("mic")), "{r}");
+    // the clock starts when the last source is live: Recording · 00:00
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert!(st["elapsed"].as_f64().unwrap() < 0.1, "{st}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    let files: Vec<String> = v["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+    let sides: Vec<Value> = files.iter().map(|f| sidecar(f)).collect();
+    for (sd, (lo, hi)) in sides.iter().zip([(0.0, 0.1), (0.29, 0.42), (0.69, 0.85)]) {
+        assert!(sd["first_sample_ns"].as_u64().unwrap() < FRAME_NS, "first sample within a frame of the start: {sd}");
+        let w = sd["warmup_ns"].as_u64().unwrap() as f64 / 1e9;
+        assert!((lo..hi).contains(&w), "warmup_ns {w}: {sd}");
+        assert_eq!(sd["clock_start_ns"], sides[0]["clock_start_ns"]);
+        assert_eq!(sd["clock_start_ns"], r["clockStartNs"]);
+    }
+    // all three clips start at 0 in the sequence
+    for key in ["screen", "camera", "mic"] {
+        let c = clip(&s, &v, key);
+        assert_eq!((c.start, c.source_in), (Tick::ZERO, Tick::ZERO), "{key}");
+    }
+    // the screen file is shorter by the 700 ms before the microphone was live: ~45 frames of
+    // 1.5 s, the first of them the screen's frame ~21
+    let frames = sides[0]["frames"].as_u64().unwrap();
+    assert!((40..=50).contains(&frames), "{frames} screen frames");
+    let k = index_at(&mut s, &v, "screen", 0.0);
+    assert!((19..=25).contains(&k), "the screen file starts at its frame {k}, ~700 ms in");
+    let k = index_at(&mut s, &v, "camera", 0.0);
+    assert!((10..=15).contains(&k), "the camera file starts at its frame {k}, ~400 ms in");
+    // the microphone covers the same span, to the sample
+    let samples = sides[2]["samples"].as_u64().unwrap() as f64 / 48_000.0;
+    let screen_s = frames as f64 / 30.0;
+    assert!((samples - screen_s).abs() < 0.12, "mic {samples} s, screen {screen_s} s");
+    for t in [0.0, 0.5, 1.0] {
+        same_moment(&mut s, &v, "screen", "camera", t, 2.0);
+    }
+    assert!(s.voiceover.input.is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_source_that_never_delivers_fails_the_start_and_leaves_no_files() {
+    assert_eq!(crate::record::START_TIMEOUT, Duration::from_secs(20));
+    let dir = tmp("never");
+    let mut s = Session::default();
+    s.record.factory =
+        Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), camera_delay_ms: u64::MAX / 2, ..Default::default() }));
+    s.record.start_timeout = Some(Duration::from_millis(600));
+    let d = dir.to_string_lossy().into_owned();
+    // a microphone that never delivers
+    s.voiceover.input = Some(Box::new(crate::voiceover::SyntheticInput::delayed(Duration::MAX)));
+    let e = s
+        .execute("record.start", json!({"screen": {"display": SyntheticFactory::DISPLAY}, "mic": {"device": "Synthetic Input"}, "dir": d}))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("microphone 'Synthetic Input' delivered no audio within 0.6 s"), "{e}");
+    assert!(!s.record.recording() && s.record.starting.is_none());
+    assert!(s.voiceover.input.is_some(), "the microphone input comes back");
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no files remain");
+    // a camera that never delivers
+    s.voiceover.input = Some(Box::new(crate::voiceover::SyntheticInput::clicks()));
+    let e = s.execute("record.start", json!({"camera": {"device": SyntheticFactory::CAMERA}, "mic": {}, "dir": d})).unwrap_err().to_string();
+    assert!(e.contains("camera 'Synthetic Camera' delivered no frames within 0.6 s"), "{e}");
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no files remain");
+    assert!(s.voiceover.input.is_some());
+    // started without waiting: `record.status` says starting; the failure comes as an event
+    let r = s.execute("record.start", json!({"camera": {"device": SyntheticFactory::CAMERA}, "dir": d, "wait": false})).unwrap();
+    assert_eq!((r["starting"].as_bool(), r["label"].as_str()), (Some(true), Some("Starting the camera…")));
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!((st["recording"].as_bool(), st["starting"].as_bool()), (Some(false), Some(true)), "{st}");
+    assert!(s.execute("record.start", json!({"mic": {}, "dir": d})).is_err(), "one start at a time");
+    assert!(s.execute("audio.voiceover.start", json!({})).is_err());
+    let t0 = std::time::Instant::now();
+    while s.record.starting.is_some() && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+        s.execute("record.status", json!({})).unwrap();
+    }
+    let ev = s.record.last_event.clone().unwrap();
+    assert_eq!(ev["event"], "startFailed");
+    assert!(ev["error"].as_str().unwrap().contains("delivered no frames"), "{ev}");
+    // cancelled while starting: nothing is written
+    s.record.start_timeout = None;
+    s.execute(
+        "record.start",
+        json!({"screen": {"display": SyntheticFactory::DISPLAY}, "camera": {"device": SyntheticFactory::CAMERA}, "dir": d, "wait": false}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["label"], "Starting screen capture…");
+    let c = s.execute("record.cancel", json!({})).unwrap();
+    assert_eq!(c["cancelled"], true);
+    assert!(s.record.starting.is_none() && !s.record.recording());
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no files remain");
+    std::fs::remove_dir_all(&dir).ok();
 }

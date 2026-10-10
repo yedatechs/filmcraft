@@ -16,7 +16,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -37,7 +37,7 @@ use filmcraft_engine::record::{
 };
 
 use super::screen::{BGRA, Shared, copy_frame, host_now_ns};
-use super::{HostClockMap, Need, permission_error};
+use super::{HostClockMap, Need, START_TIMEOUT, permission_error, waited};
 
 fn failed(msg: impl Into<String>) -> CaptureError {
     CaptureError::new(CaptureErrorKind::Failed, msg)
@@ -180,6 +180,39 @@ struct Sendable<T>(T);
 // them from one thread at a time (`&mut self` methods).
 unsafe impl<T> Send for Sendable<T> {}
 
+/// Start a configured session: `startRunning` blocks until the camera runs (or fails), so it runs
+/// on its own thread and is waited for at most [`START_TIMEOUT`]; a session that starts after
+/// that is stopped again.
+fn start_running(session: &Retained<AVCaptureSession>) -> Result<(), CaptureError> {
+    let (tx, rx) = mpsc::sync_channel::<bool>(1);
+    let held = Sendable(session.clone());
+    std::thread::Builder::new()
+        .name("filmcraft-camera-start".into())
+        .spawn(move || {
+            let held = held;
+            let running = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: the session is retained by `held` and fully configured; starting it
+                // from a background thread is what Apple recommends.
+                unsafe {
+                    held.0.startRunning();
+                    held.0.isRunning()
+                }
+            }))
+            .unwrap_or(false);
+            if tx.try_send(running).is_err() && running {
+                // nobody waits any more (the start timed out): stop it again
+                // SAFETY: as above; stopping a running session is always allowed.
+                unsafe { held.0.stopRunning() };
+            }
+        })
+        .map_err(|e| failed(format!("cannot start the camera thread: {e}")))?;
+    match rx.recv_timeout(START_TIMEOUT) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(failed("the camera did not start (in use by another app?)")),
+        Err(_) => Err(failed(format!("starting the camera: macOS {}", waited(START_TIMEOUT)))),
+    }
+}
+
 /// A camera being recorded.
 pub struct CameraInput {
     device: String,
@@ -277,11 +310,7 @@ impl VideoInput for CameraInput {
             } else {
                 req.fps.clamp(1, 60)
             };
-            // blocks until the camera runs (or fails); we are on the recording command's thread
-            session.startRunning();
-            if !session.isRunning() {
-                return Err(failed("the camera did not start (in use by another app?)"));
-            }
+            start_running(&session)?;
             let desc = device.activeFormat().formatDescription();
             let dim = CMVideoFormatDescriptionGetDimensions(&desc);
             let w = u32::try_from(dim.width).unwrap_or(1280).clamp(16, 8192) & !1;

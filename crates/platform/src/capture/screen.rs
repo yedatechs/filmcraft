@@ -15,7 +15,8 @@
 //!
 //! Every Objective-C callback body runs under `catch_unwind`; a panic becomes the input's error.
 //! Completion handlers only send on a channel; the waiting side gives up after
-//! [`super::OS_TIMEOUT`].
+//! [`super::START_TIMEOUT`] for the stream start (the first one in a process is slow) and
+//! [`super::OS_TIMEOUT`] for everything else.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,7 +43,7 @@ use filmcraft_engine::record::{
     VideoFormat, VideoInput, VideoRequest, WindowInfo,
 };
 
-use super::{HostClockMap, Need, OS_TIMEOUT, permission_error, time_ns};
+use super::{HostClockMap, Need, OS_TIMEOUT, START_TIMEOUT, permission_error, time_ns, waited};
 
 /// `kCVPixelFormatType_32BGRA`.
 pub const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
@@ -108,7 +109,7 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
     match rx.recv_timeout(OS_TIMEOUT) {
         Ok(Ok(c)) => Ok(c.0),
         Ok(Err(e)) => Err(failed(format!("cannot list the screens: {e}"))),
-        Err(_) => Err(failed("macOS did not list the screens within 5 s")),
+        Err(_) => Err(failed(format!("listing the screens: macOS {}", waited(OS_TIMEOUT)))),
     }
 }
 
@@ -298,18 +299,18 @@ impl StreamOutput {
     }
 }
 
-/// Wait for a ScreenCaptureKit completion handler `(NSError?)`.
-fn run_with_completion(what: &str, call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) -> Result<(), CaptureError> {
+/// Wait at most `timeout` for a ScreenCaptureKit completion handler `(NSError?)`.
+fn run_with_completion(what: &str, timeout: std::time::Duration, call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) -> Result<(), CaptureError> {
     let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let block = RcBlock::new(move |error: *mut NSError| {
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| if error.is_null() { Ok(()) } else { Err(ns_error(error)) }));
         let _ = tx.try_send(r.unwrap_or_else(|_| Err("panic in a completion handler".into())));
     });
     call(&block);
-    match rx.recv_timeout(OS_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(failed(format!("{what}: {e}"))),
-        Err(_) => Err(failed(format!("{what}: macOS did not answer within 5 s"))),
+        Err(_) => Err(failed(format!("{what}: macOS {}", waited(timeout)))),
     }
 }
 
@@ -478,7 +479,8 @@ impl VideoInput for ScreenInput {
                     .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Audio, Some(&queue))
                     .map_err(|e| failed(format!("cannot receive the system audio: {}", e.localizedDescription())))?;
             }
-            run_with_completion("starting the screen recording", |b| stream.startCaptureWithCompletionHandler(Some(b)))?;
+            // the first start in a process warms up ScreenCaptureKit: give it START_TIMEOUT
+            run_with_completion("starting the screen recording", START_TIMEOUT, |b| stream.startCaptureWithCompletionHandler(Some(b)))?;
             self.error = Some(shared.clone());
             self.running = Some(Sendable(Running { stream, output, _queue: queue, shared }));
             Ok(VideoFormat { width: w, height: h, fps, format: PixelFormat::Bgra8 })
@@ -490,7 +492,7 @@ impl VideoInput for ScreenInput {
         r.shared.stopped.store(true, Ordering::Release);
         // SAFETY: the stream and output object are retained by `r` until the end of this
         // function; stopping a started stream has no other preconditions.
-        let stopped = run_with_completion("stopping the screen recording", |b| unsafe { r.stream.stopCaptureWithCompletionHandler(Some(b)) });
+        let stopped = run_with_completion("stopping the screen recording", OS_TIMEOUT, |b| unsafe { r.stream.stopCaptureWithCompletionHandler(Some(b)) });
         if let Err(e) = stopped {
             log::warn!("{e}");
         }

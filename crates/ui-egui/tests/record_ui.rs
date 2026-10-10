@@ -60,6 +60,17 @@ impl Driver {
         }
     }
 
+    /// Step frames until the recording runs: Record starts the sources on their own thread and
+    /// the recording begins when every one of them is live.
+    fn wait_recording(&mut self) -> bool {
+        let t0 = Instant::now();
+        while !self.harness.state().session.record.recording() && t0.elapsed() < Duration::from_secs(5) {
+            self.frames(1);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.harness.state().session.record.recording()
+    }
+
     fn call(&mut self, method: &str, params: Value) -> Value {
         let (req, reply) = ControlRequest::new(method, params.clone());
         self.tx.send(req).unwrap();
@@ -127,7 +138,7 @@ fn record_and_stop_builds_a_synced_sequence() {
     d.frames(2);
     let before = d.sequences();
     d.click("record.panel.record");
-    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.status);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.status);
     d.run_for(1.2);
     let live = d.harness.state().ui.record.live.clone();
     assert!(live.starts_with("Recording · 00:0") && live.contains("screen ") && live.contains("camera "), "{live}");
@@ -176,7 +187,7 @@ fn cancel_discards_and_leaves_no_files() {
     d.frames(2);
     let before = d.sequences();
     d.click("record.panel.record");
-    assert!(d.harness.state().session.record.recording());
+    assert!(d.wait_recording());
     d.run_for(0.6);
     // the panel cannot be closed while recording
     d.click("record.panel.close");
@@ -223,7 +234,7 @@ fn a_second_camera_row_records_to_its_own_track() {
     assert_eq!(ui["cameras"][1]["mirror"], true);
     assert_eq!(ui["mics"][1]["device"], "Synthetic Input 2");
     d.click("record.panel.record");
-    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
     d.run_for(0.8);
     d.click("record.panel.record");
     let s = &d.harness.state().session;
@@ -303,7 +314,7 @@ fn the_countdown_shows_then_records_and_escape_cancels_it() {
     assert_eq!(d.harness.state().ui.record.live, "Recording in 2…");
     clock.store(13_000, Ordering::Release);
     d.frames(2);
-    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
     d.run_for(0.5);
     assert!(d.harness.state().ui.record.live.starts_with("Recording · "));
     d.click("record.panel.record"); // Stop
@@ -319,5 +330,39 @@ fn the_countdown_shows_then_records_and_escape_cancels_it() {
     d.frames(2);
     assert!(!d.harness.state().session.record.recording());
     assert!(d.harness.state().ui.record.live.is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn record_says_starting_until_every_source_is_live() {
+    let dir = tmp("starting");
+    let mut d = Driver::new(&dir);
+    // a screen that takes 1.5 s to deliver its first frame (ScreenCaptureKit's first start)
+    d.harness.state_mut().session.record.factory =
+        Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), screen_delay_ms: 1500, ..Default::default() }));
+    d.ok(
+        "ui.set",
+        json!({"record": {"open": true, "initialized": true, "screen": "display:synthetic:display", "cameras": [], "mics": [{"device": "default"}]}}),
+    );
+    d.frames(3);
+    d.click("record.panel.record");
+    assert!(!d.harness.state().session.record.recording());
+    assert_eq!(d.harness.state().ui.record.live, "Starting screen capture…");
+    assert_eq!(d.element("record.panel.record").unwrap()["label"], "Starting screen capture…");
+    let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
+    assert_eq!((st["starting"].as_bool(), st["recording"].as_bool()), (Some(true), Some(false)), "{st}");
+    // the button does nothing while the sources start
+    d.click("record.panel.record");
+    assert!(d.harness.state().session.record.starting.is_some());
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
+    d.frames(1);
+    let live = d.harness.state().ui.record.live.clone();
+    assert!(live.starts_with("Recording · 00:00"), "the clock starts when every source is live: {live}");
+    d.run_for(0.5);
+    d.click("record.panel.record"); // Stop
+    assert!(!d.harness.state().session.record.recording());
+    let s = &d.harness.state().session;
+    let q = s.active_sequence().unwrap();
+    assert!(q.video_tracks[0].items[0].start == filmcraft_time::Tick::ZERO && q.audio_tracks[0].items[0].start == filmcraft_time::Tick::ZERO);
     std::fs::remove_dir_all(&dir).ok();
 }

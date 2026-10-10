@@ -8,17 +8,28 @@
 - **THEN** three files exist, the two MOV files decode with FilmCraft's own decoders and last about 2 s, and the WAV file holds about 2 s of samples
 
 ### Requirement: One clock and a sidecar per file
-Every sample of every source SHALL be stamped on one monotonic clock taken at `record.start`, and each file SHALL get a sidecar `<file stem>.recording.json` with `version`, `recording`, `source`, `file`, `device`, `clock_start_ns` (the same in every sidecar of a recording), `first_sample_ns`, `last_sample_ns`, `dropped`, the picture or audio format, `encoder` (video), and an `events` list that is empty until click tracking exists.
+Every sample of every source SHALL be stamped on one monotonic clock, and each file SHALL get a sidecar `<file stem>.recording.json` with `version`, `recording`, `source`, `file`, `device`, `clock_start_ns` (the same in every sidecar of a recording), `first_sample_ns`, `last_sample_ns`, `warmup_ns`, `dropped`, the picture or audio format, `encoder` (video), and an `events` list that is empty until click tracking exists.
+
+### Requirement: The recording begins when every source is live
+`record.start` SHALL start every screen, camera and microphone, then wait (at most 20 s overall, `START_TIMEOUT`) until each one has delivered its first frame or audio block. The recording clock SHALL start at the latest of those first-sample times, so that media time 0 of every file is the same instant: frames captured before it SHALL be left out before the encoder (not counted as dropped) and audio SHALL be trimmed to the sample (system audio, which may be silent, is not waited for and is filled with silence from the start). `clockStartNs` and `clock_start_ns` SHALL be that start, `first_sample_ns` SHALL then be under one frame for every source, and `warmup_ns` SHALL say how long each source took from its start to its first sample. A source that delivers nothing within the wait SHALL fail the start with its name ("microphone 'Yeti Stereo Microphone' delivered no audio within 20 s"), the other sources stopped and their files deleted. The platform SHALL give stream and session starts (`startCapture`, the camera session start) 20 s and keep 5 s (`OS_TIMEOUT`) for enumeration and permission calls; a start that times out SHALL say "did not answer within 20 s". While the sources start, `record.status` SHALL report `starting: true` and the Record panel and status bar SHALL show "Starting screen capture…" with the Record button disabled; the countdown, if any, SHALL run before the sources start and the elapsed time SHALL count from the recording's start. `record.start {wait: false}` SHALL return at once (`{starting: true}`) and report the outcome as a `started` / `startFailed` event of `record.status`; `record.cancel` / `record.stop` while starting SHALL stop the sources and leave no files.
+
+#### Scenario: Sources with different start latencies
+- **WHEN** a synthetic screen (0 ms), camera (300 ms) and microphone (700 ms) are recorded for 1.5 s
+- **THEN** all three clips start at 0 in the new sequence, every sidecar has `first_sample_ns` under one frame and `warmup_ns` of about 0, 300 and 700 ms, and the screen file holds about 45 frames, its first one the screen's frame ~21
+
+#### Scenario: A source that never delivers
+- **WHEN** a microphone delivers no audio within the wait
+- **THEN** `record.start` fails naming the microphone and no files remain
 
 ### Requirement: Capture never blocks and never crashes
 Frames SHALL pass from the capture callback to the encoder through a bounded queue that drops the oldest frame when full; dropped frames SHALL be counted in `record.status` and the sidecar. Capture and encoder threads SHALL run under `catch_unwind`; a failure SHALL end up as the recording's `error` (in `record.status` and as the error of `record.stop`), never as a hang or a crash.
 
 ### Requirement: Stop imports and places the sources in sync, in one undo step
-`record.stop` SHALL finish the files, import them, and create a sequence named after the recording with the screen on V1, the camera on V2 and the microphone on A1, each placed at its first sample time minus the earliest first sample time (frame-aligned, with the source In absorbing the sub-frame difference), as one undo step. `cameraOffsetMs` SHALL move the camera clip by that many milliseconds (renormalised so nothing starts before 0).
+`record.stop` SHALL finish the files, import them, and create a sequence named after the recording with the screen on V1, the camera on V2 and the microphone on A1, each file's media time 0 (the recording's start) at sequence time 0, as one undo step. `cameraOffsetMs` SHALL move the camera clip by that many milliseconds (frame-aligned, with the source In absorbing the sub-frame difference, renormalised so nothing starts before 0): the delay inside a camera is invisible to the clock.
 
 #### Scenario: A camera that starts late
 - **WHEN** the synthetic camera starts 300 ms after the screen
-- **THEN** the camera clip starts 300 ms (± one frame) after the screen clip in the new sequence
+- **THEN** the recording begins when the camera is live: both clips start at 0, the screen file leaves out its first ~300 ms, and what both show at the same sequence time was captured together
 
 #### Scenario: Undo
 - **WHEN** the user undoes once after `record.stop`
@@ -41,7 +52,7 @@ Window ▸ Record SHALL open a Record panel with Screen, Camera (+ quality: 720p
 
 #### Scenario: Two cameras and two microphones
 - **WHEN** a screen, two synthetic cameras that start 100 ms and 400 ms late and two microphones are recorded and stopped with `cameraOffsetsMs: [0, 100]`
-- **THEN** the sequence has the screen on V1, the cameras on V2 and V3 (the second 100 ms later than its first sample), the microphones on A1 and A2, and five files with sidecars
+- **THEN** the sequence has the screen on V1, the cameras on V2 and V3 (the second at 100 ms, everything else at 0), the microphones on A1 and A2, and five files with sidecars
 
 #### Scenario: The same device twice
 - **WHEN** `record.start` names one camera (or microphone) twice
