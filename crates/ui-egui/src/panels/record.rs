@@ -10,7 +10,8 @@
 //! per microphone row `record.panel.mic.<n>.device` (+ `.device.<i>`), `.remove`, and
 //! `record.panel.mic.add`; `record.panel.name`, `record.panel.record` (Record / Stop),
 //! `record.panel.cancel`, `record.panel.refresh`, `record.panel.counters`, `record.panel.level`,
-//! `record.panel.error`, `record.panel.close`; the Program monitor button is
+//! `record.panel.error`, `record.panel.close`, the title row's `record.panel.minimize` (–),
+//! `record.panel.restore` (+, while minimized) and `record.panel.titleClose` (×); the Program monitor button is
 //! `program.transport.record`. UI command: `window.record` (open). The panel state is
 //! `UiState::record` ([`RecordUi`]), so `ui.set {"record": {...}}` drives it. No keyboard
 //! shortcuts.
@@ -132,6 +133,9 @@ pub struct RecordUi {
     pub initialized: bool,
     /// The Settings section at the bottom is expanded.
     pub settings_open: bool,
+    /// The panel is a compact strip (title, Record / Stop with the time, the camera thumbnails,
+    /// `+` to restore); kept until restored, also across recordings.
+    pub minimized: bool,
     /// `record.devices`, refreshed when the panel opens (not saved).
     #[serde(skip)]
     pub devices: Option<Value>,
@@ -424,6 +428,37 @@ fn combo(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, id: &str, v
     elems.push((id.to_string(), cb.inner.response.rect, shown));
 }
 
+/// The Record / Stop button (red, with the elapsed time while recording); true when clicked.
+fn record_button(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, label: &str, enabled: bool) -> bool {
+    let b = ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(label).color(Color32::WHITE).size(16.0)).fill(RED).corner_radius(18.0).min_size(vec2(150.0, 36.0)),
+    );
+    elems.push(("record.panel.record".into(), b.rect, label.to_string()));
+    b.clicked()
+}
+
+/// The panel's own title row: "Record", then – (minimize) or + (restore) and × at the right.
+/// Returns (toggle minimized, close).
+fn title_row(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, minimized: bool, can_close: bool) -> (bool, bool) {
+    let (mut toggle, mut close) = (false, false);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Record").strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let x = ui.add_enabled(can_close, egui::Button::new("×").small().frame(false));
+            elems.push(("record.panel.titleClose".into(), x.rect, "Close".into()));
+            close = x.clicked();
+            let (id, text, tip) =
+                if minimized { ("record.panel.restore", "+", "Restore the panel") } else { ("record.panel.minimize", "–", "Minimize the panel") };
+            let m = ui.add(egui::Button::new(text).small().frame(false)).on_hover_text(tip);
+            elems.push((id.into(), m.rect, tip.into()));
+            toggle = m.clicked();
+        });
+    });
+    ui.separator();
+    (toggle, close)
+}
+
 /// Every frame: the panel (while open or recording) and the live status-bar line.
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     tick(app);
@@ -512,12 +547,43 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let dim = app.tokens.text_dim;
     let preview = app.ui.record.preview.clone();
     let session = &app.session;
+    let record_label = if let Some(l) = &starting_label {
+        l.clone()
+    } else if let Some(left) = countdown_left {
+        format!("{}  (Cancel)", countdown_text(left))
+    } else if recording {
+        format!("■  Stop  {}", mmss(st.as_ref().and_then(|s| s["elapsed"].as_f64()).unwrap_or(0.0)))
+    } else {
+        "●  Record".to_string()
+    };
     let win = egui::Window::new("Record")
         .id(egui::Id::new("record-panel"))
+        .title_bar(false)
         .collapsible(false)
         .resizable(false)
         .default_pos(ctx.content_rect().center_top() + vec2(-260.0, 40.0))
         .show(ctx, |ui| {
+            let (toggle_min, x) = title_row(ui, &mut elems, r.minimized, !recording);
+            if toggle_min {
+                r.minimized = !r.minimized;
+            }
+            close |= x;
+            if r.minimized {
+                // the strip: Record / Stop with the time, and the cameras at the recording size
+                ui.horizontal(|ui| {
+                    if record_button(ui, &mut elems, &record_label, starting_label.is_none()) {
+                        do_toggle = true;
+                    }
+                    for (i, c) in r.cameras.iter_mut().enumerate().filter(|(_, c)| !c.device.is_empty()) {
+                        super::record_preview::thumbnail(ui, &mut elems, &preview, session, i + 1, c, true);
+                    }
+                });
+                if !r.error.is_empty() {
+                    let e = ui.label(RichText::new(&r.error).small().color(RED));
+                    elems.push(("record.panel.error".into(), e.rect, r.error.clone()));
+                }
+                return;
+            }
             egui::Grid::new("record-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Screen:");
                 ui.vertical(|ui| {
@@ -657,22 +723,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let label = if let Some(l) = &starting_label {
-                    l.clone()
-                } else if let Some(left) = countdown_left {
-                    format!("{}  (Cancel)", countdown_text(left))
-                } else if recording {
-                    format!("■  Stop  {}", mmss(st.as_ref().and_then(|s| s["elapsed"].as_f64()).unwrap_or(0.0)))
-                } else {
-                    "●  Record".to_string()
-                };
                 // disabled while the sources start (Cancel stops them)
-                let b = ui.add_enabled(
-                    starting_label.is_none(),
-                    egui::Button::new(RichText::new(&label).color(Color32::WHITE).size(16.0)).fill(RED).corner_radius(18.0).min_size(vec2(150.0, 36.0)),
-                );
-                elems.push(("record.panel.record".into(), b.rect, label));
-                if b.clicked() {
+                if record_button(ui, &mut elems, &record_label, starting_label.is_none()) {
                     do_toggle = true;
                 }
                 let c = ui.add_enabled(recording, egui::Button::new("Cancel"));

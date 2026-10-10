@@ -615,3 +615,54 @@ fn a_camera_that_turns_while_recording_is_noted_after_stop() {
     assert_eq!((q.settings.width, q.settings.height), (180, 320), "the start's orientation (90°)");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn minimize_shrinks_the_panel_to_a_strip_and_the_choice_survives_a_recording() {
+    let dir = tmp("minimize");
+    let mut d = Driver::new(&dir);
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.ok("ui.set", json!({"record": {"screen": "", "cameras": [{"device": "synthetic:camera", "quality": "native"}], "mics": []}}));
+    d.frames(2);
+    let full = d.element("record.panel").unwrap()["rect"].clone();
+    assert!(d.element("record.panel.camera.1.device").is_some());
+    assert!(d.element("record.panel.restore").is_none());
+    d.click("record.panel.minimize");
+    d.frames(3);
+    assert!(d.harness.state().ui.record.minimized);
+    for gone in [
+        "record.panel.camera.1.device",
+        "record.panel.camera.1.rotate",
+        "record.panel.screen",
+        "record.panel.mic.add",
+        "record.panel.settings",
+        "record.panel.minimize",
+    ] {
+        assert!(d.element(gone).is_none(), "{gone} is hidden in the strip");
+    }
+    for kept in ["record.panel.record", "record.panel.restore", "record.panel.titleClose", "record.panel.camera.1.preview"] {
+        assert!(d.element(kept).is_some(), "{kept} stays in the strip");
+    }
+    let strip = d.element("record.panel").unwrap()["rect"].clone();
+    assert!(strip[3].as_f64().unwrap() < full[3].as_f64().unwrap(), "smaller: {strip} vs {full}");
+    // record and stop from the strip: it stays minimized
+    d.click("record.panel.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
+    d.run_for(0.4);
+    let label = d.element("record.panel.record").unwrap()["label"].as_str().unwrap_or("").to_string();
+    assert!(label.contains("Stop"), "{label}");
+    d.click("record.panel.record");
+    assert!(!d.harness.state().session.record.recording());
+    d.frames(2);
+    assert!(d.harness.state().ui.record.minimized, "the choice survives a recording");
+    assert!(d.element("record.panel.camera.1.device").is_none());
+    // restore brings the rows back; ui.set drives it too
+    d.click("record.panel.restore");
+    d.frames(2);
+    assert!(!d.harness.state().ui.record.minimized);
+    assert!(d.element("record.panel.camera.1.device").is_some());
+    d.ok("ui.set", json!({"record": {"minimized": true}}));
+    d.frames(2);
+    assert!(d.element("record.panel.camera.1.device").is_none());
+    assert!(d.element("record.panel.record").is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}
