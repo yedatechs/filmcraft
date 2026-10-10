@@ -149,7 +149,7 @@ example "open System Settings ▸ Privacy & Security ▸ Screen & System Audio R
 then press Record again". When FilmCraft is started from a terminal, macOS asks for (and lists)
 the terminal app instead, and a terminal that declares no camera usage description (the Claude
 desktop app's terminal pane, for one) never shows the camera prompt at all. Run the app bundle
-instead (`cargo xtask bundle`, then `open -a target/release/FilmCraft.app`, see
+instead (`cargo xtask bundle`, then `open -a "target/release/FilmCraft Dev.app"`, see
 [contributing.md](contributing.md) "macOS app bundle"), so the permissions are FilmCraft's own.
 Screen Recording takes effect after FilmCraft is restarted.
 `record.devices` lists no displays until Screen Recording is allowed and says why in `error`; it

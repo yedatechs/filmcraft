@@ -69,15 +69,18 @@ glyphs skip when it is empty; when you touch fonts, run the gates both with and 
 ### macOS app bundle
 
 ```sh
-cargo xtask bundle            # release build → target/release/FilmCraft.app (--debug: target/debug/)
+cargo xtask bundle            # release build → "target/release/FilmCraft Dev.app" (--debug: target/debug/)
 cargo xtask bundle --open     # …and open it
-open -a target/release/FilmCraft.app --args --control 9876 --data-dir /tmp/fc
+open -a "target/release/FilmCraft Dev.app" --args --control 9876 --data-dir /tmp/fc
 ```
 
-`cargo xtask bundle [--release|--debug] [--open]` (macOS only; elsewhere it does nothing) builds
-`filmcraft` and assembles `<target>/<profile>/FilmCraft.app` (`CARGO_TARGET_DIR` is honoured):
-`Contents/MacOS/filmcraft`, `Contents/Resources/filmcraft.icns`, a generated `Info.plist`
-(`xtask/src/bundle.rs`: bundle id `ai.storyteller.filmcraft`, the workspace version, macOS 12.3+,
+`cargo xtask bundle [--release|--debug] [--open] [--release-id]` (macOS only; elsewhere it does
+nothing) builds `filmcraft` and assembles `<target>/<profile>/FilmCraft Dev.app` (`CARGO_TARGET_DIR`
+is honoured): `Contents/MacOS/filmcraft`, `Contents/Resources/filmcraft.icns`, a generated
+`Info.plist` (`xtask/src/bundle.rs`: bundle id `ai.storyteller.filmcraft.dev` and the name
+"FilmCraft Dev", so Launch Services never confuses it with an installed release, whose id
+`ai.storyteller.filmcraft` and name `FilmCraft.app` the bundle takes only under `--release-id`; the
+workspace version; macOS 12.3+;
 camera and microphone usage descriptions, `.fcproj` and media document types) and `PkgInfo`. It
 copies nothing else (fonts and other assets are embedded) and signs the bundle ad hoc
 (`codesign --force --deep --sign -`). Options after `--args` reach FilmCraft as usual.

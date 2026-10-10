@@ -1,4 +1,5 @@
-//! `cargo xtask bundle [--release|--debug] [--open]`: a local macOS `FilmCraft.app`.
+//! `cargo xtask bundle [--release|--debug] [--open] [--release-id]`: a local macOS `FilmCraft Dev.app`
+//! (`FilmCraft.app` with the release bundle id under `--release-id`).
 //!
 //! Builds the `filmcraft` binary and assembles `<target>/<profile>/FilmCraft.app` with its own
 //! Info.plist (camera / microphone usage descriptions, document types), the icon and an ad-hoc
@@ -13,6 +14,12 @@ use std::process::Command;
 /// The bundle identifier, the same as the release bundle (`packaging/macos/Info.plist.in`) and the
 /// Linux app id (`packaging/linux/ai.storyteller.filmcraft.desktop`).
 pub const BUNDLE_ID: &str = "ai.storyteller.filmcraft";
+/// The local build's bundle id and name. A local bundle must not share the release id: Launch
+/// Services resolves a bundle id to the registered copy, so `open` on a local `FilmCraft.app` can
+/// start an installed release instead (it did, on the owner's Mac, with FilmCraft 0.2.1 in
+/// /Applications).
+pub const DEV_BUNDLE_ID: &str = "ai.storyteller.filmcraft.dev";
+pub const DEV_NAME: &str = "FilmCraft Dev";
 
 /// ScreenCaptureKit (linked by `crates/platform/src/capture/screen.rs`) needs macOS 12.3; its
 /// macOS 13 API (`capturesAudio`) is checked at run time.
@@ -30,10 +37,12 @@ pub fn short_version(version: &str) -> &str {
     version.split_once('-').map_or(version, |(core, _)| core)
 }
 
-/// The bundle's Info.plist for the workspace `version`.
-pub fn info_plist(version: &str) -> String {
+/// The bundle's Info.plist for the workspace `version`, bundle `id` and display `name`.
+pub fn info_plist(version: &str, id: &str, name: &str) -> String {
     let short = esc(short_version(version));
     let full = esc(version);
+    let id = esc(id);
+    let name = esc(name);
     let camera = esc(CAMERA_USAGE);
     let mic = esc(MICROPHONE_USAGE);
     format!(
@@ -45,11 +54,11 @@ pub fn info_plist(version: &str) -> String {
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleIdentifier</key>
-  <string>{BUNDLE_ID}</string>
+  <string>{id}</string>
   <key>CFBundleName</key>
-  <string>FilmCraft</string>
+  <string>{name}</string>
   <key>CFBundleDisplayName</key>
-  <string>FilmCraft</string>
+  <string>{name}</string>
   <key>CFBundleExecutable</key>
   <string>filmcraft</string>
   <key>CFBundleIconFile</key>
@@ -84,7 +93,7 @@ pub fn info_plist(version: &str) -> String {
   <array>
     <dict>
       <key>UTTypeIdentifier</key>
-      <string>{BUNDLE_ID}.project</string>
+      <string>{id}.project</string>
       <key>UTTypeDescription</key>
       <string>FilmCraft Project</string>
       <key>UTTypeConformsTo</key>
@@ -115,7 +124,7 @@ pub fn info_plist(version: &str) -> String {
       <key>CFBundleTypeIconFile</key>
       <string>filmcraft</string>
       <key>LSItemContentTypes</key>
-      <array><string>{BUNDLE_ID}.project</string></array>
+      <array><string>{id}.project</string></array>
       <key>CFBundleTypeExtensions</key>
       <array><string>fcproj</string></array>
     </dict>
@@ -166,14 +175,17 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 pub fn run_bundle(root: &Path, args: &[&str]) -> Result<(), String> {
     let mut release = true;
     let mut open = false;
+    let mut release_id = false;
     for a in args {
         match *a {
             "--release" => release = true,
             "--debug" => release = false,
             "--open" => open = true,
-            _ => return Err(format!("bundle: unknown argument `{a}` (usage: cargo xtask bundle [--release|--debug] [--open])")),
+            "--release-id" => release_id = true,
+            _ => return Err(format!("bundle: unknown argument `{a}` (usage: cargo xtask bundle [--release|--debug] [--open] [--release-id])")),
         }
     }
+    let (id, name) = if release_id { (BUNDLE_ID, "FilmCraft") } else { (DEV_BUNDLE_ID, DEV_NAME) };
     if !cfg!(target_os = "macos") {
         println!("bundle: a macOS app bundle; nothing to do on this host");
         return Ok(());
@@ -191,7 +203,7 @@ pub fn run_bundle(root: &Path, args: &[&str]) -> Result<(), String> {
     let profile = if release { "release" } else { "debug" };
     let out = target_dir(root).join(profile);
     let bin = out.join("filmcraft");
-    let app = out.join("FilmCraft.app");
+    let app = out.join(format!("{name}.app"));
     if app.exists() {
         std::fs::remove_dir_all(&app).map_err(|e| format!("{}: {e}", app.display()))?;
     }
@@ -205,14 +217,14 @@ pub fn run_bundle(root: &Path, args: &[&str]) -> Result<(), String> {
     copy(&bin, &macos.join("filmcraft"))?;
     copy(&root.join("assets/app-icon/filmcraft.icns"), &resources.join("filmcraft.icns"))?;
     let write = |p: PathBuf, data: &[u8]| std::fs::write(&p, data).map_err(|e| format!("{}: {e}", p.display()));
-    write(contents.join("Info.plist"), info_plist(&version).as_bytes())?;
+    write(contents.join("Info.plist"), info_plist(&version, id, name).as_bytes())?;
     write(contents.join("PkgInfo"), b"APPL????")?;
 
     run(Command::new("plutil").arg("-lint").arg(contents.join("Info.plist")))?;
     // Ad-hoc: one code identity for TCC, but a new one each build (permissions are asked again).
     run(Command::new("codesign").args(["--force", "--deep", "--sign", "-"]).arg(&app))?;
     run(Command::new("codesign").args(["--verify", "--strict"]).arg(&app))?;
-    println!("bundle: {} (FilmCraft {version}, {profile}, {:.1} MB)", app.display(), dir_size(&app) as f64 / 1e6);
+    println!("bundle: {} ({name} {version}, {id}, {profile}, {:.1} MB)", app.display(), dir_size(&app) as f64 / 1e6);
     if open {
         run(Command::new("open").arg(&app))?;
     }
@@ -238,12 +250,17 @@ mod tests {
     fn info_plist_has_the_keys_and_the_workspace_version() {
         let manifest = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml")).unwrap();
         let version = crate::version::read(&manifest).unwrap();
-        let p = info_plist(&version);
+        let p = info_plist(&version, DEV_BUNDLE_ID, DEV_NAME);
         let short = short_version(&version).to_string();
+        let r = info_plist(&version, BUNDLE_ID, "FilmCraft");
+        assert_eq!(value_of(&r, "CFBundleIdentifier").as_deref(), Some(BUNDLE_ID));
+        assert_eq!(value_of(&r, "CFBundleName").as_deref(), Some("FilmCraft"));
+        assert!(r.contains(&format!("<string>{BUNDLE_ID}.project</string>")));
+        assert_ne!(DEV_BUNDLE_ID, BUNDLE_ID, "a local bundle never takes the release id");
         for (k, v) in [
-            ("CFBundleIdentifier", BUNDLE_ID),
-            ("CFBundleName", "FilmCraft"),
-            ("CFBundleDisplayName", "FilmCraft"),
+            ("CFBundleIdentifier", DEV_BUNDLE_ID),
+            ("CFBundleName", DEV_NAME),
+            ("CFBundleDisplayName", DEV_NAME),
             ("CFBundleExecutable", "filmcraft"),
             ("CFBundleIconFile", "filmcraft"),
             ("CFBundlePackageType", "APPL"),
