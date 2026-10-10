@@ -38,6 +38,7 @@ pub mod project_panel;
 pub mod project_tools;
 pub mod proxies;
 pub mod record;
+pub mod record_settings;
 pub mod redact;
 pub mod relink;
 pub mod remix;

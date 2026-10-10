@@ -390,3 +390,222 @@ fn a_mirrored_camera_is_flipped_in_the_sequence() {
     assert!((5..=25).contains(&k), "frame {k} at 0.5 s once unflipped");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------------------------------------------------- settings
+
+fn wav_fmt(path: &str) -> (u16, u16, u32, u16) {
+    let b = std::fs::read(path).unwrap();
+    let le16 = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    (le16(20), le16(22), u32::from_le_bytes([b[24], b[25], b[26], b[27]]), le16(34))
+}
+
+#[test]
+fn recording_settings_defaults_clamping_and_merge() {
+    use crate::record_settings::RecordingSettings;
+    let d = RecordingSettings::default();
+    assert_eq!((d.screen_fps, d.screen_resolution.as_str(), d.show_cursor, d.system_audio), (30, "native", true, false));
+    assert_eq!((d.camera_quality.as_str(), d.camera_fps, d.camera_mirror), ("1080p", 30, false));
+    assert_eq!((d.codec.as_str(), d.quality.as_str(), d.keyframe_seconds, d.hardware_encoder), ("h264", "high", 2, true));
+    assert_eq!((d.sample_rate, d.channels.as_str(), d.audio_format.as_str(), d.auto_gain), (48_000, "mono", "f32", false));
+    assert_eq!((d.countdown_seconds, d.stop_after_minutes, d.open_sequence, d.output_folder.as_str()), (3, 0, true, ""));
+    // a hostile preferences file is repaired on load
+    let p = crate::autosave::Preferences::from_value(json!({"recording": {
+        "screenFps": 999, "codec": "av1", "stopAfterMinutes": 5000, "sampleRate": "abc", "keyframeSeconds": 3, "cameraQuality": 7, "showCursor": false
+    }}));
+    let r = &p.recording;
+    assert_eq!((r.screen_fps, r.codec.as_str(), r.stop_after_minutes, r.sample_rate, r.keyframe_seconds), (30, "h264", 180, 48_000, 2));
+    assert_eq!(r.camera_quality, "1080p");
+    assert!(!r.show_cursor, "valid values survive");
+    // record.settings get / set (merge) and prefs agree
+    let mut s = Session::default();
+    let g = s.execute("record.settings", json!({"get": true})).unwrap();
+    assert_eq!(g["settings"]["screenFps"], 30);
+    assert_eq!(g["settings"]["countdownSeconds"], 3);
+    let v = s.execute("record.settings", json!({"set": {"screenFps": 60, "quality": "max", "keyframeSeconds": "4", "autoGain": true}})).unwrap();
+    assert_eq!(v["settings"]["screenFps"], 60);
+    assert_eq!(v["settings"]["keyframeSeconds"], 4);
+    assert_eq!(v["settings"]["cameraFps"], 30, "a merge keeps the other fields");
+    assert_eq!(s.execute("prefs.get", json!({"key": "recording.quality"})).unwrap(), "max");
+    s.execute("prefs.set", json!({"key": "recording.countdownSeconds", "value": "10"})).unwrap();
+    assert_eq!(s.execute("record.settings", json!({})).unwrap()["settings"]["countdownSeconds"], 10);
+    for (bad, field) in [
+        (json!({"screenFps": 50}), "screenFps"),
+        (json!({"screenFps": 30.5}), "screenFps"),
+        (json!({"codec": "av1"}), "codec"),
+        (json!({"stopAfterMinutes": 181}), "stopAfterMinutes"),
+        (json!({"stopAfterMinutes": -1}), "stopAfterMinutes"),
+        (json!({"showCursor": "yes"}), "showCursor"),
+        (json!({"channels": 2}), "channels"),
+        (json!({"bogus": 1}), "bogus"),
+        (json!({"outputFolder": "a\u{0}b"}), "outputFolder"),
+    ] {
+        let e = s.execute("record.settings", json!({"set": bad.clone()})).unwrap_err().to_string();
+        assert!(e.contains(field), "{bad}: {e}");
+    }
+    assert!(s.execute("record.settings", json!({"set": [1]})).is_err());
+    assert_eq!(s.prefs.recording.screen_fps, 60, "a refused set changes nothing");
+    if !crate::record_settings::hevc_available() {
+        let e = s.execute("record.settings", json!({"set": {"codec": "hevc"}})).unwrap_err().to_string();
+        assert!(e.contains("codec") && e.contains("hardware"), "{e}");
+    }
+    // the Settings page lists every field under `recording.`
+    let keys: Vec<&str> = crate::settings::fields().into_iter().filter(|(c, _)| *c == "recording").map(|(_, f)| f.key).collect();
+    for k in crate::record_settings::keys() {
+        assert!(keys.contains(&format!("recording.{k}").as_str()), "Settings ▸ Recording has {k}");
+    }
+}
+
+#[test]
+fn record_start_takes_the_recording_settings_and_explicit_params_win() {
+    let dir = tmp("settings");
+    let mut s = Session::default();
+    s.record.factory = Some(Arc::new(SyntheticFactory { display_size: (1440, 1080), camera_size: (320, 180), ..Default::default() }));
+    s.execute(
+        "record.settings",
+        json!({"set": {
+            "screenFps": 15, "screenResolution": "720p", "showCursor": false, "systemAudio": true,
+            "cameraQuality": "native", "cameraFps": 24, "cameraMirror": true,
+            "codec": "prores", "sampleRate": 44100, "channels": "stereo", "audioFormat": "s16", "autoGain": true,
+            "outputFolder": dir.to_string_lossy(),
+        }}),
+    )
+    .unwrap();
+    let r = s
+        .execute(
+            "record.start",
+            json!({"screen": {"display": SyntheticFactory::DISPLAY, "fps": 10}, "camera": {"device": SyntheticFactory::CAMERA}, "mic": {}, "settings": {"audioFormat": "s24"}}),
+        )
+        .unwrap();
+    let keys: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, ["screen", "camera", "mic", "systemAudio"]);
+    assert!(r["dir"].as_str().unwrap().starts_with(&*dir.to_string_lossy()), "the output folder setting: {r}");
+    std::thread::sleep(Duration::from_millis(1200));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    let files: Vec<String> = v["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+    assert!(files[3].ends_with("Recording 1 - System Audio.wav"), "{files:?}");
+    let sides: Vec<Value> = files.iter().map(|f| sidecar(f)).collect();
+    // screen: 720p of a 1440 × 1080 display, the explicit 10 fps, ProRes, no cursor
+    assert_eq!((sides[0]["width"].as_u64(), sides[0]["height"].as_u64(), sides[0]["fps"].as_u64()), (Some(960), Some(720), Some(10)));
+    assert_eq!(sides[0]["encoder"], "FilmCraft ProRes 422");
+    assert_eq!(sides[0]["show_cursor"], false);
+    assert_eq!(sides[0]["bitrate_kbps"], 0);
+    // camera: its own size (native), 24 fps, mirrored
+    assert_eq!((sides[1]["width"].as_u64(), sides[1]["fps"].as_u64(), sides[1]["mirror"].as_bool()), (Some(320), Some(24), Some(true)));
+    // mic: 44.1 kHz stereo, 24-bit (the explicit settings win over the saved 16-bit), auto gain
+    assert_eq!((sides[2]["sample_rate"].as_u64(), sides[2]["channels"].as_u64(), sides[2]["format"].as_str()), (Some(44_100), Some(2), Some("s24")));
+    assert_eq!(sides[2]["auto_gain"], true);
+    assert!(sides[2]["notes"][0].as_str().unwrap().contains("auto gain"), "{}", sides[2]);
+    assert_eq!(wav_fmt(&files[2]), (1, 2, 44_100, 24));
+    // system audio: the synthetic screen's tone, on the next audio track
+    assert_eq!(sides[3]["source"], "systemAudio");
+    let (_, ch, rate, bits) = wav_fmt(&files[3]);
+    assert_eq!((ch, rate, bits), (2, 44_100, 24));
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (2, 2));
+    assert_eq!(q.audio_tracks[1].items[0].id, clip(&s, &v, "systemAudio").id);
+    assert_eq!(q.video_tracks[1].items[0].effects[0].effect, "horizontal_flip");
+    let item = filmcraft_project::ItemId(v["items"]["systemAudio"].as_u64().unwrap());
+    let info = s.project.item(item).unwrap().as_media().unwrap().info.clone();
+    assert!((secs(info.duration) - 1.2).abs() < 0.3, "{}", secs(info.duration));
+    let b = std::fs::read(&files[3]).unwrap();
+    let pcm: Vec<f64> = b[44..].as_chunks::<3>().0.iter().map(|x| f64::from(i32::from_le_bytes([0, x[0], x[1], x[2]]) >> 8) / 8_388_608.0).collect();
+    let rms = (pcm.iter().map(|x| x * x).sum::<f64>() / pcm.len() as f64).sqrt();
+    assert!((rms - 0.25 / 2f64.sqrt()).abs() < 0.02, "the tone is in the file: rms {rms}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn countdown_uses_the_synthetic_clock_and_can_be_cancelled() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tmp("countdown");
+    let mut s = session(0);
+    let clock = Arc::new(AtomicU64::new(1_000));
+    s.record.test_clock_ms = Some(clock.clone());
+    let d = dir.to_string_lossy().into_owned();
+    for bad in [json!(11), json!(2.5), json!("x"), json!(-1)] {
+        assert!(s.execute("record.start", json!({"mic": {}, "dir": d, "countdown": bad.clone()})).is_err(), "{bad}");
+    }
+    assert!(s.execute("record.start", json!({"screen": {"display": "nope"}, "dir": d, "countdown": 3})).is_err(), "devices are checked first");
+    assert!(s.execute("record.start", json!({"dir": d, "countdown": 3})).is_err(), "no source");
+    let r = s.execute("record.start", json!({"mic": {}, "dir": d, "countdown": 3})).unwrap();
+    assert_eq!((r["recording"].as_bool(), r["countdown"].as_u64()), (Some(false), Some(3)));
+    assert!(s.execute("record.start", json!({"mic": {}, "dir": d})).is_err(), "one start at a time");
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!(st["countdown"]["remaining"], 3.0);
+    clock.store(3_000, Ordering::Release);
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!((st["recording"].as_bool(), st["countdown"]["remaining"].as_f64()), (Some(false), Some(1.0)));
+    clock.store(4_000, Ordering::Release);
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!(st["recording"], true, "{st}");
+    assert_eq!(s.record.last_event.as_ref().unwrap()["event"], "started");
+    std::thread::sleep(Duration::from_millis(300));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["placed"], true);
+    // Cancel (or Stop) during the countdown: nothing starts, nothing is written
+    s.execute("record.start", json!({"mic": {}, "dir": d, "countdown": 5})).unwrap();
+    let c = s.execute("record.cancel", json!({})).unwrap();
+    assert_eq!(c["cancelled"], true);
+    clock.store(20_000, Ordering::Release);
+    s.execute("record.status", json!({})).unwrap();
+    assert!(!s.record.recording() && s.record.countdown.is_none());
+    s.execute("record.start", json!({"mic": {}, "dir": d, "countdown": 3})).unwrap();
+    assert_eq!(s.execute("record.stop", json!({})).unwrap()["cancelled"], true);
+    assert!(s.execute("record.stop", json!({})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stop_after_and_open_sequence_settings() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tmp("stopafter");
+    let mut s = session(0);
+    let clock = Arc::new(AtomicU64::new(0));
+    s.record.test_clock_ms = Some(clock.clone());
+    s.execute("record.settings", json!({"set": {"stopAfterMinutes": 1, "openSequence": false}})).unwrap();
+    let before = s.state.active_sequence;
+    s.execute("record.start", json!({"mic": {}, "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    clock.store(59_000, Ordering::Release);
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["recording"], true);
+    clock.store(60_000, Ordering::Release);
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!(st["recording"], false);
+    let ev = s.record.last_event.clone().unwrap();
+    assert_eq!(ev["event"], "stoppedAfter");
+    assert_eq!(ev["result"]["placed"], true);
+    assert_eq!(ev["result"]["opened"], false);
+    assert_eq!(s.state.active_sequence, before, "Open the sequence after Stop is off");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn auto_gain_moves_toward_minus_18_dbfs_at_2_db_per_second() {
+    use crate::record_settings::AutoGain;
+    let rate = 48_000;
+    let mut g = AutoGain::new(rate);
+    // a quiet tone (−40 dBFS RMS) for 3 s in 20 ms blocks: +2 dB per second
+    let amp = 0.01 * 2f32.sqrt();
+    let mut t = 0usize;
+    for _ in 0..150 {
+        let mut b = vec![(0..960).map(|i| amp * ((t + i) as f32 * 0.05).sin()).collect::<Vec<f32>>()];
+        t += 960;
+        g.process(&mut b);
+    }
+    assert!((g.gain_db() - 6.0).abs() < 0.3, "gain {}", g.gain_db());
+    // silence holds the gain; it never passes ±20 dB
+    let mut b = vec![vec![0.0f32; 48_000]];
+    g.process(&mut b);
+    assert!((g.gain_db() - 6.0).abs() < 0.3);
+    for _ in 0..60 {
+        let mut b = vec![(0..48_000).map(|i| amp * (i as f32 * 0.05).sin()).collect::<Vec<f32>>()];
+        g.process(&mut b);
+    }
+    assert!((g.gain_db() - 20.0).abs() < 1e-6, "{}", g.gain_db());
+    // loud input is turned down and clipped to full scale
+    let mut g = AutoGain::new(rate);
+    let mut b = vec![vec![1.5f32, f32::NAN, -2.0]];
+    g.process(&mut b);
+    assert!(b[0].iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+}

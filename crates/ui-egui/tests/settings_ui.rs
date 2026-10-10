@@ -96,7 +96,7 @@ impl Driver {
     }
 }
 
-const CATEGORIES: [&str; 16] = [
+const CATEGORIES: [&str; 17] = [
     "general",
     "appearance",
     "audio",
@@ -111,6 +111,7 @@ const CATEGORIES: [&str; 16] = [
     "memory",
     "playback",
     "plugins",
+    "recording",
     "timeline",
     "trim",
 ];

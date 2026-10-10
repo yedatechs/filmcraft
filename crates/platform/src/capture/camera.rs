@@ -7,7 +7,8 @@
 //!   sample-buffer delegate (an Objective-C class defined here) on a serial dispatch queue; each
 //!   frame is copied and handed to the engine's sink with its presentation time mapped onto the
 //!   recording clock. The size follows the requested quality through the session preset
-//!   (720p / 1080p / 2160p, else the device's best); the frame rate is the device's own.
+//!   (720p / 1080p / 2160p, else the device's best); the frame rate is the one asked for when
+//!   the active format supports it (`activeVideoMin/MaxFrameDuration`), else the format's best.
 //! - Camera audio is not captured: the microphone source records sound.
 //!
 //! The Camera permission is checked first; an undetermined one is requested (the system prompt)
@@ -27,7 +28,7 @@ use objc2_av_foundation::{
     AVCaptureSessionPreset1280x720, AVCaptureSessionPreset1920x1080, AVCaptureSessionPreset3840x2160, AVCaptureSessionPresetHigh, AVCaptureVideoDataOutput,
     AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaType, AVMediaTypeAudio, AVMediaTypeVideo,
 };
-use objc2_core_media::{CMSampleBuffer, CMVideoFormatDescriptionGetDimensions};
+use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags, CMVideoFormatDescriptionGetDimensions};
 use objc2_core_video::kCVPixelBufferPixelFormatTypeKey;
 use objc2_foundation::{NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSString};
 
@@ -242,8 +243,13 @@ impl VideoInput for CameraInput {
             let settings: Retained<NSDictionary<NSString, AnyObject>> = NSDictionary::from_slices(&[key], &[&*value as &AnyObject]);
             output.setVideoSettings(Some(&settings));
             output.setAlwaysDiscardsLateVideoFrames(true);
-            let shared =
-                Arc::new(Shared { sink, map: HostClockMap::new(clock.now_ns(), host_now_ns()), stopped: AtomicBool::new(false), error: Mutex::new(None) });
+            let shared = Arc::new(Shared {
+                sink,
+                map: HostClockMap::new(clock.now_ns(), host_now_ns()),
+                audio: None,
+                stopped: AtomicBool::new(false),
+                error: Mutex::new(None),
+            });
             let delegate = SampleDelegate::new(shared.clone());
             let queue = DispatchQueue::new("org.filmcraft.capture.camera", None);
             output.setSampleBufferDelegate_queue(Some(ProtocolObject::from_ref(&*delegate)), Some(&queue));
@@ -253,6 +259,24 @@ impl VideoInput for CameraInput {
             }
             session.addOutput(&output);
             session.commitConfiguration();
+            // the frame rate asked for, when the active format can do it (after the preset,
+            // which resets it); else the device's own
+            let want = f64::from(req.fps.clamp(1, 60));
+            let fmt = device.activeFormat();
+            let ranges = fmt.videoSupportedFrameRateRanges();
+            let can = ranges.iter().any(|r| r.minFrameRate() <= want + 0.01 && r.maxFrameRate() >= want - 0.01);
+            let best = ranges.iter().map(|r| r.maxFrameRate()).fold(0.0f64, f64::max);
+            let fps = if can && device.lockForConfiguration().is_ok() {
+                let d = CMTime { value: 1, timescale: req.fps.clamp(1, 60) as i32, flags: CMTimeFlags::Valid, epoch: 0 };
+                device.setActiveVideoMinFrameDuration(d);
+                device.setActiveVideoMaxFrameDuration(d);
+                device.unlockForConfiguration();
+                req.fps.clamp(1, 60)
+            } else if best.is_finite() && best >= 1.0 {
+                best.round().clamp(1.0, 60.0) as u32
+            } else {
+                req.fps.clamp(1, 60)
+            };
             // blocks until the camera runs (or fails); we are on the recording command's thread
             session.startRunning();
             if !session.isRunning() {
@@ -264,7 +288,7 @@ impl VideoInput for CameraInput {
             let h = u32::try_from(dim.height).unwrap_or(720).clamp(16, 8192) & !1;
             self.error = Some(shared.clone());
             self.running = Some(Sendable(Running { session, _output: output, _delegate: delegate, _queue: queue, shared }));
-            Ok(VideoFormat { width: w, height: h, fps: req.fps.clamp(1, 60), format: PixelFormat::Bgra8 })
+            Ok(VideoFormat { width: w, height: h, fps, format: PixelFormat::Bgra8 })
         }
     }
 

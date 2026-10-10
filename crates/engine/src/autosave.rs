@@ -168,6 +168,8 @@ pub struct Preferences {
     pub project_panel: crate::project_panel::ProjectPanelPrefs,
     /// Media Browser: Favorites, recent directories, file types, view, columns.
     pub media_browser: crate::media_browser::MediaBrowserPrefs,
+    /// Settings ▸ Recording (Window ▸ Record): frame rates, sizes, codec, audio format, countdown.
+    pub recording: crate::record_settings::RecordingSettings,
 }
 
 impl Default for Preferences {
@@ -195,6 +197,7 @@ impl Default for Preferences {
             voice_over: Default::default(),
             project_panel: Default::default(),
             media_browser: Default::default(),
+            recording: Default::default(),
         }
     }
 }
@@ -391,6 +394,7 @@ impl Preferences {
         self.playback.postroll_seconds = secs(self.playback.postroll_seconds);
         self.trim.large_trim_offset = self.trim.large_trim_offset.clamp(1, 1000);
         self.labels.sanitize_labels();
+        self.recording.clamp();
         self.version = settings::PREFS_VERSION;
     }
 

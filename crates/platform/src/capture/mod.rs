@@ -139,6 +139,9 @@ impl filmcraft_engine::record::VideoInputFactory for MacCaptureFactory {
     fn open_camera(&self, device: &str) -> Result<Box<dyn filmcraft_engine::record::VideoInput>, CaptureError> {
         Ok(Box::new(camera::CameraInput::new(device)?))
     }
+    fn system_audio(&self) -> bool {
+        true
+    }
 }
 
 /// Install the system's capture factory (`filmcraft_platform::register` calls it). Returns
@@ -226,7 +229,7 @@ mod tests {
         let clock = RecordClock::new();
         let fmt = input
             .start(
-                &VideoRequest { width: None, height: None, fps: 10 },
+                &VideoRequest::at(10),
                 clock,
                 std::sync::Arc::new(move |f| {
                     n2.fetch_add(1, Ordering::Relaxed);

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, always, bad, bool_p, str_p};
+use crate::record_settings as rs;
 use crate::{EngineError, Result, Session};
 
 /// Version of the preferences file layout ([`crate::autosave::Preferences::version`]).
@@ -987,6 +988,62 @@ static CATEGORIES: &[Category] = &[
         rows: &[
             Row::Group("Plugins", &[b("plugins.developerMode", "Enable developer mode", false)]),
             Row::Note("No plugins are installed. Changes will take effect the next time you start FilmCraft."),
+        ],
+    },
+    Category {
+        id: "recording",
+        title: "Recording",
+        rows: &[
+            Row::Group(
+                "Screen",
+                &[
+                    f("recording.screenFps", "Frame rate", Kind::Choice(rs::SCREEN_FPS), true),
+                    f("recording.screenResolution", "Resolution", Kind::Choice(rs::SCREEN_RESOLUTION), true),
+                    b("recording.showCursor", "Show cursor", true),
+                    b("recording.systemAudio", "Record system audio (with a screen source; macOS)", true),
+                ],
+            ),
+            Row::Group(
+                "Camera (new camera rows)",
+                &[
+                    f("recording.cameraQuality", "Quality", Kind::Choice(rs::CAMERA_QUALITY), true),
+                    f("recording.cameraFps", "Frame rate", Kind::Choice(rs::CAMERA_FPS), true),
+                    b("recording.cameraMirror", "Mirror", true),
+                ],
+            ),
+            Row::Group(
+                "Encoding",
+                &[
+                    f("recording.codec", "Codec", Kind::Choice(rs::CODECS), true),
+                    f("recording.quality", "Quality", Kind::Choice(rs::QUALITIES), true),
+                    f("recording.keyframeSeconds", "Keyframe every", Kind::Choice(rs::KEYFRAMES), true),
+                    b("recording.hardwareEncoder", "Hardware encoder", true),
+                ],
+            ),
+            Row::Note(
+                "Quality is the H.264 / HEVC bitrate: 6 / 12 / 20 / 40 Mbit/s at 1080p 30 fps, scaled by the picture size and frame rate. HEVC needs the hardware encoder; without one H.264 is recorded. ProRes 422 is FilmCraft's own encoder (large files, every frame a keyframe). With the hardware encoder off, recordings above 1080p are made at most at 15 fps.",
+            ),
+            Row::Group(
+                "Audio",
+                &[
+                    f("recording.sampleRate", "Sample rate", Kind::Choice(rs::SAMPLE_RATES), true),
+                    f("recording.channels", "Channels", Kind::Choice(rs::CHANNELS), true),
+                    f("recording.audioFormat", "Format", Kind::Choice(rs::AUDIO_FORMATS), true),
+                    b("recording.autoGain", "Auto gain (toward −18 dBFS, in the file only)", true),
+                ],
+            ),
+            Row::Group(
+                "Behaviour",
+                &[
+                    f("recording.countdownSeconds", "Countdown", Kind::Choice(rs::COUNTDOWNS), true),
+                    f("recording.stopAfterMinutes", "Stop after (0 = off)", int(0.0, 180.0, "minutes"), true),
+                    b("recording.openSequence", "Open the sequence after Stop", true),
+                    f("recording.outputFolder", "Output folder", Kind::Path, true),
+                ],
+            ),
+            Row::Note(
+                "The output folder is empty by default: Project Settings ▸ Scratch Disks ▸ Captured Audio and Video, else next to the project, else Recordings in FilmCraft's data folder.",
+            ),
         ],
     },
     Category {

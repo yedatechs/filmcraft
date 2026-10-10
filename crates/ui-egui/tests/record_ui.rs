@@ -1,6 +1,7 @@
 //! Headless UI tests of the Record panel (Window ▸ Record) with the engine's synthetic screen,
 //! camera and microphone: Record, live counters and the status-bar line, Stop → a synced
-//! sequence; Cancel → nothing left behind.
+//! sequence; Cancel → nothing left behind; several camera rows; the Settings section; the
+//! countdown.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
@@ -30,6 +31,8 @@ impl Driver {
         let mut session = Session::default();
         session.record.factory = Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), ..Default::default() }));
         Arc::make_mut(&mut session.project).settings.scratch.captured = Some(dir.to_string_lossy().into_owned());
+        // Record starts at once (the countdown test turns it back on)
+        session.prefs.recording.countdown_seconds = 0;
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
         let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
@@ -231,5 +234,90 @@ fn a_second_camera_row_records_to_its_own_track() {
     // a row's − removes it
     d.click("record.panel.camera.2.remove");
     assert_eq!(d.harness.state().ui.record.cameras.len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_settings_section_and_preferences_show_the_same_recording_settings() {
+    let dir = tmp("settings");
+    let mut d = Driver::new(&dir);
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.frames(3);
+    assert!(d.element("record.panel.settings.screenFps").is_none(), "collapsed at first");
+    d.click("record.panel.settings");
+    assert!(d.harness.state().ui.record.settings_open);
+    for id in [
+        "screenFps",
+        "screenResolution",
+        "showCursor",
+        "systemAudio",
+        "codec",
+        "quality",
+        "keyframeSeconds",
+        "sampleRate",
+        "autoGain",
+        "countdownSeconds",
+        "stopAfterMinutes",
+        "outputFolder",
+    ] {
+        assert!(d.element(&format!("record.panel.settings.{id}")).is_some(), "{id}");
+    }
+    d.click("record.panel.settings.screenFps");
+    d.click("record.panel.settings.screenFps.3"); // 15, 24, 30, 60
+    d.click("record.panel.settings.showCursor");
+    let g = d.ok("engine.execute", json!({"command": "record.settings", "params": {"get": true}}));
+    assert_eq!(g["settings"]["screenFps"], 60, "{g}");
+    assert_eq!(g["settings"]["showCursor"], false);
+    // a change made elsewhere shows in the panel
+    d.ok("engine.execute", json!({"command": "record.settings", "params": {"set": {"codec": "prores"}}}));
+    d.frames(2);
+    assert!(d.element("record.panel.settings.codec").unwrap()["label"].as_str().unwrap().contains("ProRes"));
+    // Preferences ▸ Recording shows the same values
+    d.ok("ui.menu.invoke", json!({"id": "app.settings.recording"}));
+    d.frames(3);
+    let fps = d.element("settings.recording.screenFps").unwrap();
+    assert!(fps["label"].as_str().unwrap().contains("60"), "{fps}");
+    assert!(d.element("settings.recording.outputFolder.browse").is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_countdown_shows_then_records_and_escape_cancels_it() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tmp("countdown");
+    let mut d = Driver::new(&dir);
+    let clock = Arc::new(AtomicU64::new(10_000));
+    d.harness.state_mut().session.record.test_clock_ms = Some(clock.clone());
+    d.ok("engine.execute", json!({"command": "record.settings", "params": {"set": {"countdownSeconds": 3}}}));
+    d.ok(
+        "ui.set",
+        json!({"record": {"open": true, "initialized": true, "screen": "display:synthetic:display", "cameras": [], "mics": [{"device": "default"}]}}),
+    );
+    d.frames(3);
+    d.click("record.panel.record");
+    assert!(!d.harness.state().session.record.recording());
+    assert_eq!(d.harness.state().ui.record.live, "Recording in 3…");
+    assert!(d.element("record.panel.record").unwrap()["label"].as_str().unwrap().starts_with("Recording in 3…"));
+    clock.store(11_500, Ordering::Release);
+    d.frames(2);
+    assert_eq!(d.harness.state().ui.record.live, "Recording in 2…");
+    clock.store(13_000, Ordering::Release);
+    d.frames(2);
+    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    d.run_for(0.5);
+    assert!(d.harness.state().ui.record.live.starts_with("Recording · "));
+    d.click("record.panel.record"); // Stop
+    assert!(!d.harness.state().session.record.recording());
+    // Esc during the countdown cancels it
+    d.click("record.panel.record");
+    assert!(d.harness.state().session.record.countdown.is_some());
+    d.ok("ui.key", json!({"key": "Escape"}));
+    d.frames(2);
+    assert!(d.harness.state().session.record.countdown.is_none());
+    assert_eq!(d.harness.state().ui.record.last, "Countdown cancelled");
+    clock.store(30_000, Ordering::Release);
+    d.frames(2);
+    assert!(!d.harness.state().session.record.recording());
+    assert!(d.harness.state().ui.record.live.is_empty());
     std::fs::remove_dir_all(&dir).ok();
 }

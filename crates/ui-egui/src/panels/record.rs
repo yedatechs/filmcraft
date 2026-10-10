@@ -81,6 +81,19 @@ pub struct MicRow {
     pub device: String,
 }
 
+impl Quality {
+    /// The Settings ▸ Recording ▸ Camera quality id (`720p`, `1080p`, `4k`, `native`).
+    pub fn from_id(id: &str) -> Quality {
+        serde_json::from_value(json!(id)).unwrap_or_default()
+    }
+}
+
+/// A new camera row with the Settings ▸ Recording camera defaults.
+pub fn camera_row(app: &FilmcraftApp, device: String) -> CameraRow {
+    let rs = &app.session.prefs.recording;
+    CameraRow { device, quality: Quality::from_id(&rs.camera_quality), mirror: rs.camera_mirror, offset_ms: 0.0 }
+}
+
 /// Record panel state (`UiState::record`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -102,6 +115,8 @@ pub struct RecordUi {
     pub live: String,
     /// The sources were preselected once (first display, first camera, default mic).
     pub initialized: bool,
+    /// The Settings section at the bottom is expanded.
+    pub settings_open: bool,
     /// `record.devices`, refreshed when the panel opens (not saved).
     #[serde(skip)]
     pub devices: Option<Value>,
@@ -119,6 +134,7 @@ pub fn route(app: &mut FilmcraftApp, id: &str) -> Option<Result<Value, String>> 
 }
 
 pub fn open(app: &mut FilmcraftApp) {
+    tick(app);
     app.ui.record.open = true;
     refresh(app);
 }
@@ -126,6 +142,7 @@ pub fn open(app: &mut FilmcraftApp) {
 fn refresh(app: &mut FilmcraftApp) {
     match app.session.execute("record.devices", json!({})) {
         Ok(v) => {
+            let first_cam = v["cameras"][0]["id"].as_str().map(|id| camera_row(app, id.to_string()));
             let r = &mut app.ui.record;
             if !r.initialized {
                 r.initialized = true;
@@ -135,9 +152,9 @@ fn refresh(app: &mut FilmcraftApp) {
                     r.screen = format!("display:{id}");
                 }
                 if r.cameras.is_empty()
-                    && let Some(id) = v["cameras"][0]["id"].as_str()
+                    && let Some(row) = first_cam
                 {
-                    r.cameras.push(CameraRow { device: id.to_string(), ..Default::default() });
+                    r.cameras.push(row);
                 }
                 if r.mics.is_empty() {
                     r.mics.push(MicRow { device: "default".into() });
@@ -150,6 +167,12 @@ fn refresh(app: &mut FilmcraftApp) {
     }
 }
 
+/// "Recording in 3…" (whole seconds left, rounded up).
+fn countdown_text(left: f64) -> String {
+    let n = if left.is_finite() { left.max(0.0).ceil() as u64 } else { 0 };
+    format!("Recording in {n}…")
+}
+
 fn mmss(secs: f64) -> String {
     let s = if secs.is_finite() { secs.max(0.0) as u64 } else { 0 };
     format!("{:02}:{:02}", s / 60, s % 60)
@@ -157,6 +180,9 @@ fn mmss(secs: f64) -> String {
 
 /// The status-bar line while recording (None when not recording).
 pub fn status_line(app: &FilmcraftApp) -> Option<String> {
+    if let Some(left) = app.session.record.countdown_left() {
+        return Some(countdown_text(left));
+    }
     if !app.session.record.recording() {
         return None;
     }
@@ -221,8 +247,41 @@ pub fn stop_params(r: &RecordUi) -> Value {
     if offsets.iter().all(|o| *o == 0.0) { json!({}) } else { json!({"cameraOffsetsMs": offsets}) }
 }
 
-/// Record / Stop.
+/// Run what the engine has due (a counted-down start, Stop after) and show what happened.
+pub fn tick(app: &mut FilmcraftApp) {
+    let Some(ev) = filmcraft_engine::record::tick(&mut app.session) else { return };
+    match ev["event"].as_str() {
+        Some("started") => {
+            app.ui.record.error.clear();
+            app.ui.record.last.clear();
+            app.ui.status = format!("Recording {}", ev["result"]["name"].as_str().unwrap_or(""));
+        }
+        Some("stoppedAfter") => {
+            let v = &ev["result"];
+            app.ui.record.last = format!(
+                "Stopped after {} min: {} — {} file(s) in a new sequence",
+                ev["minutes"],
+                v["name"].as_str().unwrap_or("Recording"),
+                v["files"].as_array().map_or(0, Vec::len)
+            );
+            app.ui.status = app.ui.record.last.clone();
+            app.ui.record.live.clear();
+        }
+        _ => {
+            let e = ev["error"].as_str().unwrap_or("recording failed").to_string();
+            app.ui.record.error = e.clone();
+            app.ui.status = e;
+            app.ui.record.live.clear();
+        }
+    }
+}
+
+/// Record / Stop (and Cancel of a countdown).
 pub fn toggle(app: &mut FilmcraftApp) {
+    if app.session.record.countdown.is_some() {
+        cancel(app);
+        return;
+    }
     if app.session.record.recording() {
         let p = stop_params(&app.ui.record);
         match app.session.execute("record.stop", p) {
@@ -241,12 +300,21 @@ pub fn toggle(app: &mut FilmcraftApp) {
         app.ui.record.live.clear();
         return;
     }
-    let p = start_params(&app.ui.record);
+    let mut p = start_params(&app.ui.record);
+    let countdown = app.session.prefs.recording.countdown_seconds;
+    if countdown > 0
+        && let Some(o) = p.as_object_mut()
+    {
+        o.insert("countdown".into(), json!(countdown));
+    }
     match app.session.execute("record.start", p) {
         Ok(v) => {
             app.ui.record.error.clear();
             app.ui.record.last.clear();
-            app.ui.status = format!("Recording {}", v["name"].as_str().unwrap_or(""));
+            app.ui.status = match v["countdown"].as_u64() {
+                Some(n) => countdown_text(n as f64),
+                None => format!("Recording {}", v["name"].as_str().unwrap_or("")),
+            };
         }
         Err(e) => {
             app.ui.record.error = e.to_string();
@@ -256,12 +324,12 @@ pub fn toggle(app: &mut FilmcraftApp) {
 }
 
 pub fn cancel(app: &mut FilmcraftApp) {
-    if !app.session.record.recording() {
+    if !app.session.record.recording() && app.session.record.countdown.is_none() {
         return;
     }
     match app.session.execute("record.cancel", json!({})) {
-        Ok(_) => {
-            app.ui.record.last = "Recording discarded".into();
+        Ok(v) => {
+            app.ui.record.last = if v["cancelled"] == true { "Countdown cancelled".into() } else { "Recording discarded".into() };
             app.ui.status = app.ui.record.last.clone();
         }
         Err(e) => app.ui.record.error = e.to_string(),
@@ -287,22 +355,36 @@ fn combo(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, id: &str, v
 
 /// Every frame: the panel (while open or recording) and the live status-bar line.
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    tick(app);
+    let counting = app.session.record.countdown.is_some();
+    if counting {
+        app.ui.record.live = status_line(app).unwrap_or_default();
+        app.ui.record.open = true;
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Esc cancels the countdown
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel(app);
+            return;
+        }
+    }
     let recording = app.session.record.recording();
     if recording {
         app.ui.record.live = status_line(app).unwrap_or_default();
         app.ui.record.open = true;
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
-    } else if !app.ui.record.live.is_empty() {
+    } else if !counting && !app.ui.record.live.is_empty() {
         // stopped from elsewhere (`record.stop` over the control channel)
         app.ui.record.live.clear();
     }
+    let recording = recording || counting;
     if !app.ui.record.open {
         return;
     }
     if app.ui.record.devices.is_none() {
         refresh(app);
     }
-    let st = recording.then(|| filmcraft_engine::record::status_of(&app.session));
+    let st = app.session.record.recording().then(|| filmcraft_engine::record::status_of(&app.session));
+    let countdown_left = app.session.record.countdown_left();
     let dev = app.ui.record.devices.clone().unwrap_or_default();
     let list = |key: &str, f: &dyn Fn(&Value) -> (String, String)| -> Vec<(String, String)> {
         dev[key].as_array().map(|a| a.iter().map(f).collect()).unwrap_or_default()
@@ -326,6 +408,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
 
     let mut elems: Vec<(String, Rect, String)> = Vec::new();
     let mut r = app.ui.record.clone();
+    let new_cam = camera_row(app, String::new());
+    let rs = app.session.prefs.recording.clone();
+    let hevc = filmcraft_engine::record_settings::hevc_available();
+    let sys_ok = dev["systemAudio"].as_bool().unwrap_or(false);
+    let mut patch = serde_json::Map::new();
+    let mut choose_folder = false;
     let (mut do_toggle, mut do_cancel, mut do_refresh, mut close) = (false, false, false, false);
     let accent = app.tokens.accent;
     let dim = app.tokens.text_dim;
@@ -396,7 +484,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     if a.clicked() {
                         let used: Vec<&str> = r.cameras.iter().map(|c| c.device.as_str()).collect();
                         let next = cameras.iter().map(|c| c.0.clone()).find(|id| !id.is_empty() && !used.contains(&id.as_str())).unwrap_or_default();
-                        r.cameras.push(CameraRow { device: next, ..Default::default() });
+                        r.cameras.push(CameraRow { device: next, ..new_cam.clone() });
                     }
                     let a = ui.add_enabled(!recording && r.mics.len() < MAX_ROWS, egui::Button::new("+ Microphone"));
                     elems.push(("record.panel.mic.add".into(), a.rect, "+ Microphone".into()));
@@ -412,7 +500,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let label = if recording {
+                let label = if let Some(left) = countdown_left {
+                    format!("{}  (Cancel)", countdown_text(left))
+                } else if recording {
                     format!("■  Stop  {}", mmss(st.as_ref().and_then(|s| s["elapsed"].as_f64()).unwrap_or(0.0)))
                 } else {
                     "●  Record".to_string()
@@ -469,6 +559,21 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 elems.push(("record.panel.error".into(), e.rect, r.error.clone()));
             }
             ui.add_space(4.0);
+            let hdr = egui::CollapsingHeader::new("Settings").id_salt("record-panel-settings").open(Some(r.settings_open)).show(ui, |ui| {
+                settings_section(
+                    ui,
+                    &mut elems,
+                    &rs,
+                    &mut patch,
+                    SectionCtx { enabled: !recording, hevc, sys_ok, has_screen: !r.screen.is_empty() },
+                    &mut choose_folder,
+                );
+            });
+            elems.push(("record.panel.settings".into(), hdr.header_response.rect, "Settings".into()));
+            if hdr.header_response.clicked() {
+                r.settings_open = !r.settings_open;
+            }
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Each source is its own file; Stop builds a synced sequence.").small().weak());
                 let x = ui.add_enabled(!recording, egui::Button::new("Close"));
@@ -485,6 +590,14 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         app.auto.add(&id, rect, &label);
     }
     app.ui.record = RecordUi { devices: app.ui.record.devices.take(), ..r };
+    if choose_folder && let Some(dir) = app.hooks.pick_folder.as_mut().and_then(|p| p()) {
+        patch.insert("outputFolder".into(), json!(dir));
+    }
+    if !patch.is_empty()
+        && let Err(e) = app.session.execute("record.settings", json!({"set": Value::Object(patch)}))
+    {
+        app.ui.record.error = e.to_string();
+    }
     if do_refresh {
         refresh(app);
     }
@@ -497,6 +610,129 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if close && !app.session.record.recording() {
         app.ui.record.open = false;
     }
+}
+
+/// What the Settings section needs to know.
+struct SectionCtx {
+    enabled: bool,
+    hevc: bool,
+    sys_ok: bool,
+    has_screen: bool,
+}
+
+fn opts(o: &[(&str, &str)]) -> Vec<(String, String)> {
+    o.iter().map(|(v, l)| (v.to_string(), l.to_string())).collect()
+}
+
+/// The Settings section of the panel: the same values as Settings ▸ Recording (`record.settings`);
+/// a change goes into `patch` (`{field: value}`), written after the frame.
+fn settings_section(
+    ui: &mut egui::Ui,
+    elems: &mut Vec<(String, Rect, String)>,
+    rs: &filmcraft_engine::record_settings::RecordingSettings,
+    patch: &mut serde_json::Map<String, Value>,
+    cx: SectionCtx,
+    choose_folder: &mut bool,
+) {
+    use filmcraft_engine::record_settings as k;
+    let id = |key: &str| format!("record.panel.settings.{key}");
+    let choice = |ui: &mut egui::Ui,
+                  elems: &mut Vec<(String, Rect, String)>,
+                  patch: &mut serde_json::Map<String, Value>,
+                  key: &str,
+                  label: &str,
+                  cur: String,
+                  o: Vec<(String, String)>,
+                  numeric: bool,
+                  enabled: bool| {
+        ui.label(label);
+        let mut v = cur.clone();
+        combo(ui, elems, &id(key), &mut v, &o, enabled, 200.0);
+        if v != cur {
+            patch.insert(key.into(), if numeric { v.parse::<u64>().map(Value::from).unwrap_or(json!(v)) } else { json!(v) });
+        }
+        ui.end_row();
+    };
+    let check = |ui: &mut egui::Ui,
+                 elems: &mut Vec<(String, Rect, String)>,
+                 patch: &mut serde_json::Map<String, Value>,
+                 key: &str,
+                 label: &str,
+                 cur: bool,
+                 enabled: bool| {
+        ui.label("");
+        let mut b = cur;
+        let r = ui.add_enabled(enabled, egui::Checkbox::new(&mut b, label));
+        elems.push((id(key), r.rect, format!("{label} {b}")));
+        if b != cur {
+            patch.insert(key.into(), json!(b));
+        }
+        ui.end_row();
+    };
+    let head = |ui: &mut egui::Ui, t: &str| {
+        ui.label(RichText::new(t).strong());
+        ui.end_row();
+    };
+    let en = cx.enabled;
+    egui::Grid::new("record-settings-grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+        head(ui, "Screen");
+        choice(ui, elems, patch, "screenFps", "Frame rate:", rs.screen_fps.to_string(), opts(k::SCREEN_FPS), true, en);
+        choice(ui, elems, patch, "screenResolution", "Resolution:", rs.screen_resolution.clone(), opts(k::SCREEN_RESOLUTION), false, en);
+        check(ui, elems, patch, "showCursor", "Show cursor", rs.show_cursor, en);
+        let sys_label = if cx.sys_ok { "System audio (with a screen)" } else { "System audio (not available yet)" };
+        check(ui, elems, patch, "systemAudio", sys_label, rs.system_audio, en && cx.sys_ok && cx.has_screen);
+        head(ui, "Camera (new rows)");
+        choice(ui, elems, patch, "cameraQuality", "Quality:", rs.camera_quality.clone(), opts(k::CAMERA_QUALITY), false, en);
+        choice(ui, elems, patch, "cameraFps", "Frame rate:", rs.camera_fps.to_string(), opts(k::CAMERA_FPS), true, en);
+        check(ui, elems, patch, "cameraMirror", "Mirror", rs.camera_mirror, en);
+        head(ui, "Encoding");
+        let codecs: Vec<(String, String)> = opts(k::CODECS).into_iter().filter(|(v, _)| cx.hevc || v != "hevc" || rs.codec == "hevc").collect();
+        choice(ui, elems, patch, "codec", "Codec:", rs.codec.clone(), codecs, false, en);
+        choice(ui, elems, patch, "quality", "Quality:", rs.quality.clone(), opts(k::QUALITIES), false, en && rs.codec != "prores");
+        choice(ui, elems, patch, "keyframeSeconds", "Keyframe every:", rs.keyframe_seconds.to_string(), opts(k::KEYFRAMES), true, en && rs.codec != "prores");
+        check(ui, elems, patch, "hardwareEncoder", "Hardware encoder", rs.hardware_encoder, en);
+        if !rs.hardware_encoder {
+            ui.label("");
+            ui.label(RichText::new("FilmCraft's own encoder: at most 15 fps above 1080p").small().weak());
+            ui.end_row();
+        }
+        head(ui, "Audio");
+        choice(ui, elems, patch, "sampleRate", "Sample rate:", rs.sample_rate.to_string(), opts(k::SAMPLE_RATES), true, en);
+        choice(ui, elems, patch, "channels", "Channels:", rs.channels.clone(), opts(k::CHANNELS), false, en);
+        choice(ui, elems, patch, "audioFormat", "Format:", rs.audio_format.clone(), opts(k::AUDIO_FORMATS), false, en);
+        check(ui, elems, patch, "autoGain", "Auto gain (−18 dBFS, file only)", rs.auto_gain, en);
+        head(ui, "Behaviour");
+        choice(ui, elems, patch, "countdownSeconds", "Countdown:", rs.countdown_seconds.to_string(), opts(k::COUNTDOWNS), true, en);
+        ui.label("Stop after:");
+        let mut m = rs.stop_after_minutes;
+        let d = ui.add_enabled(
+            en,
+            egui::DragValue::new(&mut m)
+                .range(0..=k::MAX_STOP_AFTER_MINUTES)
+                .custom_formatter(|v, _| if v < 0.5 { "Off".into() } else { format!("{v:.0} min") }),
+        );
+        elems.push((id("stopAfterMinutes"), d.rect, format!("{m}")));
+        if m != rs.stop_after_minutes {
+            patch.insert("stopAfterMinutes".into(), json!(m));
+        }
+        ui.end_row();
+        check(ui, elems, patch, "openSequence", "Open the sequence after Stop", rs.open_sequence, en);
+        ui.label("Output folder:");
+        ui.horizontal(|ui| {
+            let mut f = rs.output_folder.clone();
+            let t = ui.add_enabled(en, egui::TextEdit::singleline(&mut f).hint_text("Captured Audio and Video scratch disk").desired_width(200.0));
+            elems.push((id("outputFolder"), t.rect, f.clone()));
+            if t.lost_focus() && f != rs.output_folder {
+                patch.insert("outputFolder".into(), json!(f));
+            }
+            let b = ui.add_enabled(en, egui::Button::new("Choose…"));
+            elems.push((id("outputFolder.choose"), b.rect, "Choose…".into()));
+            if b.clicked() {
+                *choose_folder = true;
+            }
+        });
+        ui.end_row();
+    });
 }
 
 #[cfg(test)]

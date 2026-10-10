@@ -143,6 +143,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("app.settings.memory", "Memory…", ["Edit", "Preferences"], None),
     uic!("app.settings.playback", "Playback…", ["Edit", "Preferences"], None),
     uic!("app.settings.plugins", "Plugins…", ["Edit", "Preferences"], None),
+    uic!("app.settings.recording", "Recording…", ["Edit", "Preferences"], None),
     uic!("app.settings.timeline", "Timeline…", ["Edit", "Preferences"], None),
     uic!("app.settings.trim", "Trim…", ["Edit", "Preferences"], None),
     uic!("layout.menu.place.topLeft", "Top Left", ["Clip", "Layout", "Place"], None),

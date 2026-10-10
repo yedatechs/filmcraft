@@ -4,7 +4,10 @@
 //!   Screen Recording is already allowed (`CGPreflightScreenCaptureAccess`), so listing never
 //!   shows a prompt.
 //! - [`ScreenInput`]: an `SCStream` on one display or window, BGRA at the display's pixel size
-//!   (at most 3840 wide), `minimumFrameInterval` 1 / fps, the cursor shown; a stream output
+//!   (at most 3840 wide, scaled down to the requested resolution by ScreenCaptureKit),
+//!   `minimumFrameInterval` 1 / fps, the cursor shown or hidden; with system audio
+//!   (`capturesAudio`, macOS 13+) the stream's audio buffers (32-bit float) go to the audio sink
+//!   with their own clock mapping; FilmCraft's own sound is left out. A stream output
 //!   object (an Objective-C class defined here) receives the `CMSampleBuffer`s on a serial
 //!   dispatch queue, copies complete frames and hands them to the engine's frame sink with the
 //!   buffer's presentation time mapped onto the recording clock. ScreenCaptureKit only sends a
@@ -22,11 +25,11 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, DefinedClass, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
 use objc2_core_graphics::{
     CGDisplayCopyDisplayMode, CGDisplayIsBuiltin, CGDisplayMode, CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
 };
-use objc2_core_media::{CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_media::{CMAudioFormatDescriptionGetStreamBasicDescription, CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
     CVImageBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
@@ -35,8 +38,8 @@ use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput, SCStreamOutputType};
 
 use filmcraft_engine::record::{
-    CaptureError, CaptureErrorKind, CapturedFrame, DisplayInfo, FrameSink, Permission, PixelFormat, RecordClock, ScreenTarget, VideoFormat, VideoInput,
-    VideoRequest, WindowInfo,
+    AudioSink, CaptureError, CaptureErrorKind, CapturedAudio, CapturedFrame, DisplayInfo, FrameSink, Permission, PixelFormat, RecordClock, ScreenTarget,
+    VideoFormat, VideoInput, VideoRequest, WindowInfo,
 };
 
 use super::{HostClockMap, Need, OS_TIMEOUT, permission_error, time_ns};
@@ -165,6 +168,9 @@ pub fn devices() -> Result<(Vec<DisplayInfo>, Vec<WindowInfo>), CaptureError> {
 pub(super) struct Shared {
     pub sink: FrameSink,
     pub map: HostClockMap,
+    /// System audio: its sink and its own clock mapping (audio and video times are each
+    /// monotonic on their own).
+    pub audio: Option<(AudioSink, HostClockMap)>,
     /// Set at stop: frames that still arrive are dropped.
     pub stopped: AtomicBool,
     pub error: Mutex<Option<String>>,
@@ -244,7 +250,20 @@ define_class!(
         fn stream_did_output(&self, _stream: &SCStream, sample_buffer: &CMSampleBuffer, kind: SCStreamOutputType) {
             let shared = self.ivars();
             let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                if kind != SCStreamOutputType::Screen || shared.stopped.load(Ordering::Acquire) {
+                if shared.stopped.load(Ordering::Acquire) {
+                    return;
+                }
+                if kind == SCStreamOutputType::Audio {
+                    if let Some((sink, map)) = &shared.audio {
+                        match copy_audio(sample_buffer, map) {
+                            Ok(Some(a)) => sink(a),
+                            Ok(None) => {}
+                            Err(e) => shared.fail(e),
+                        }
+                    }
+                    return;
+                }
+                if kind != SCStreamOutputType::Screen {
                     return;
                 }
                 match copy_frame(sample_buffer, &shared.map) {
@@ -306,13 +325,73 @@ pub struct ScreenInput {
     target: ScreenTarget,
     running: Option<Sendable<Running>>,
     error: Option<Arc<Shared>>,
+    /// System audio asked for: rate, channels, sink.
+    audio: Option<(u32, u16, AudioSink)>,
 }
 
 impl ScreenInput {
     pub fn new(target: ScreenTarget) -> Result<Self, CaptureError> {
         require_permission()?;
-        Ok(Self { target, running: None, error: None })
+        Ok(Self { target, running: None, error: None, audio: None })
     }
+}
+
+/// `kAudioFormatFlagIsFloat`, `kAudioFormatFlagIsNonInterleaved`.
+const AUDIO_FLOAT: u32 = 1;
+const AUDIO_NON_INTERLEAVED: u32 = 1 << 5;
+
+/// Copy a system-audio sample buffer (32-bit float, planar or interleaved) into a
+/// [`CapturedAudio`] (None: nothing usable in it).
+fn copy_audio(sb: &CMSampleBuffer, map: &HostClockMap) -> Result<Option<CapturedAudio>, String> {
+    // SAFETY: `sb` is a valid sample buffer for the duration of the callback.
+    let n = unsafe { sb.num_samples() };
+    if n <= 0 {
+        return Ok(None);
+    }
+    let n = usize::try_from(n).map_err(|_| "audio sample count overflows")?.min(1 << 20);
+    // SAFETY: as above.
+    let pts: CMTime = unsafe { sb.presentation_time_stamp() };
+    if !pts.flags.contains(CMTimeFlags::Valid) {
+        return Ok(None);
+    }
+    // SAFETY: as above; the format description is retained while used.
+    let Some(desc) = (unsafe { sb.format_description() }) else { return Ok(None) };
+    // SAFETY: `desc` is a valid format description; the call returns null for a non-audio one,
+    // else a pointer into `desc`, which outlives its use below.
+    let asbd = unsafe { CMAudioFormatDescriptionGetStreamBasicDescription(&desc) };
+    if asbd.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: checked non-null above; points into `desc` (alive).
+    let asbd = unsafe { &*asbd };
+    let (rate, ch, flags, bits) = (asbd.mSampleRate, asbd.mChannelsPerFrame, asbd.mFormatFlags, asbd.mBitsPerChannel);
+    if flags & AUDIO_FLOAT == 0 || bits != 32 || ch == 0 || ch > 8 || !rate.is_finite() || !(1000.0..=384_000.0).contains(&rate) {
+        return Err(format!("unexpected system audio format ({rate} Hz, {ch} channels, {bits} bits, flags {flags:#x})"));
+    }
+    let ch = ch as usize;
+    // SAFETY: as above; the block buffer is retained while used.
+    let Some(block) = (unsafe { sb.data_buffer() }) else { return Ok(None) };
+    // SAFETY: `block` is a valid block buffer.
+    let len = unsafe { block.data_length() };
+    let want = n.saturating_mul(ch).saturating_mul(4);
+    if len < want {
+        return Err(format!("system audio buffer holds {len} bytes, not {want}"));
+    }
+    let mut bytes = vec![0u8; want];
+    let Some(dst) = std::ptr::NonNull::new(bytes.as_mut_ptr().cast::<std::ffi::c_void>()) else { return Ok(None) };
+    // SAFETY: `dst` points to `want` writable bytes and `want <= data_length`.
+    let status = unsafe { block.copy_data_bytes(0, want, dst) };
+    if status != 0 {
+        return Err(format!("cannot read the system audio ({status})"));
+    }
+    let samples: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    let channels: Vec<Vec<f32>> = if flags & AUDIO_NON_INTERLEAVED != 0 {
+        samples.chunks_exact(n).take(ch).map(<[f32]>::to_vec).collect()
+    } else {
+        (0..ch).map(|c| samples.iter().skip(c).step_by(ch).copied().collect()).collect()
+    };
+    let time_ns = map.map(time_ns(pts.value, pts.timescale).unwrap_or(0));
+    Ok(Some(CapturedAudio { sample_rate: rate.round() as u32, channels, time_ns }))
 }
 
 /// An even size of at most [`MAX_WIDTH`] wide with the aspect of `w × h`.
@@ -361,21 +440,44 @@ impl VideoInput for ScreenInput {
                 }
             };
             let (w, h) = fit(req.width.unwrap_or(pw), req.height.unwrap_or(ph));
+            // Settings ▸ Recording ▸ Resolution: ScreenCaptureKit scales to the configured size
+            let (w, h) = req.max_height.and_then(|mh| filmcraft_engine::record_settings::downscale((w, h), mh)).unwrap_or((w, h));
             let config = SCStreamConfiguration::new();
             config.setWidth(w as usize);
             config.setHeight(h as usize);
             config.setPixelFormat(BGRA);
             config.setMinimumFrameInterval(CMTime { value: 1, timescale: fps as i32, flags: CMTimeFlags::Valid, epoch: 0 });
             config.setQueueDepth(5);
-            config.setShowsCursor(true);
-            let shared =
-                Arc::new(Shared { sink, map: HostClockMap::new(clock.now_ns(), host_now_ns()), stopped: AtomicBool::new(false), error: Mutex::new(None) });
+            config.setShowsCursor(req.show_cursor);
+            let audio_sink = match &self.audio {
+                Some((rate, ch, sink)) => {
+                    config.setCapturesAudio(true);
+                    config.setSampleRate(*rate as isize);
+                    config.setChannelCount(*ch as isize);
+                    config.setExcludesCurrentProcessAudio(true);
+                    Some(sink.clone())
+                }
+                None => None,
+            };
+            let (anchor_clock, anchor_host) = (clock.now_ns(), host_now_ns());
+            let shared = Arc::new(Shared {
+                sink,
+                map: HostClockMap::new(anchor_clock, anchor_host),
+                audio: audio_sink.map(|s| (s, HostClockMap::new(anchor_clock, anchor_host))),
+                stopped: AtomicBool::new(false),
+                error: Mutex::new(None),
+            });
             let output = StreamOutput::new(shared.clone());
             let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(&*output)));
             let queue = DispatchQueue::new("org.filmcraft.capture.screen", None);
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue))
                 .map_err(|e| failed(format!("cannot receive screen frames: {}", e.localizedDescription())))?;
+            if shared.audio.is_some() {
+                stream
+                    .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Audio, Some(&queue))
+                    .map_err(|e| failed(format!("cannot receive the system audio: {}", e.localizedDescription())))?;
+            }
             run_with_completion("starting the screen recording", |b| stream.startCaptureWithCompletionHandler(Some(b)))?;
             self.error = Some(shared.clone());
             self.running = Some(Sendable(Running { stream, output, _queue: queue, shared }));
@@ -394,10 +496,27 @@ impl VideoInput for ScreenInput {
         }
         // SAFETY: as above; removing the output we added.
         let _ = unsafe { r.stream.removeStreamOutput_type_error(ProtocolObject::from_ref(&*r.output), SCStreamOutputType::Screen) };
+        if r.shared.audio.is_some() {
+            // SAFETY: as above; removing the audio output we added.
+            let _ = unsafe { r.stream.removeStreamOutput_type_error(ProtocolObject::from_ref(&*r.output), SCStreamOutputType::Audio) };
+        }
     }
 
     fn error(&self) -> Option<String> {
         self.error.as_ref().and_then(|s| s.error.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+
+    fn capture_audio(&mut self, sample_rate: u32, channels: u16, sink: AudioSink) -> bool {
+        // `capturesAudio` exists from macOS 13 on
+        // SAFETY: creating an empty stream configuration has no preconditions.
+        let config = unsafe { SCStreamConfiguration::new() };
+        if !config.respondsToSelector(sel!(setCapturesAudio:)) {
+            return false;
+        }
+        // ScreenCaptureKit's rates: 8, 16, 24 or 48 kHz; the file takes what it delivers
+        let rate = if [8_000, 16_000, 24_000, 48_000].contains(&sample_rate) { sample_rate } else { 48_000 };
+        self.audio = Some((rate, channels.clamp(1, 2), sink));
+        true
     }
 }
 

@@ -29,11 +29,72 @@ pub fn capture_kbps(w: u32, h: u32, fps: u32) -> u32 {
     (base * rate).clamp(500.0, 200_000.0).round() as u32
 }
 
-/// A live H.264 MOV recording.
+/// The codec of a recording (Settings ▸ Recording ▸ Codec).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureCodec {
+    #[default]
+    H264,
+    /// The hardware HEVC encoder only (VideoToolbox): refused without one.
+    Hevc,
+    /// FilmCraft's ProRes 422 encoder: intra-only, large, the friendliest to edit.
+    ProRes,
+}
+
+/// The quality of an H.264 / HEVC recording (Settings ▸ Recording ▸ Quality).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureQuality {
+    Low,
+    Medium,
+    #[default]
+    High,
+    Max,
+}
+
+impl CaptureQuality {
+    /// Mbit/s at 1920 × 1080, 30 fps.
+    pub fn mbps_1080p30(self) -> f64 {
+        match self {
+            CaptureQuality::Low => 6.0,
+            CaptureQuality::Medium => 12.0,
+            CaptureQuality::High => 20.0,
+            CaptureQuality::Max => 40.0,
+        }
+    }
+}
+
+/// The bitrate (kbps) of a capture of `w × h` at `fps` and `quality`: the quality's 1080p30 rate
+/// scaled by `(pixels / 1080p)^0.87` and by `fps / 30` (at least ½), 0.5–400 Mbit/s.
+pub fn capture_kbps_for(w: u32, h: u32, fps: u32, quality: CaptureQuality) -> u32 {
+    let px = f64::from(w.max(1)) * f64::from(h.max(1));
+    let base = quality.mbps_1080p30() * 1000.0 * (px / (1920.0 * 1080.0)).powf(0.87);
+    let rate = (f64::from(fps.max(1)) / 30.0).max(0.5);
+    (base * rate).clamp(500.0, 400_000.0).round() as u32
+}
+
+/// How a recording is encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureEncoding {
+    pub codec: CaptureCodec,
+    pub quality: CaptureQuality,
+    /// Seconds between keyframes (H.264 / HEVC; ProRes is all keyframes).
+    pub keyframe_seconds: u32,
+    /// Let a registered hardware encoder take it (else FilmCraft's own encoder).
+    pub hardware: bool,
+}
+
+impl Default for CaptureEncoding {
+    fn default() -> Self {
+        Self { codec: CaptureCodec::H264, quality: CaptureQuality::High, keyframe_seconds: 2, hardware: true }
+    }
+}
+
+/// A live MOV recording (H.264, HEVC or ProRes 422).
 pub struct MovRecorder {
     path: PathBuf,
     enc: Box<dyn VideoEncoder>,
     hardware: bool,
+    name: &'static str,
+    kbps: u32,
     width: u32,
     height: u32,
     rate: FrameRate,
@@ -51,9 +112,16 @@ pub struct MovRecorder {
 }
 
 impl MovRecorder {
-    /// Start `path` (created / truncated) for `width × height` pictures at the nominal `rate`.
-    /// `hardware`: let a registered hardware encoder take it (else FilmCraft's own encoder).
+    /// Start `path` (created / truncated) for `width × height` H.264 pictures at the nominal
+    /// `rate`, High quality, a keyframe every 2 s. `hardware`: let a registered hardware encoder
+    /// take it (else FilmCraft's own encoder).
     pub fn create(path: &Path, width: u32, height: u32, rate: FrameRate, hardware: bool) -> Result<Self> {
+        Self::create_with(path, width, height, rate, &CaptureEncoding { hardware, ..Default::default() })
+    }
+
+    /// Start `path` with the codec, quality, keyframe interval and encoder choice of `enc`. HEVC
+    /// is refused without a hardware HEVC encoder (or with `hardware` off): the caller falls back.
+    pub fn create_with(path: &Path, width: u32, height: u32, rate: FrameRate, enc: &CaptureEncoding) -> Result<Self> {
         if width < 16 || height < 16 || width > 8192 || height > 8192 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(ExportError::Unsupported(format!("a recording must be an even size of 16–8192 pixels, not {width}x{height}")));
         }
@@ -61,45 +129,67 @@ impl MovRecorder {
             return Err(ExportError::Unsupported("invalid recording frame rate".into()));
         }
         let fps = (rate.num as f64 / rate.den as f64).round().max(1.0) as u32;
-        let kbps = capture_kbps(width, height, fps);
+        let kbps = capture_kbps_for(width, height, fps, enc.quality);
+        let format = match enc.codec {
+            CaptureCodec::H264 => Format::H264,
+            CaptureCodec::Hevc => Format::Hevc,
+            CaptureCodec::ProRes => Format::ProRes,
+        };
+        if enc.codec == CaptureCodec::Hevc && !enc.hardware {
+            return Err(ExportError::Unsupported("HEVC is recorded by the hardware encoder only (Hardware encoder is off)".into()));
+        }
         let settings = ExportSettings {
-            format: Format::H264,
+            format,
             path: path.to_string_lossy().into_owned(),
             bitrate_kbps: kbps,
             max_bitrate_kbps: Some(kbps.saturating_mul(3) / 2),
-            keyframe_distance: Some(fps.saturating_mul(2).max(1)),
+            keyframe_distance: Some(fps.saturating_mul(enc.keyframe_seconds.clamp(1, 10)).max(1)),
             bitrate_mode: BitrateMode::Vbr1Pass,
-            hardware_encoding: if hardware { HardwareEncoding::Auto } else { HardwareEncoding::Off },
+            hardware_encoding: if enc.hardware { HardwareEncoding::Auto } else { HardwareEncoding::Off },
+            prores_profile: "standard".into(),
             ..Default::default()
         };
-        let make = |settings: &ExportSettings| -> Result<Box<dyn VideoEncoder>> {
-            video_factories()
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .find_map(|fac| fac(Format::H264, width, height, rate, settings))
-                .ok_or_else(|| ExportError::Unsupported("no H.264 encoder".into()))?
+        let make = |settings: &ExportSettings| -> Option<Result<Box<dyn VideoEncoder>>> {
+            video_factories().read().unwrap_or_else(|e| e.into_inner()).iter().find_map(|fac| fac(format, width, height, rate, settings))
         };
-        // the hardware encoder (High profile, no frame reordering) when one takes it, else ours in
-        // Constrained Baseline: no B-frames (pictures come out in capture order) and the fastest
-        let sessions = hw_encode_stats().sessions;
-        let mut hw = None;
-        if hardware {
-            let enc = make(&settings)?;
-            if hw_encode_stats().sessions > sessions {
-                hw = Some(enc);
+        let (enc_box, hardware, name) = match enc.codec {
+            CaptureCodec::ProRes => {
+                let e = make(&settings).ok_or_else(|| ExportError::Unsupported("no ProRes encoder".into()))??;
+                (e, false, "FilmCraft ProRes 422")
             }
-        }
-        let hardware = hw.is_some();
-        let enc = match hw {
-            Some(enc) => enc,
-            None => make(&ExportSettings { hardware_encoding: HardwareEncoding::Off, h264_profile: H264Profile::Baseline, ..settings.clone() })?,
+            CaptureCodec::Hevc => {
+                let e = make(&settings).ok_or_else(|| ExportError::Unsupported("HEVC needs a hardware HEVC encoder, and this system has none".into()))??;
+                (e, true, "VideoToolbox HEVC")
+            }
+            CaptureCodec::H264 => {
+                // the hardware encoder (High profile, no frame reordering) when one takes it, else
+                // ours in Constrained Baseline: no B-frames (pictures come out in capture order)
+                // and the fastest
+                let sessions = hw_encode_stats().sessions;
+                let mut hw = None;
+                if enc.hardware {
+                    let e = make(&settings).ok_or_else(|| ExportError::Unsupported("no H.264 encoder".into()))??;
+                    if hw_encode_stats().sessions > sessions {
+                        hw = Some(e);
+                    }
+                }
+                match hw {
+                    Some(e) => (e, true, "VideoToolbox H.264"),
+                    None => {
+                        let soft = ExportSettings { hardware_encoding: HardwareEncoding::Off, h264_profile: H264Profile::Baseline, ..settings.clone() };
+                        let e = make(&soft).ok_or_else(|| ExportError::Unsupported("no H.264 encoder".into()))??;
+                        (e, false, "FilmCraft H.264")
+                    }
+                }
+            }
         };
         let file = File::create(path).map_err(|e| ExportError::Io(format!("{}: {e}", path.display())))?;
         Ok(Self {
             path: path.to_path_buf(),
-            enc,
+            enc: enc_box,
             hardware,
+            name,
+            kbps: if enc.codec == CaptureCodec::ProRes { 0 } else { kbps },
             width,
             height,
             rate,
@@ -114,9 +204,14 @@ impl MovRecorder {
         })
     }
 
-    /// "VideoToolbox H.264" or "FilmCraft H.264".
+    /// "VideoToolbox H.264", "VideoToolbox HEVC", "FilmCraft H.264" or "FilmCraft ProRes 422".
     pub fn encoder_name(&self) -> &'static str {
-        if self.hardware { "VideoToolbox H.264" } else { "FilmCraft H.264" }
+        self.name
+    }
+
+    /// The target bitrate (kbps; 0 for ProRes, which has none).
+    pub fn kbps(&self) -> u32 {
+        self.kbps
     }
 
     pub fn hardware(&self) -> bool {
@@ -225,6 +320,52 @@ mod tests {
         let k720 = capture_kbps(1280, 720, 30);
         assert!((5_000..7_000).contains(&k720), "{k720}");
         assert_eq!(capture_kbps(1920, 1080, 60), 24_000);
+        // quality tiers at 1080p30: 6 / 12 / 20 / 40 Mbit/s, scaled by pixels and frame rate
+        let q = |w, h, fps, q| capture_kbps_for(w, h, fps, q);
+        assert_eq!(q(1920, 1080, 30, CaptureQuality::Low), 6_000);
+        assert_eq!(q(1920, 1080, 30, CaptureQuality::Medium), 12_000);
+        assert_eq!(q(1920, 1080, 30, CaptureQuality::High), 20_000);
+        assert_eq!(q(1920, 1080, 30, CaptureQuality::Max), 40_000);
+        assert_eq!(q(1920, 1080, 60, CaptureQuality::High), 40_000);
+        assert_eq!(q(1920, 1080, 15, CaptureQuality::High), 10_000);
+        assert!((65_000..70_000).contains(&q(3840, 2160, 30, CaptureQuality::High)));
+        assert!((9_500..10_500).contains(&q(1280, 720, 30, CaptureQuality::High)));
+        assert_eq!(q(16, 16, 1, CaptureQuality::Low), 500, "never below 0.5 Mbit/s");
+    }
+
+    #[test]
+    fn codecs_and_keyframes() {
+        let dir = std::env::temp_dir().join(format!("filmcraft-recorder-codecs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let px = vec![90u8; 64 * 32 * 4];
+        // ProRes 422: FilmCraft's encoder, every picture a keyframe, no bitrate
+        let path = dir.join("p.mov");
+        let enc = CaptureEncoding { codec: CaptureCodec::ProRes, ..Default::default() };
+        let mut r = MovRecorder::create_with(&path, 64, 32, FrameRate::new(30, 1), &enc).unwrap();
+        assert_eq!((r.encoder_name(), r.kbps()), ("FilmCraft ProRes 422", 0));
+        for k in 0..4 {
+            r.push(&px, k).unwrap();
+        }
+        r.finish(4).unwrap();
+        let mp4 = filmcraft_isobmff::open(std::fs::read(&path).unwrap().as_slice()).unwrap();
+        assert!(mp4.tracks[0].samples.iter().all(|s| s.is_sync));
+        assert_eq!(mp4.tracks[0].samples.len(), 4);
+        // H.264 in software with a keyframe every second at 10 fps
+        let path = dir.join("h.mov");
+        let enc = CaptureEncoding { codec: CaptureCodec::H264, quality: CaptureQuality::Low, keyframe_seconds: 1, hardware: false };
+        let mut r = MovRecorder::create_with(&path, 64, 32, FrameRate::new(10, 1), &enc).unwrap();
+        assert_eq!(r.encoder_name(), "FilmCraft H.264");
+        for k in 0..25 {
+            r.push(&px, k).unwrap();
+        }
+        r.finish(25).unwrap();
+        let mp4 = filmcraft_isobmff::open(std::fs::read(&path).unwrap().as_slice()).unwrap();
+        let keys: Vec<usize> = mp4.tracks[0].samples.iter().enumerate().filter(|(_, s)| s.is_sync).map(|(i, _)| i).collect();
+        assert_eq!(keys, vec![0, 10, 20]);
+        // HEVC without the hardware encoder is refused (the engine falls back to H.264)
+        let enc = CaptureEncoding { codec: CaptureCodec::Hevc, hardware: false, ..Default::default() };
+        assert!(MovRecorder::create_with(&dir.join("x.mov"), 64, 32, FrameRate::new(30, 1), &enc).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
