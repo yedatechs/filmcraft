@@ -108,7 +108,9 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
     });
     // SAFETY: the block lives as long as ScreenCaptureKit keeps it (it copies the block); the
     // arguments are plain booleans.
-    unsafe { SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(true, true, &block) };
+    super::catch_objc("listing the screens", || unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(true, true, &block)
+    })?;
     match rx.recv_timeout(OS_TIMEOUT) {
         Ok(Ok(c)) => Ok(c.0),
         Ok(Err(e)) => Err(failed(format!("cannot list the screens: {e}"))),
@@ -474,6 +476,31 @@ impl VideoInput for ScreenInput {
         if self.running.is_some() {
             return Err(failed("the screen is already being recorded"));
         }
+        // ScreenCaptureKit raises Objective-C exceptions for a bad filter or configuration:
+        // caught, they are this recording's error, not the end of the app
+        super::catch_objc("starting the screen recording", || self.start_stream(req, clock, sink))?
+    }
+
+    fn stop(&mut self) {
+        let _ = super::catch_objc("stopping the screen recording", || self.stop_stream());
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.as_ref().and_then(|s| s.error.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+
+    fn refresh_exclusions(&mut self) -> Result<(), CaptureError> {
+        super::catch_objc("updating what the screen recording leaves out", || self.refresh_filter())?
+    }
+
+    fn capture_audio(&mut self, sample_rate: u32, channels: u16, sink: AudioSink) -> bool {
+        super::catch_objc("configuring the system audio", || self.enable_audio(sample_rate, channels, sink)).unwrap_or(false)
+    }
+}
+
+impl ScreenInput {
+    /// The body of [`VideoInput::start`], run under [`super::catch_objc`].
+    fn start_stream(&mut self, req: &VideoRequest, clock: RecordClock, sink: FrameSink) -> Result<VideoFormat, CaptureError> {
         let content = shareable_content()?;
         let fps = req.fps.clamp(1, 60);
         let mut source_rect: Option<CGRect> = None;
@@ -575,7 +602,7 @@ impl VideoInput for ScreenInput {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop_stream(&mut self) {
         let Some(Sendable(r)) = self.running.take() else { return };
         r.shared.stopped.store(true, Ordering::Release);
         // SAFETY: the stream and output object are retained by `r` until the end of this
@@ -592,11 +619,7 @@ impl VideoInput for ScreenInput {
         }
     }
 
-    fn error(&self) -> Option<String> {
-        self.error.as_ref().and_then(|s| s.error.lock().unwrap_or_else(PoisonError::into_inner).clone())
-    }
-
-    fn refresh_exclusions(&mut self) -> Result<(), CaptureError> {
+    fn refresh_filter(&mut self) -> Result<(), CaptureError> {
         let ScreenTarget::Display(id) = &self.target else { return Ok(()) };
         let Some(Sendable(r)) = self.running.as_ref() else { return Ok(()) };
         let content = shareable_content()?;
@@ -618,7 +641,7 @@ impl VideoInput for ScreenInput {
         Ok(())
     }
 
-    fn capture_audio(&mut self, sample_rate: u32, channels: u16, sink: AudioSink) -> bool {
+    fn enable_audio(&mut self, sample_rate: u32, channels: u16, sink: AudioSink) -> bool {
         // `capturesAudio` exists from macOS 13 on
         // SAFETY: creating an empty stream configuration has no preconditions.
         let config = unsafe { SCStreamConfiguration::new() };

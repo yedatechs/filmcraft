@@ -32,6 +32,11 @@ ADR 0001, unchanged:
    input's error (`VideoInput::error`), which stops the recording with that error. Completion
    handlers (shareable-content enumeration, access requests) only send on a channel, and the
    waiting side gives up after 5 s, so a callback that never comes cannot hang the app.
+   And no Objective-C exception crosses it the other way: Rust cannot unwind through one (the
+   process aborts with "Rust cannot catch foreign exceptions", which is how a camera that rejected
+   its configuration took the app down on 2026-10-10). Every AVFoundation, ScreenCaptureKit and
+   AppKit call runs under `capture::catch_objc` (`objc2::exception::catch`), which turns an
+   exception into a `CaptureError` naming the call and the exception's reason, and logs it.
 5. The crate compiles on every target. The new bindings are macOS-only dependencies; on other
    systems `register()` installs no capture factory and the engine reports screen and camera
    capture as not available.

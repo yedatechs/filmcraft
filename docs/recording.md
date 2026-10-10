@@ -238,6 +238,11 @@ window, the display scaled to fit, so `ui.drag` on `record.overlay` draws an are
 
 ## Permissions (macOS)
 
+A camera or screen that rejects its configuration raises an Objective-C exception inside macOS;
+FilmCraft catches it (`docs/adr/0002-platform-capture-ffi.md` §4) and shows it in the Record panel
+as that source's error ("starting the camera: NSInvalidArgumentException …") instead of quitting.
+If you see one, the message is what to report.
+
 macOS asks once per app for Screen Recording (which also covers system audio), Camera and
 Microphone. FilmCraft checks first and never waits on the system: when a permission is missing it
 shows the system prompt (the first time) and the start fails with a message naming the pane, for

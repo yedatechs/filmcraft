@@ -36,7 +36,7 @@ objc2-core-media = "0.3.2"
 objc2-core-video = "0.3.2"
 objc2-video-toolbox = "0.3.2"
 # OS media capture (ADR 0002): ScreenCaptureKit (screens, windows) and AVFoundation (cameras).
-objc2 = "0.6"
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = "0.3.2"
 block2 = "0.6"
 dispatch2 = "0.3"

@@ -165,6 +165,19 @@ pub fn register() -> bool {
 /// before it is reported as failed: never a hang.
 pub const OS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Run `f` with Objective-C exceptions caught. An exception raised by AVFoundation, ScreenCaptureKit
+/// or AppKit cannot unwind through Rust: without this the process aborts ("Rust cannot catch
+/// foreign exceptions"), which is how a camera that rejected its configuration took the whole app
+/// down. Here it becomes a [`CaptureError`] naming `what` and the exception's reason, and is logged.
+#[cfg(target_os = "macos")]
+pub fn catch_objc<R>(what: &str, f: impl FnOnce() -> R) -> Result<R, CaptureError> {
+    objc2::exception::catch(std::panic::AssertUnwindSafe(f)).map_err(|e| {
+        let reason = e.map(|e| e.to_string()).unwrap_or_else(|| "an unknown Objective-C exception".into());
+        log::error!("{what}: Objective-C exception: {reason}");
+        CaptureError::new(CaptureErrorKind::Failed, format!("{what}: {reason}"))
+    })
+}
+
 /// How long a stream or session start (ScreenCaptureKit `startCapture`, the camera session's
 /// `startRunning`) may take: the first `startCapture` in a process warms up ScreenCaptureKit's
 /// helper and can take more than 5 s; later ones take well under a second. The engine waits as
@@ -268,5 +281,21 @@ mod tests {
         let t = times.lock().unwrap();
         assert!(t.windows(2).all(|w| w[1].0 > w[0].0), "monotonic");
         assert!(t[0].0 < 1_000_000_000, "the first frame is stamped near the clock start: {}", t[0].0);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod objc_tests {
+    use super::*;
+
+    #[test]
+    fn an_objective_c_exception_becomes_an_error_not_an_abort() {
+        let arr = objc2_foundation::NSArray::<objc2_foundation::NSString>::new();
+        // deliberately out of range: `objectAtIndex:` raises NSRangeException, which the guard
+        // must turn into an error
+        let r = catch_objc("reading past the end", || arr.objectAtIndex(5));
+        let e = r.expect_err("the exception is caught").to_string();
+        assert!(e.contains("reading past the end"), "{e}");
+        assert!(catch_objc("fine", || 1 + 1).is_ok_and(|v| v == 2));
     }
 }

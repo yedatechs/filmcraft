@@ -53,8 +53,8 @@ fn media(audio: bool) -> Option<&'static AVMediaType> {
 pub fn permission(audio: bool) -> Permission {
     let Some(m) = media(audio) else { return Permission::Unavailable };
     // SAFETY: `m` is AVMediaTypeVideo or AVMediaTypeAudio, the two types the call accepts.
-    let s = unsafe { AVCaptureDevice::authorizationStatusForMediaType(m) };
-    match s {
+    let s = super::catch_objc("checking the camera permission", || unsafe { AVCaptureDevice::authorizationStatusForMediaType(m) });
+    match s.unwrap_or(AVAuthorizationStatus::NotDetermined) {
         AVAuthorizationStatus::Authorized => Permission::Granted,
         AVAuthorizationStatus::NotDetermined => Permission::Undetermined,
         _ => Permission::Denied,
@@ -69,7 +69,7 @@ fn require_permission() -> Result<(), CaptureError> {
     {
         let handler = RcBlock::new(|_granted: Bool| {});
         // SAFETY: `m` is AVMediaTypeVideo; AVFoundation copies the (empty) handler block.
-        unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(m, &handler) };
+        let _ = super::catch_objc("asking for the camera permission", || unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(m, &handler) });
     }
     match permission_error(Need::Camera, p) {
         Some(e) => Err(e),
@@ -115,7 +115,8 @@ fn formats_of(d: &AVCaptureDevice) -> Vec<CameraFormat> {
 /// Cameras with their formats (no permission needed, no prompt).
 pub fn devices() -> Result<Vec<CameraInfo>, CaptureError> {
     let r = std::panic::catch_unwind(|| {
-        video_devices()
+        super::catch_objc("listing the cameras", video_devices)
+            .unwrap_or_default()
             .iter()
             .map(|d| {
                 // SAFETY: `d` is a valid, retained device.
@@ -193,10 +194,11 @@ fn start_running(session: &Retained<AVCaptureSession>) -> Result<(), CaptureErro
             let running = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 // SAFETY: the session is retained by `held` and fully configured; starting it
                 // from a background thread is what Apple recommends.
-                unsafe {
+                super::catch_objc("starting the camera session", || unsafe {
                     held.0.startRunning();
                     held.0.isRunning()
-                }
+                })
+                .unwrap_or(false)
             }))
             .unwrap_or(false);
             if tx.try_send(running).is_err() && running {
@@ -248,6 +250,27 @@ impl VideoInput for CameraInput {
             return Err(failed("the camera is already being recorded"));
         }
         require_permission()?;
+        // every AVFoundation call below may raise an Objective-C exception (a format or preset the
+        // device rejects): caught here, it is this camera's error, not the end of the app
+        super::catch_objc("starting the camera", || self.start_session(req, clock, sink))?
+    }
+
+    fn stop(&mut self) {
+        let Some(Sendable(r)) = self.running.take() else { return };
+        r.shared.stopped.store(true, Ordering::Release);
+        // SAFETY: the session is retained by `r`; stopping a running session is always allowed
+        // and blocks until it stopped, so no frame reaches the sink afterwards.
+        let _ = super::catch_objc("stopping the camera", || unsafe { r.session.stopRunning() });
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.as_ref().and_then(|s| s.error.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+}
+
+impl CameraInput {
+    /// The body of [`VideoInput::start`], run under [`super::catch_objc`].
+    fn start_session(&mut self, req: &VideoRequest, clock: RecordClock, sink: FrameSink) -> Result<VideoFormat, CaptureError> {
         let device = video_devices()
             .into_iter()
             // SAFETY: valid, retained devices.
@@ -319,18 +342,6 @@ impl VideoInput for CameraInput {
             self.running = Some(Sendable(Running { session, _output: output, _delegate: delegate, _queue: queue, shared }));
             Ok(VideoFormat { width: w, height: h, fps, format: PixelFormat::Bgra8 })
         }
-    }
-
-    fn stop(&mut self) {
-        let Some(Sendable(r)) = self.running.take() else { return };
-        r.shared.stopped.store(true, Ordering::Release);
-        // SAFETY: the session is retained by `r`; stopping a running session is always allowed
-        // and blocks until it stopped, so no frame reaches the sink afterwards.
-        unsafe { r.session.stopRunning() };
-    }
-
-    fn error(&self) -> Option<String> {
-        self.error.as_ref().and_then(|s| s.error.lock().unwrap_or_else(PoisonError::into_inner).clone())
     }
 }
 

@@ -11,6 +11,17 @@
 pub fn raise_without_focus() -> bool {
     #[cfg(target_os = "macos")]
     {
+        filmcraft_platform::capture::catch_objc("raising the window", raise_impl).unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn raise_impl() -> bool {
+    {
         let Some(mtm) = objc2::MainThreadMarker::new() else { return false };
         let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
         let windows = app.windows();
@@ -21,10 +32,6 @@ pub fn raise_without_focus() -> bool {
         }
         true
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
 }
 
 /// Put FilmCraft's recording border window (Window ▸ Record; its title starts with `title`) over
@@ -33,6 +40,18 @@ pub fn raise_without_focus() -> bool {
 /// unframed. Returns whether a window was placed (macOS).
 pub fn place_overlay(title: &str, frame: [f64; 4]) -> bool {
     #[cfg(target_os = "macos")]
+    {
+        filmcraft_platform::capture::catch_objc("placing the recording border", || place_impl(title, frame)).unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, frame);
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn place_impl(title: &str, frame: [f64; 4]) -> bool {
     {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
         let Some(mtm) = objc2::MainThreadMarker::new() else { return false };
@@ -54,10 +73,5 @@ pub fn place_overlay(title: &str, frame: [f64; 4]) -> bool {
             }
         }
         placed
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (title, frame);
-        false
     }
 }
