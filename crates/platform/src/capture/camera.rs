@@ -320,14 +320,43 @@ impl CameraInput {
             let want = f64::from(req.fps.clamp(1, 60));
             let fmt = device.activeFormat();
             let ranges = fmt.videoSupportedFrameRateRanges();
-            let can = ranges.iter().any(|r| r.minFrameRate() <= want + 0.01 && r.maxFrameRate() >= want - 0.01);
+            let range = ranges.iter().find(|r| r.minFrameRate() <= want + 0.01 && r.maxFrameRate() >= want - 0.01);
             let best = ranges.iter().map(|r| r.maxFrameRate()).fold(0.0f64, f64::max);
-            let fps = if can && device.lockForConfiguration().is_ok() {
-                let d = CMTime { value: 1, timescale: req.fps.clamp(1, 60) as i32, flags: CMTimeFlags::Valid, epoch: 0 };
-                device.setActiveVideoMinFrameDuration(d);
-                device.setActiveVideoMaxFrameDuration(d);
-                device.unlockForConfiguration();
-                req.fps.clamp(1, 60)
+            // The duration must lie inside the range's own CMTime bounds, which a camera reports as
+            // exact fractions (an Insta360 Link says 30.00003 fps = 1000000/30000030): a plain 1/30
+            // is a hair outside and AVFoundation raises "Not supported". So the range's own bound is
+            // used when the rate asked for is one of its ends, and a failure here only means the
+            // device's own rate, never a failed start.
+            let applied = range.and_then(|r| {
+                let at_max = (r.maxFrameRate() - want).abs() <= 0.01;
+                let at_min = (r.minFrameRate() - want).abs() <= 0.01;
+                let d = if at_max {
+                    r.minFrameDuration()
+                } else if at_min {
+                    r.maxFrameDuration()
+                } else {
+                    CMTime { value: 1, timescale: req.fps.clamp(1, 60) as i32, flags: CMTimeFlags::Valid, epoch: 0 }
+                };
+                let set = super::catch_objc("setting the camera frame rate", || {
+                    if device.lockForConfiguration().is_err() {
+                        return false;
+                    }
+                    device.setActiveVideoMinFrameDuration(d);
+                    device.setActiveVideoMaxFrameDuration(d);
+                    device.unlockForConfiguration();
+                    true
+                });
+                match set {
+                    Ok(true) => Some(req.fps.clamp(1, 60)),
+                    Ok(false) => None,
+                    Err(e) => {
+                        log::warn!("{e}; recording at the camera's own rate");
+                        None
+                    }
+                }
+            });
+            let fps = if let Some(fps) = applied {
+                fps
             } else if best.is_finite() && best >= 1.0 {
                 best.round().clamp(1.0, 60.0) as u32
             } else {
