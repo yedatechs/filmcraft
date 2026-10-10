@@ -211,3 +211,218 @@ fn float_wav_round_trip() {
 fn bar_state_serializes_lowercase() {
     assert_eq!(serde_json::to_value(BarState::Green).unwrap(), json!("green"));
 }
+
+// ---------------------------------------------------------------- disk use: orphans, guard
+
+/// A fresh folder under the build's target directory (never the real Media Cache).
+fn target_tmp(name: &str) -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let d = exe.parent().unwrap().join("previews-disk-tests").join(format!("{name}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// An `untitled-<pid>-…` folder with a preview file and (optionally) an `.owner` heartbeat.
+fn untitled(root: &std::path::Path, pid: u32, beat: Option<u64>) -> std::path::PathBuf {
+    let d = root.join(format!("untitled-{pid}-1f2e3d"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("0123456789abcdef0123456789abcdef.mov"), b"preview").unwrap();
+    if let Some(b) = beat {
+        std::fs::write(d.join(".owner"), format!("pid={pid}\nheartbeat={b}\n")).unwrap();
+    }
+    d
+}
+
+// pids far above any real pid: no such process is running
+const GONE: u32 = 4_000_000_001;
+
+#[test]
+fn orphaned_untitled_folders_are_removed_at_startup() {
+    let root = target_tmp("orphans");
+    let now = unix_now();
+    let stale = untitled(&root, GONE, Some(now - 3600));
+    let missing = untitled(&root, GONE + 1, None);
+    let fresh = untitled(&root, GONE + 2, Some(now - 30));
+    let mine = untitled(&root, std::process::id(), Some(now - 3600));
+    let other = root.join("not-a-preview-folder");
+    std::fs::create_dir_all(&other).unwrap();
+    let removed = crate::previews::sweep_orphans(&root, now);
+    assert_eq!(removed.len(), 2, "{removed:?}");
+    assert!(!stale.exists(), "a stale heartbeat is an orphan");
+    assert!(!missing.exists(), "no heartbeat at all is an orphan");
+    assert!(fresh.exists(), "a fresh heartbeat is a live session");
+    assert!(mine.exists(), "this process's folder is never an orphan");
+    assert!(other.exists(), "only untitled-* folders are touched");
+    // first use of a preview root sweeps it (Session start: apply_media_cache → set_temp_root)
+    let root2 = target_tmp("orphans-startup");
+    let stale2 = untitled(&root2, GONE, Some(now - 3600));
+    let fresh2 = untitled(&root2, GONE + 2, Some(now));
+    let s = Session::default();
+    s.previews.set_temp_root(Some(root2.clone()));
+    assert!(!stale2.exists());
+    assert!(fresh2.exists());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&root2);
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_sweep_never_follows_symlinks() {
+    let root = target_tmp("orphans-link");
+    let outside = target_tmp("orphans-outside");
+    let victim = untitled(&outside, GONE, None);
+    std::os::unix::fs::symlink(&victim, root.join(format!("untitled-{GONE}-link"))).unwrap();
+    assert!(crate::previews::sweep_orphans(&root, unix_now()).is_empty());
+    assert!(victim.join("0123456789abcdef0123456789abcdef.mov").exists());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn stale_part_files_are_removed_when_the_folder_opens() {
+    let dir = target_tmp("parts");
+    let old = dir.join("0123456789abcdef0123456789abcdef.mov.part");
+    let new = dir.join("fedcba9876543210fedcba9876543210.mov.part");
+    let done = dir.join("00112233445566778899aabbccddeeff.mov");
+    for p in [&old, &new, &done] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for p in [&old, &done] {
+        std::fs::File::options().write(true).open(p).unwrap().set_modified(hour_ago).unwrap();
+    }
+    let store = crate::previews::PreviewStore::default();
+    store.set_dir(Some(dir.clone()));
+    assert!(!old.exists(), "a .part nobody wrote for an hour is left from a crash");
+    assert!(new.exists(), "a .part written moments ago may be another session's render");
+    assert!(done.exists(), "finished previews stay");
+    assert_eq!(store.count(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_untitled_folder_goes_with_the_session() {
+    let root = target_tmp("lifecycle");
+    // shutdown (File ▸ Quit, the app's exit path)
+    let (mut s, _) = session("lifecycle");
+    s.previews.set_temp_root(Some(root.clone()));
+    s.previews.reset_temp();
+    let dir = s.previews.dir().unwrap();
+    assert!(dir.starts_with(&root));
+    let v = s.execute("sequence.renderEffectsInToOut", json!({"wait": true})).unwrap();
+    job_ok(&s, &v);
+    let owner = std::fs::read_to_string(dir.join(".owner")).unwrap();
+    assert!(owner.starts_with(&format!("pid={}\nheartbeat=", std::process::id())), "{owner}");
+    s.shutdown();
+    assert!(!dir.exists(), "a clean exit deletes the unsaved project's previews");
+    // dropping the session (and its store)
+    let (s, _) = session("lifecycle-drop");
+    s.previews.set_temp_root(Some(root.clone()));
+    s.previews.reset_temp();
+    let dir = s.previews.dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    drop(s);
+    assert!(!dir.exists());
+    // leaving it for another folder (open a saved project, new project)
+    let store = crate::previews::PreviewStore::default();
+    store.set_temp_root(Some(root.clone()));
+    store.reset_temp();
+    let a = store.dir().unwrap();
+    std::fs::create_dir_all(&a).unwrap();
+    store.reset_temp();
+    assert!(!a.exists());
+    // a saved project's folder is never deleted
+    let saved = target_tmp("lifecycle-saved");
+    store.set_dir(Some(saved.clone()));
+    drop(store);
+    assert!(saved.exists());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&saved);
+}
+
+fn seg(frames: i64) -> filmcraft_render::preview::Segment {
+    filmcraft_render::preview::Segment {
+        first_frame: 0,
+        frames,
+        start: Tick::ZERO,
+        end: Tick::ZERO,
+        hash: "0".repeat(32),
+        need: filmcraft_render::preview::Need::Render,
+        cost_ms: 100.0,
+        clips: Vec::new(),
+    }
+}
+
+#[test]
+fn preview_size_estimate_uses_the_prores_rate_target() {
+    use crate::previews::{estimate_bytes, frame_bytes};
+    // ProRes 422 HQ: 900 bits per 16×16 macroblock (220 Mbit/s at 1080p29.97)
+    assert_eq!(frame_bytes(1920, 1080), 8160 * 900 / 8);
+    assert_eq!(frame_bytes(3840, 2160), 32_400 * 900 / 8);
+    assert_eq!(frame_bytes(0, 0), 0);
+    assert!(frame_bytes(u32::MAX, u32::MAX) > 0, "hostile sizes saturate");
+    // 14 minutes of 3840×2160 at 30 fps in four segments: ~92 GB
+    let segs = [seg(6300), seg(6300), seg(6300), seg(6300)];
+    let est = estimate_bytes(3840, 2160, &segs);
+    assert_eq!(est, 3_645_000 * 25_200 + 4 * 65_536);
+    assert_eq!(crate::previews::format_bytes(est), "92 GB");
+    assert_eq!(estimate_bytes(3840, 2160, &[seg(-5)]), 65_536, "hostile frame counts");
+}
+
+#[test]
+fn preview_toast_and_refusal_texts() {
+    use crate::previews::{format_bytes, refuse_reason, start_toast};
+    assert_eq!(start_toast(4, 11_000_000_000, 57.4 * 60.0), "Rendering 4 preview segments (about 11 GB, ~57 min). Cancel: × in the status bar.");
+    assert_eq!(start_toast(1, 350_000_000, 5.0), "Rendering 1 preview segment (about 350 MB, ~1 min). Cancel: × in the status bar.");
+    assert_eq!(
+        refuse_reason(4, 11_000_000_000, Some(7_900_000_000)).unwrap(),
+        "Rendering 4 segments needs about 11 GB; 7.9 GB free (FilmCraft keeps 4 GB free). Free space or render a shorter In/Out range."
+    );
+    assert!(refuse_reason(4, 11_000_000_000, Some(15_100_000_000)).is_none());
+    assert!(refuse_reason(4, 11_000_000_000, Some(14_900_000_000)).is_some(), "the 4 GB reserve counts");
+    assert!(refuse_reason(4, u64::MAX, None).is_none(), "unknown free space (web) never refuses");
+    assert_eq!(format_bytes(0), "under 1 MB");
+}
+
+#[test]
+fn render_says_what_it_will_write_and_refuses_to_fill_the_disk() {
+    let (mut s, _) = session("guard");
+    // plenty of space: a start toast and the estimate in the result
+    s.previews.set_space_probe(Some(Arc::new(|_: &std::path::Path| Some(500_000_000_000))));
+    s.drain_events();
+    let v = s.execute("sequence.renderEffectsInToOut", json!({"wait": true})).unwrap();
+    job_ok(&s, &v);
+    assert_eq!(v["estimatedBytes"], 4 * 3 * 900 / 8 * 24 + 65_536);
+    let toasts: Vec<String> =
+        s.drain_events().into_iter().filter_map(|e| if let crate::Event::Toast { message, .. } = e { Some(message) } else { None }).collect();
+    assert!(toasts.iter().any(|t| t.starts_with("Rendering 1 preview segment (about ")), "{toasts:?}");
+    s.execute("sequence.deleteRenderFiles", json!({})).unwrap();
+    // 3 GB free: under the 4 GB reserve, nothing starts
+    s.previews.set_space_probe(Some(Arc::new(|_: &std::path::Path| Some(3_000_000_000))));
+    let jobs = s.jobs.len();
+    let e = s.execute("sequence.renderEffectsInToOut", json!({"wait": true})).unwrap_err().to_string();
+    assert!(e.contains("needs about") && e.contains("3 GB free"), "{e}");
+    assert_eq!(s.jobs.len(), jobs, "no job was started");
+    assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Toast { error: true, message } if message.contains("Free space"))));
+    // the disk fills up while rendering: the job stops and leaves no partial file
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    s.previews.set_space_probe(Some(Arc::new(move |_: &std::path::Path| {
+        Some(if c.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 { 500_000_000_000 } else { 1_500_000_000 })
+    })));
+    let v = s.execute("sequence.renderInToOut", json!({"wait": true})).unwrap();
+    let id = v["job"].as_u64().unwrap();
+    let j = s.jobs.iter().find(|j| j.id == id).unwrap().to_json();
+    let err = j["result"]["error"].as_str().unwrap_or_default().to_string();
+    assert!(err.starts_with("Rendering stopped: only 1.5 GB free"), "{j}");
+    let dir = s.previews.dir().unwrap();
+    let parts = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".part")).count();
+    assert_eq!(parts, 0);
+    assert_eq!(s.previews.count(), 0);
+    let _ = std::fs::remove_dir_all(dir);
+}

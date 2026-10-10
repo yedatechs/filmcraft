@@ -41,6 +41,10 @@ thiserror = { workspace = true }
 log = { workspace = true }
 web-time = "1"
 
+# Free disk space for the render-preview guard (no std API; the web build skips the guard).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs4 = "0.13"
+
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }

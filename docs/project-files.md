@@ -240,6 +240,51 @@ the items of an open dropdown; `settings.<key>.browse`, `settings.<key>.hex`;
 `settings.cancel`, `settings.ok`. The open dialog's page and draft are `ui.settings` in `ui.inspect`;
 `ui.set {"settings": {"page": id, "values": {key: value}}}` edits the draft (OK applies it).
 
+## Render previews on disk
+
+Sequence ▸ Render Effects In to Out (Return), Render In to Out and Render Selection write one ProRes
+422 HQ QuickTime file per segment, `<content hash>.mov` (written as `<hash>.mov.part` and renamed when
+complete); Render Audio writes float WAVs. A saved project `/path/Film.fcproj` keeps them in
+`/path/FilmCraft Previews/Film/`. An unsaved project uses a per-process folder
+`untitled-<pid>-<nanos>/` under `<Media Cache>/Previews/` (`FilmCraft Previews` in the system temp
+folder when there is no data directory); its files move next to the project on the first save.
+
+**Folder lifecycle.**
+
+- The untitled folder is deleted when the session ends cleanly (File ▸ Quit, closing the window:
+  `Session::shutdown`, which first cancels running preview renders; also when the session is
+  dropped) and when the project leaves it (Save moves the files out, Open / New Project switch away).
+- While the session renders, plays previews or runs commands, it refreshes the folder's `.owner`
+  file (`pid=<pid>`, `heartbeat=<unix seconds>`) at most once every 60 s.
+- The first time a process uses a preview root (startup: the system temp root at `Session::new`,
+  the Media Cache root when the data directory loads), it deletes `untitled-*` folders left by
+  other processes: not this process's pid, heartbeat missing or older than 10 minutes, and (macOS,
+  Linux) no running FilmCraft process with that pid. Sequence ▸ Delete Render Files runs the same
+  sweep and reports the orphaned folders it removed (`{"deleted": n, "orphanedFolders": m}`).
+- Opening any preview folder (saved or unsaved) deletes `*.part` files there that were last
+  written more than 10 minutes ago and that this process is not writing.
+- Only real folders inside the preview root are removed; symlinks are never followed. Every removal
+  is logged. Settings ▸ Media Cache's size (`mediaCache.info`) counts everything under the cache,
+  orphaned folders included, and Delete… (`mediaCache.clean`) removes them too.
+
+**Free-space guard.** Before a render starts, its size is estimated from the segments' frame count
+and the ProRes encoder's rate target: `ceil(w/16) × ceil(h/16)` macroblocks × 900 bits (ProRes 422
+HQ's nominal 220 Mbit/s at 1080p29.97 spread over 8160 macroblocks) ÷ 8 bytes per frame, plus
+64 KB per file. 3840×2160 is 3.645 MB a frame, 109 MB/s at 30 fps (875 Mbit/s), so 14 minutes is
+about 92 GB; 1920×1080 is 918 KB a frame. Real files are usually smaller (static content
+compresses well below the target), so the estimate errs high. The render is refused when the
+estimate exceeds the free space minus a 4 GB reserve, with an error toast such as "Rendering 4
+segments needs about 11 GB; 7.9 GB free (FilmCraft keeps 4 GB free). Free space or render a
+shorter In/Out range." While rendering, free space is checked before every segment and every 10 s
+inside one; under 2 GB the job stops ("Rendering stopped: only 1.5 GB free on the disk…", shown as
+a toast), deleting its `.part` file. The web build has no disk to check and skips the guard.
+
+**What you see.** A render that starts says so: "Rendering 4 preview segments (about 92 GB, ~57
+min). Cancel: × in the status bar." (the time is a rough guess from the segments' playback cost
+plus the encode); the status bar shows the job with its progress and time left, and its × cancels
+it. `sequence.renderEffectsInToOut`, `sequence.renderInToOut` and `sequence.renderSelection` return
+`{"job", "segments", "frames", "estimatedBytes"}`.
+
 ## Media: offline, relinking, proxies, ingest
 
 Media is referenced by path. Each imported file also records its **identity**

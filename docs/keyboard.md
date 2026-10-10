@@ -47,6 +47,11 @@ Frame has no default key; the Premiere preset moves Shift+E to Export Frame and 
 While a dialog is open (Remove Pauses, Scenes…, Add Tracks…, the clip dialogs, Preferences…), Return
 belongs to the dialog (Apply / OK) and never fires its application shortcut, Render Effects In to Out.
 
+Return in the Timeline is Sequence ▸ Render Effects In to Out, as in Premiere. It writes ProRes
+preview files, which are large (about 6.5 GB a minute at 3840×2160 30 fps), so it first says how
+much it will write, refuses when that would leave less than 4 GB free, and stops when the disk
+falls under 2 GB; see [Render previews on disk](project-files.md#render-previews-on-disk).
+
 ## Skipped Premiere default shortcuts
 
 | Premiere command (key, scope) | Reason |

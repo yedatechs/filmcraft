@@ -521,11 +521,17 @@ impl Session {
 
     /// Clean shutdown: flush and stop the worker. Unsaved changes stay in the journal (offered on
     /// the next launch); otherwise the session's journal directory is removed.
+    /// An unsaved project's render previews (its `untitled-*` folder) are deleted: running preview
+    /// renders are cancelled first.
     pub fn shutdown(&mut self) {
         self.sync_persistence();
         if let Some(p) = self.persistence.take() {
             p.close();
         }
+        for j in self.jobs.iter().filter(|j| j.label.starts_with("Rendering ")) {
+            j.progress.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.previews.release_untitled();
     }
 
     pub fn recovery_candidates(&self) -> &[autosave::RecoveryCandidate] {
@@ -651,6 +657,8 @@ impl Session {
             self.log.push(panels::Level::Error, id, e.to_string());
         }
         self.sync_persistence();
+        // an active session keeps its untitled preview folder's owner heartbeat fresh
+        self.previews.heartbeat();
         // playback reads the newest snapshot (mixer moves, mutes… are heard while playing)
         self.previews.live.publish_project(self.project.clone());
         if r.is_ok() && spec.journal {

@@ -1307,7 +1307,12 @@ impl FilmcraftApp {
             && j.progress.finished.load(Ordering::Relaxed)
         {
             self.watched_render = None;
-            let ok = j.progress.error.lock().map(|e| e.is_none()).unwrap_or(false);
+            let err = j.progress.error.lock().map(|e| e.clone()).unwrap_or(None);
+            let ok = err.is_none();
+            // a render that stopped on its own (disk nearly full, a failed segment) says why
+            if let Some(e) = err.filter(|e| !e.contains("cancelled")) {
+                self.toast = Some((e, ui.ctx().input(|i| i.time)));
+            }
             if ok && self.ui.play_after_render && !self.playback.playing {
                 self.session.set_playhead(from);
                 self.play(1.0);

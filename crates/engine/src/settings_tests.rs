@@ -410,7 +410,7 @@ fn media_cache_location_policy_and_clean() {
     let r = s.execute("mediaCache.clean", json!({})).unwrap();
     assert_eq!(r["files"], 0);
     let r = s.execute("mediaCache.clean", json!({"all": true})).unwrap();
-    assert_eq!(r["files"], 1);
+    assert_eq!(r["files"], 2, "the preview and its folder's `.owner` heartbeat");
     s.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }

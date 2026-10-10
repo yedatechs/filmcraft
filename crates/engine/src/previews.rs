@@ -2,12 +2,29 @@
 //! Delete Render Files…) and the timeline render bar.
 //!
 //! Segments, content hashes and the yellow/red cost estimate come from
-//! [`filmcraft_render::preview`]. A rendered segment is a ProRes 422 QuickTime file named
+//! [`filmcraft_render::preview`]. A rendered segment is a ProRes 422 HQ QuickTime file named
 //! `<hash>.mov` in the project's preview cache directory:
 //!
 //! * saved project `/path/Film.fcproj` → `/path/FilmCraft Previews/Film/`;
-//! * unsaved project → a per-process folder in the system temp dir; its files move into the
-//!   project's folder on the first save.
+//! * unsaved project → a per-process folder `untitled-<pid>-<nanos>/` under the preview root
+//!   (`<Media Cache>/Previews`, or `FilmCraft Previews` in the system temp dir without a data
+//!   directory); its files move into the project's folder on the first save.
+//!
+//! **Folder lifecycle.** The untitled folder belongs to the [`PreviewStore`] that made it: it is
+//! deleted when the store leaves it (save, open, new project), when the session shuts down and
+//! when the store is dropped. While it renders or plays, the owning session refreshes the
+//! folder's `.owner` file (`pid=…`, `heartbeat=<unix seconds>`) every [`HEARTBEAT_SECS`]. The first
+//! use of a preview root in a process deletes the `untitled-*` folders other processes left
+//! behind: not this process's, heartbeat missing or older than [`ORPHAN_AFTER_SECS`], and (on Unix)
+//! no FilmCraft process with that pid. Opening any preview folder (saved or unsaved) deletes
+//! `*.part` files older than [`STALE_PART_SECS`] that this process is not writing. Only real
+//! folders inside the preview root are touched; symlinks are never followed.
+//!
+//! **Free-space guard.** Before a render starts, the output is estimated from the segments' frame
+//! count and the ProRes encoder's rate target for the sequence frame size ([`estimate_bytes`]); the
+//! render is refused when that exceeds the free space minus [`RESERVE_BYTES`]. While rendering,
+//! free space is checked before each segment and every [`SPACE_CHECK_SECS`] inside one; under
+//! [`STOP_BELOW_BYTES`] the job stops and its `.part` file is deleted. The web build skips the guard.
 //!
 //! Because files are named by content, an edit simply changes the hash of the segments it touches
 //! (their bar turns yellow/red again) while every other preview stays valid; undo brings the old
@@ -21,8 +38,9 @@ use filmcraft_audio_dsp::channels::{Layout, Mixdown};
 use filmcraft_render::audio::to_layout;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use filmcraft_frame::{AudioBuffer, VideoFrame};
 use filmcraft_media::{FrameRequest, SharedSource};
@@ -64,6 +82,32 @@ pub enum RenderMode {
     Selection,
 }
 
+/// The owning session refreshes an untitled folder's `.owner` heartbeat this often while it
+/// renders or plays.
+pub const HEARTBEAT_SECS: u64 = 60;
+/// An untitled folder of another process whose heartbeat is older than this (or missing) is orphaned.
+pub const ORPHAN_AFTER_SECS: u64 = 600;
+/// A `*.part` file not written for this long, and not by this process, is left over from a crash.
+pub const STALE_PART_SECS: u64 = 600;
+/// Free space a render must leave on the disk.
+pub const RESERVE_BYTES: u64 = 4_000_000_000;
+/// A running render stops when free space falls under this.
+pub const STOP_BELOW_BYTES: u64 = 2_000_000_000;
+/// How often a running render checks free space inside a segment.
+pub const SPACE_CHECK_SECS: u64 = 10;
+/// Rough ProRes encode cost per megapixel of a frame, in milliseconds (the start toast's time).
+const ENCODE_MS_PER_MPIXEL: f64 = 12.0;
+const OWNER_FILE: &str = ".owner";
+
+/// Bytes available on the volume holding a path (None = unknown, treated as enough). Tests
+/// install a fake one with [`PreviewStore::set_space_probe`].
+pub type SpaceProbe = Arc<dyn Fn(&Path) -> Option<u64> + Send + Sync>;
+
+/// `.part` files this process is writing (no session may delete them as stale).
+static WRITING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Preview roots already swept for orphaned folders by this process.
+static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 type Memo = (Arc<Project>, ItemId, Arc<Vec<Segment>>);
 type AudioMemo = (Arc<Project>, ItemId, Arc<Vec<AudioSegment>>);
 
@@ -85,6 +129,18 @@ pub struct PreviewStore {
     pub generation: AtomicU64,
     /// Live mixer state shared with playback: held controls, meters, newest project snapshot.
     pub live: Arc<filmcraft_render::mixer::LiveMix>,
+    /// The untitled folder this store made (deleted when the store leaves it or is dropped).
+    owned: RwLock<Option<PathBuf>>,
+    /// Unix seconds of the last `.owner` heartbeat written.
+    last_beat: AtomicU64,
+    /// Free-space probe (None = the operating system's).
+    space_probe: RwLock<Option<SpaceProbe>>,
+}
+
+impl Drop for PreviewStore {
+    fn drop(&mut self) {
+        self.release_untitled();
+    }
 }
 
 fn video_name(hash: &str) -> String {
@@ -98,17 +154,72 @@ impl PreviewStore {
     /// A store using a fresh per-process temp folder (unsaved projects).
     pub fn temp() -> Self {
         let s = Self::default();
-        s.set_dir(default_temp_dir());
+        s.set_untitled(default_temp_root());
         s
     }
 
     /// Switch to a fresh temp folder (new unsaved project).
     pub fn reset_temp(&self) {
-        let root = self.temp_root();
-        self.set_dir(match root {
-            Some(r) => Some(untitled_dir(&r)),
-            None => default_temp_dir(),
-        });
+        self.set_untitled(self.temp_root().or_else(default_temp_root));
+    }
+
+    fn set_untitled(&self, root: Option<PathBuf>) {
+        let Some(root) = root else {
+            self.set_dir(None);
+            return;
+        };
+        sweep_root_once(&root);
+        let dir = untitled_dir(&root);
+        self.set_dir(Some(dir.clone()));
+        *self.owned.write().unwrap_or_else(|e| e.into_inner()) = Some(dir);
+        self.last_beat.store(0, Ordering::Relaxed);
+    }
+
+    /// Delete the untitled folder this store made (session end). Saved projects' folders stay.
+    pub fn release_untitled(&self) {
+        let owned = self.owned.write().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(d) = owned {
+            remove_untitled(&d, "the session ended", true);
+        }
+    }
+
+    /// Install a free-space probe (tests); None restores the operating system's.
+    pub fn set_space_probe(&self, probe: Option<SpaceProbe>) {
+        *self.space_probe.write().unwrap_or_else(|e| e.into_inner()) = probe;
+    }
+
+    /// Bytes available on the volume holding `dir` (None = unknown: the web, or no answer).
+    pub fn available_space(&self, dir: &Path) -> Option<u64> {
+        let probe = self.space_probe.read().unwrap_or_else(|e| e.into_inner()).clone();
+        match probe {
+            Some(p) => p(dir),
+            None => os_available_space(dir),
+        }
+    }
+
+    /// Refresh the untitled folder's `.owner` heartbeat if [`HEARTBEAT_SECS`] have passed (cheap:
+    /// an atomic read; a small file write once a minute). Saved projects' folders have none.
+    pub fn heartbeat(&self) {
+        self.beat(false);
+    }
+
+    fn beat(&self, force: bool) {
+        let now = unix_now();
+        if !force && now.saturating_sub(self.last_beat.load(Ordering::Relaxed)) < HEARTBEAT_SECS {
+            return;
+        }
+        let Some(owned) = self.owned.read().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+        if self.dir().as_deref() != Some(owned.as_path()) || !owned.is_dir() {
+            return;
+        }
+        self.last_beat.store(now, Ordering::Relaxed);
+        let _ = std::fs::write(owned.join(OWNER_FILE), format!("pid={}\nheartbeat={now}\n", std::process::id()));
+    }
+
+    /// Delete orphaned untitled folders under the preview roots now (Delete Render Files).
+    pub fn sweep_orphans(&self) -> usize {
+        let roots: Vec<PathBuf> = self.temp_root().into_iter().chain(default_temp_root()).collect();
+        roots.iter().map(|r| sweep_orphans(r, unix_now()).len()).sum()
     }
 
     /// The folder unsaved projects' previews go into (None = the system temp dir).
@@ -117,6 +228,9 @@ impl PreviewStore {
     }
 
     pub fn set_temp_root(&self, root: Option<PathBuf>) {
+        if let Some(r) = &root {
+            sweep_root_once(r);
+        }
         *self.temp_root.write().unwrap_or_else(|e| e.into_inner()) = root;
     }
 
@@ -138,6 +252,17 @@ impl PreviewStore {
                     files.insert(name);
                 }
             }
+        }
+        if let Some(d) = &dir {
+            sweep_parts(d, SystemTime::now());
+        }
+        // leaving the untitled folder this store made: its previews are gone (or moved) for good
+        let left = {
+            let mut owned = self.owned.write().unwrap_or_else(|e| e.into_inner());
+            if owned.is_some() && owned.as_deref() != dir.as_deref() { owned.take() } else { None }
+        };
+        if let Some(old) = left {
+            remove_untitled(&old, "the project left it", false);
         }
         *self.dir.write().unwrap_or_else(|e| e.into_inner()) = dir;
         *self.files.write().unwrap_or_else(|e| e.into_inner()) = files;
@@ -370,6 +495,8 @@ impl PreviewStore {
         if self.files.read().unwrap_or_else(|e| e.into_inner()).is_empty() {
             return None;
         }
+        // playing previews keeps the folder's owner heartbeat fresh
+        self.heartbeat();
         let segs = self.segments(project, seq);
         let seg = segment_at(&segs, frame)?;
         if !self.has(&seg.hash) {
@@ -406,11 +533,219 @@ fn is_hash(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn default_temp_dir() -> Option<PathBuf> {
+/// The preview root without a media cache: `FilmCraft Previews` in the system temp dir.
+fn default_temp_root() -> Option<PathBuf> {
     if cfg!(target_arch = "wasm32") {
         return None;
     }
-    Some(untitled_dir(&crate::temp_dir().join("FilmCraft Previews")))
+    Some(crate::temp_dir().join("FilmCraft Previews"))
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn os_available_space(dir: &Path) -> Option<u64> {
+    // the folder may not exist yet: ask about its nearest existing ancestor
+    let mut d = dir;
+    loop {
+        if d.exists() {
+            return fs4::available_space(d).ok();
+        }
+        d = d.parent()?;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn os_available_space(_: &Path) -> Option<u64> {
+    None
+}
+
+/// The pid in an untitled folder name `untitled-<pid>-<nanos>`.
+fn untitled_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("untitled-")?.split('-').next()?.parse().ok()
+}
+
+/// (pid, heartbeat) from a folder's `.owner` file.
+fn read_owner(dir: &Path) -> (Option<u32>, Option<u64>) {
+    let Ok(text) = std::fs::read_to_string(dir.join(OWNER_FILE)) else { return (None, None) };
+    let field = |k: &str| text.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=').map(str::trim));
+    (field("pid").and_then(|v| v.parse().ok()), field("heartbeat").and_then(|v| v.parse().ok()))
+}
+
+/// Whether a FilmCraft process with this pid is running (Unix: `ps`; elsewhere unknown = false,
+/// so only the heartbeat decides).
+fn filmcraft_running(pid: u32) -> bool {
+    if !cfg!(unix) || cfg!(target_arch = "wasm32") {
+        return false;
+    }
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("filmcraft"))
+}
+
+/// Whether `dir` is a real directory (not a symlink).
+fn real_dir(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir())
+}
+
+/// Delete an untitled folder; unless `force`, not while this process writes a preview into it.
+fn remove_untitled(dir: &Path, why: &str, force: bool) {
+    let busy = !force && WRITING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.starts_with(dir));
+    if busy || !real_dir(dir) || !dir.file_name().is_some_and(|n| n.to_string_lossy().starts_with("untitled-")) {
+        return;
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => log::info!("render previews: removed {} ({why})", dir.display()),
+        Err(e) => log::info!("render previews: could not remove {}: {e}", dir.display()),
+    }
+}
+
+/// [`sweep_orphans`] the first time this process uses `root`.
+fn sweep_root_once(root: &Path) {
+    {
+        let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if swept.iter().any(|r| r == root) {
+            return;
+        }
+        swept.push(root.to_path_buf());
+    }
+    sweep_orphans(root, unix_now());
+}
+
+/// Delete the `untitled-<pid>-*` folders under `root` that other processes left behind: not this
+/// process's, heartbeat missing or older than [`ORPHAN_AFTER_SECS`] at `now` (unix seconds), and no
+/// FilmCraft process with that pid running. Returns the folders removed.
+pub fn sweep_orphans(root: &Path, now: u64) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    let me = std::process::id();
+    for e in rd.flatten() {
+        // file_type() does not follow symlinks: a linked folder is never entered or removed
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(name_pid) = untitled_pid(&name) else { continue };
+        let dir = e.path();
+        let (pid, beat) = read_owner(&dir);
+        let pid = pid.unwrap_or(name_pid);
+        if pid == me || name_pid == me {
+            continue;
+        }
+        if beat.is_some_and(|b| now.saturating_sub(b) <= ORPHAN_AFTER_SECS) || filmcraft_running(pid) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {
+                log::info!("render previews: removed orphaned folder {} (process {pid} is gone)", dir.display());
+                out.push(dir);
+            }
+            Err(err) => log::info!("render previews: could not remove orphaned folder {}: {err}", dir.display()),
+        }
+    }
+    out
+}
+
+/// Delete `*.part` files under `dir` last written before `now - STALE_PART_SECS` that this process
+/// is not writing (left by a crash or a shutdown mid-render). Returns the files removed.
+pub fn sweep_parts(dir: &Path, now: SystemTime) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let writing = WRITING.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut stack = vec![(dir.to_path_buf(), 0u32)];
+    while let Some((d, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            let path = e.path();
+            if t.is_dir() {
+                if depth < 4 {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if !t.is_file() || !e.file_name().to_string_lossy().ends_with(".part") || writing.contains(&path) {
+                continue;
+            }
+            let Ok(modified) = e.metadata().and_then(|m| m.modified()) else { continue };
+            if now.duration_since(modified).is_ok_and(|age| age > Duration::from_secs(STALE_PART_SECS)) && std::fs::remove_file(&path).is_ok() {
+                log::info!("render previews: removed stale partial file {}", path.display());
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// The bytes the ProRes encoder targets for one `width`×`height` preview frame: its per-macroblock
+/// budget (`Profile::nominal_bits_per_mb` of the export default profile the previews use, HQ)
+/// times the frame's 16×16 macroblocks, as `filmcraft_prores::Encoder::target_frame_bytes` does.
+pub fn frame_bytes(width: u32, height: u32) -> u64 {
+    let profile = filmcraft_export::prores_profile(&filmcraft_export::ExportSettings::default().prores_profile);
+    let mbs = u64::from(width).div_ceil(16).saturating_mul(u64::from(height).div_ceil(16));
+    mbs.saturating_mul(u64::from(profile.nominal_bits_per_mb())) / 8
+}
+
+/// Estimated size of the preview files for `segments` of a `width`×`height` sequence.
+pub fn estimate_bytes(width: u32, height: u32, segments: &[Segment]) -> u64 {
+    // ~64 KB of QuickTime header and sample tables per file
+    segments.iter().fold(0u64, |a, g| a.saturating_add(frame_bytes(width, height).saturating_mul(g.frames.max(0) as u64)).saturating_add(65_536))
+}
+
+/// Rough render time for `segments`: their playback cost plus the ProRes encode, in seconds.
+pub fn estimate_seconds(width: u32, height: u32, segments: &[Segment]) -> f64 {
+    let encode = ENCODE_MS_PER_MPIXEL * f64::from(width) * f64::from(height) / 1e6;
+    segments.iter().map(|g| g.frames.max(0) as f64 * (g.cost_ms.max(0.0) + encode)).sum::<f64>() / 1000.0
+}
+
+/// "11 GB", "7.9 GB", "350 MB" (decimal units, as Finder and Explorer's drive bars show them).
+pub fn format_bytes(b: u64) -> String {
+    let gb = b as f64 / 1e9;
+    if gb >= 9.95 {
+        format!("{gb:.0} GB")
+    } else if gb >= 1.0 {
+        let t = format!("{gb:.1}");
+        format!("{} GB", t.strip_suffix(".0").unwrap_or(&t))
+    } else if b >= 1_000_000 {
+        format!("{:.0} MB", b as f64 / 1e6)
+    } else {
+        "under 1 MB".into()
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// The toast shown when a preview render starts.
+pub fn start_toast(segments: usize, bytes: u64, seconds: f64) -> String {
+    let min = (seconds / 60.0).round().max(1.0);
+    format!("Rendering {segments} preview segment{} (about {}, ~{min:.0} min). Cancel: × in the status bar.", plural(segments), format_bytes(bytes))
+}
+
+/// Why a render of `segments` needing `bytes` may not start with `free` bytes available (None = it may).
+pub fn refuse_reason(segments: usize, bytes: u64, free: Option<u64>) -> Option<String> {
+    let free = free?;
+    (bytes > free.saturating_sub(RESERVE_BYTES)).then(|| {
+        format!(
+            "Rendering {segments} segment{} needs about {}; {} free (FilmCraft keeps {} free). Free space or render a shorter In/Out range.",
+            plural(segments),
+            format_bytes(bytes),
+            format_bytes(free),
+            format_bytes(RESERVE_BYTES)
+        )
+    })
+}
+
+/// The message a render stops with when free space falls under [`STOP_BELOW_BYTES`].
+pub fn low_space_message(free: u64) -> String {
+    format!(
+        "Rendering stopped: only {} free on the disk (renders stop under {}). Free space or render a shorter In/Out range.",
+        format_bytes(free),
+        format_bytes(STOP_BELOW_BYTES)
+    )
 }
 
 /// A fresh per-process folder for an unsaved project's previews under `root`.
@@ -461,14 +796,23 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
         .collect();
     if todo.is_empty() {
         s.toast("Nothing to render: previews are up to date");
-        return Ok(json!({"job": null, "segments": 0}));
+        return Ok(json!({"job": null, "segments": 0, "estimatedBytes": 0}));
     }
+    let (w, h) = s.project.sequence(seq).map(|q| (q.settings.width, q.settings.height)).unwrap_or((0, 0));
+    let estimate = estimate_bytes(w, h, &todo);
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("preview folder {}: {e}", dir.display())))?;
+    store.beat(true);
+    if let Some(why) = refuse_reason(todo.len(), estimate, store.available_space(&dir)) {
+        // the command's error goes to the Events panel; the toast tells the user right away
+        s.events.push(crate::Event::Toast { message: why.clone(), error: true });
+        return Err(EngineError::Other(why));
+    }
+    s.toast(start_toast(todo.len(), estimate, estimate_seconds(w, h, &todo)));
     let frames: i64 = todo.iter().map(|g| g.frames).sum();
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let job = crate::Job {
         id,
-        label: format!("Rendering {} preview segment{}", todo.len(), if todo.len() == 1 { "" } else { "s" }),
+        label: format!("Rendering {} preview segment{}", todo.len(), plural(todo.len())),
         progress: Default::default(),
         result: Default::default(),
     };
@@ -489,6 +833,11 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
                 outcome = Err("cancelled".into());
                 break;
             }
+            store.heartbeat();
+            if let Some(free) = store.available_space(&dir).filter(|f| *f < STOP_BELOW_BYTES) {
+                outcome = Err(low_space_message(free));
+                break;
+            }
             *prog.status.lock().unwrap_or_else(|e| e.into_inner()) = format!("Rendering segment {} of {nseg}", k + 1);
             let part = dir.join(format!("{}.mov.part", g.hash));
             let settings = filmcraft_export::ExportSettings {
@@ -506,7 +855,15 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
                 sdr: true,
                 ..Default::default()
             };
-            match filmcraft_export::export(&project, seq, &settings, &provider, &prog) {
+            WRITING.lock().unwrap_or_else(|e| e.into_inner()).push(part.clone());
+            let (exported, low) = export_watched(&store, &dir, &prog, || filmcraft_export::export(&project, seq, &settings, &provider, &prog));
+            WRITING.lock().unwrap_or_else(|e| e.into_inner()).retain(|p| p != &part);
+            if let Some(free) = low {
+                let _ = std::fs::remove_file(&part);
+                outcome = Err(low_space_message(free));
+                break;
+            }
+            match exported {
                 Ok(r) => {
                     bytes += r.bytes;
                     done_frames += r.frames;
@@ -551,7 +908,41 @@ pub fn render(s: &mut Session, mode: RenderMode, p: &Value) -> Result<Value> {
     } else {
         std::thread::Builder::new().name("filmcraft-render-previews".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
     }
-    Ok(json!({"job": id, "segments": nseg, "frames": frames}))
+    Ok(json!({"job": id, "segments": nseg, "frames": frames, "estimatedBytes": estimate}))
+}
+
+/// Run one segment's export while a watchdog thread checks free space every [`SPACE_CHECK_SECS`]
+/// and keeps the folder's heartbeat fresh. Free space under [`STOP_BELOW_BYTES`] cancels the
+/// export; the second value is then the free space seen. Without threads (web) it just exports.
+fn export_watched<T>(store: &PreviewStore, dir: &Path, prog: &filmcraft_export::Progress, export: impl FnOnce() -> T) -> (T, Option<u64>) {
+    let stop = AtomicBool::new(false);
+    let low = AtomicU64::new(u64::MAX);
+    let out = std::thread::scope(|sc| {
+        let watchdog = std::thread::Builder::new().name("filmcraft-render-space".into()).spawn_scoped(sc, || {
+            let mut last = std::time::Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                if last.elapsed() < Duration::from_secs(SPACE_CHECK_SECS) {
+                    continue;
+                }
+                last = std::time::Instant::now();
+                store.heartbeat();
+                if let Some(free) = store.available_space(dir).filter(|f| *f < STOP_BELOW_BYTES) {
+                    low.store(free, Ordering::Relaxed);
+                    prog.cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+        let out = export();
+        stop.store(true, Ordering::Relaxed);
+        if let Ok(h) = watchdog {
+            let _ = h.join();
+        }
+        out
+    });
+    let low = low.load(Ordering::Relaxed);
+    (out, (low != u64::MAX).then_some(low))
 }
 
 /// Render Audio: mix the audio segments in In/Out (or the whole sequence) to float WAV previews.
@@ -572,6 +963,7 @@ pub fn render_audio(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!({"job": null, "segments": 0}));
     }
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("preview folder {}: {e}", dir.display())))?;
+    store.beat(true);
     let total: i64 = todo.iter().map(|g| g.samples).sum();
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let job = crate::Job { id, label: "Rendering audio previews".into(), progress: Default::default(), result: Default::default() };
@@ -586,6 +978,7 @@ pub fn render_audio(s: &mut Session, p: &Value) -> Result<Value> {
         let mut outcome: std::result::Result<(), String> = Ok(());
         let Some(q) = project.sequence(seq) else { return };
         'segs: for g in &todo {
+            store.heartbeat();
             let mut inter = Vec::with_capacity(g.samples as usize * 2);
             let mut pos = g.first_sample;
             while pos < g.first_sample + g.samples {
@@ -697,8 +1090,11 @@ pub fn delete(s: &mut Session, in_to_out: bool) -> Result<Value> {
     } else {
         s.previews.delete(None)
     };
-    s.toast(format!("Deleted {n} render file{}", if n == 1 { "" } else { "s" }));
-    Ok(json!({"deleted": n}))
+    // Delete Render Files also clears what crashed or killed sessions left in the preview roots
+    let orphans = if in_to_out { 0 } else { s.previews.sweep_orphans() };
+    let extra = if orphans > 0 { format!(" and {orphans} orphaned preview folder{}", plural(orphans)) } else { String::new() };
+    s.toast(format!("Deleted {n} render file{}{extra}", plural(n)));
+    Ok(json!({"deleted": n, "orphanedFolders": orphans}))
 }
 
 /// The render bar of the active sequence as JSON (for agents and tests).
