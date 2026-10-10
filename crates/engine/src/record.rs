@@ -80,6 +80,7 @@ impl RecordClock {
     pub fn shifted(&self, ns: u64) -> Self {
         let start = self.start.checked_add(std::time::Duration::from_nanos(ns)).unwrap_or(self.start);
         Self { start, unix_ns: self.unix_ns.saturating_add(ns) }
+    }
 
     /// Nanoseconds from `earlier`'s start to this clock's start (0 when this one started first): a
     /// frame stamped `t` on `earlier` is at `t - ns_after(earlier)` on this clock (a camera
@@ -816,6 +817,8 @@ struct VideoSource {
     device_name: String,
     /// Flip the clip horizontally in the sequence (a camera seen as in a mirror).
     mirror: bool,
+    /// Turn the clip clockwise by this many degrees (cameras).
+    rotate: u32,
     /// The part of the display recorded (screens; sidecar `area`).
     area: Option<[u32; 4]>,
     input: Box<dyn VideoInput>,
@@ -1540,6 +1543,8 @@ struct CameraPlan {
     device: String,
     req: VideoRequest,
     mirror: bool,
+    /// Turn the clip clockwise by this many degrees (0 / 90 / 180 / 270).
+    rotate: u32,
 }
 
 struct Plan {
@@ -1611,6 +1616,7 @@ fn plan(s: &Session, p: &Value) -> Result<Plan> {
             return Err(bad(cmd, format!("the camera `{device}` is chosen twice")));
         }
         let mirror = bool_of(v, "mirror", cmd, rs.camera_mirror)?;
+        let rotate = crate::record_settings::rotate_of(v, cmd, rs.camera_rotate)?;
         let quality = choice_of(v, "quality", cmd, crate::record_settings::CAMERA_QUALITY, &rs.camera_quality)?;
         let (width, height) = (size_of(v, "width", cmd)?, size_of(v, "height", cmd)?);
         let (width, height) = match (width, height) {
@@ -1618,7 +1624,7 @@ fn plan(s: &Session, p: &Value) -> Result<Plan> {
             wh => wh,
         };
         let req = VideoRequest { width, height, fps: fps_of(v, cmd, rs.camera_fps)?, max_height: None, show_cursor: false, area: None };
-        cameras.push(CameraPlan { device, req, mirror });
+        cameras.push(CameraPlan { device, req, mirror, rotate });
     }
     let mut mics: Vec<String> = Vec::new();
     for v in list_p(p, "mics", "mic", cmd)? {
@@ -1683,6 +1689,7 @@ struct VideoSetup {
     device_id: String,
     device_name: String,
     mirror: bool,
+    rotate: u32,
     enc: CaptureEncoding,
 }
 
@@ -1727,7 +1734,7 @@ fn start_video(
     stop_ns: &Arc<AtomicU64>,
     origin: &Arc<AtomicU64>,
 ) -> std::result::Result<VideoSource, String> {
-    let VideoSetup { src, req, path, device_id, device_name, mirror, enc } = setup;
+    let VideoSetup { src, req, path, device_id, device_name, mirror, rotate, enc } = setup;
     let queue = Arc::new(FrameQueue::new(4));
     let stats = Arc::new(SourceStats::default());
     let (q, st, o) = (queue.clone(), stats.clone(), origin.clone());
@@ -1777,7 +1784,7 @@ fn start_video(
             return Err(e);
         }
     };
-    Ok(VideoSource { src, notes, device_id, device_name, mirror, area: req.area, input, queue, stats, worker: Some(worker), path })
+    Ok(VideoSource { src, notes, device_id, device_name, mirror, rotate, area: req.area, input, queue, stats, worker: Some(worker), path })
 }
 
 /// Ask a screen input for its system audio, into `path`; None when it cannot (the start goes on
@@ -2179,6 +2186,7 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
                 device_id: id,
                 device_name: screen_name.clone().unwrap_or_default(),
                 mirror: false,
+                rotate: 0,
                 enc,
             };
             let input = f.open_screen(&sp.target).map_err(|e| EngineError::Other(format!("screen: {e}")))?;
@@ -2196,6 +2204,7 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
             device_id: c.device.clone(),
             device_name: cname.clone(),
             mirror: c.mirror,
+            rotate: c.rotate,
             enc,
         };
         let input = crate::record_preview::camera_input(&mut s.record, &f, &c.device).map_err(|e| EngineError::Other(format!("{}: {e}", src.key())))?;
@@ -2440,6 +2449,7 @@ struct Done {
     device_id: String,
     device_name: String,
     mirror: bool,
+    rotate: u32,
     area: Option<[u32; 4]>,
     first_ns: u64,
     last_ns: u64,
@@ -2505,6 +2515,13 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
             if d.mirror {
                 o.insert("mirror_note".into(), json!("the file is as the camera saw it; the clip has a Horizontal Flip effect"));
             }
+            o.insert("rotate".into(), json!(d.rotate));
+            if d.rotate != 0 {
+                o.insert(
+                    "rotate_note".into(),
+                    json!(format!("the file is as the camera saw it; the clip's Motion turns it {}° and scales it to fit", d.rotate)),
+                );
+            }
         }
     }
     let bytes = serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?;
@@ -2537,6 +2554,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_id: v.device_id.clone(),
             device_name: v.device_name.clone(),
             mirror: v.mirror,
+            rotate: v.rotate,
             area: v.area,
             first_ns: v.stats.first().unwrap_or(0),
             last_ns: v.stats.last().unwrap_or(0),
@@ -2563,6 +2581,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_id: m.device.clone(),
             device_name: m.device.clone(),
             mirror: false,
+            rotate: 0,
             area: None,
             first_ns: m.stats.first().unwrap_or(0),
             last_ns: m.stats.last().unwrap_or(0),
@@ -2586,6 +2605,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_id: "system".into(),
             device_name: "System Audio".into(),
             mirror: false,
+            rotate: 0,
             area: None,
             first_ns: sa.stats.first().unwrap_or(0),
             last_ns: sa.stats.last().unwrap_or(0),
@@ -2752,6 +2772,11 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f6
     let lead = videos.first().or(audios.first()).and_then(|k| item(*k));
     let info = |it: Option<ItemId>| it.and_then(|i| s.project.item(i)).and_then(|i| i.as_media()).map(|m| m.info.clone());
     let mut settings = info(lead).map(|i| crate::commands::default_seq_settings_for(&i)).unwrap_or_default();
+    // a camera turned on its side leads (no screen): the sequence stands upright like it
+    let rotation = |k: Src| done.iter().find(|d| d.src == k).map_or(0, |d| d.rotate);
+    if videos.first().is_some_and(|k| rotation(*k) % 180 == 90) {
+        std::mem::swap(&mut settings.width, &mut settings.height);
+    }
     if let Some(a) = info(audios.first().and_then(|k| item(*k))).and_then(|i| i.audio) {
         settings.sample_rate = a.sample_rate.max(8000);
     }
@@ -2788,6 +2813,8 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f6
                 {
                     ti.effects.insert(0, flip);
                 }
+                let size = pr.resolve_media(it).and_then(|(_, m, _)| m.info.video.as_ref().map(|v| (v.width, v.height)));
+                crate::record_preview::rotate_clip(&mut ti, rotation(*k), size, (settings.width, settings.height));
                 clips.push((*k, ti.id, ti.start));
                 v_items.push(ti);
             }
@@ -2888,7 +2915,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec(
             "record.start",
             "Start Recording",
-            r#"{"screen":{"display":id,"area":[x,y,w,h]?}|{"window":id},"fps":n?,"resolution":"native|1440p|1080p|720p"?,"cursor":bool?,"systemAudio":bool?}?,"cameras":[{"device":id,"quality":"720p|1080p|4k|native"?,"width":n?,"height":n?,"fps":n?,"mirror":bool?}]?,"camera":{..}?,"mics":[{"device":str?}]?,"mic":{..}?,"name":str?,"dir":str?,"countdown":0..10?,"settings":RecordingSettings?}"#,
+            r#"{"screen":{"display":id,"area":[x,y,w,h]?}|{"window":id},"fps":n?,"resolution":"native|1440p|1080p|720p"?,"cursor":bool?,"systemAudio":bool?}?,"cameras":[{"device":id,"quality":"720p|1080p|4k|native"?,"width":n?,"height":n?,"fps":n?,"mirror":bool?,"rotate":0|90|180|270?}]?,"camera":{..}?,"mics":[{"device":str?}]?,"mic":{..}?,"name":str?,"dir":str?,"countdown":0..10?,"settings":RecordingSettings?}"#,
             can_start,
             start,
             true,

@@ -263,3 +263,78 @@ fn record_an_area_of_the_display() {
     assert_eq!((fr.w, fr.h, fr.pixels), (1280.0, 720.0, (1280, 720)));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn record_preview_rotate_turns_the_picture_clockwise() {
+    // 3 × 2: pixel (x, y) has red = 10·x + y
+    let rgba: Vec<u8> = (0..2).flat_map(|y| (0..3).flat_map(move |x| [10 * x + y, 0, 0, 255])).collect();
+    let f = PreviewFrame { width: 3, height: 2, rgba, time_ns: 0, index: 1 };
+    let px = |f: &PreviewFrame, x: usize, y: usize| f.rgba[(y * f.width as usize + x) * 4];
+    // 90° clockwise: 2 × 3, the bottom-left source pixel at the top left, the top left at the top right
+    let r = oriented(&f, false, 90);
+    assert_eq!((r.width, r.height), (2, 3));
+    assert_eq!((px(&r, 0, 0), px(&r, 1, 0), px(&r, 1, 2), px(&r, 0, 2)), (1, 0, 20, 21));
+    let r = oriented(&f, false, 180);
+    assert_eq!((r.width, r.height, px(&r, 0, 0), px(&r, 2, 1)), (3, 2, 21, 0));
+    let r = oriented(&f, false, 270);
+    assert_eq!((r.width, r.height, px(&r, 0, 0), px(&r, 1, 2)), (2, 3, 20, 1));
+    // mirrored, then turned (the clip: Horizontal Flip first, then Motion)
+    let r = oriented(&f, true, 90);
+    assert_eq!((px(&r, 0, 0), px(&r, 1, 0)), (21, 20));
+    assert_eq!(oriented(&f, false, 45), f, "not a quarter turn: as it is");
+    // on the synthetic camera: the burnt-in index row ends up in the right-hand column
+    let (mut s, _) = session((320, 180));
+    s.execute("record.preview", json!({"camera": {"device": SyntheticFactory::CAMERA, "width": 320, "height": 180}})).unwrap();
+    let fr = wait_frame(&s, SyntheticFactory::CAMERA, 3);
+    let r = oriented(&fr, false, 90);
+    assert_eq!((r.width, r.height), (180, 320));
+    // turn it back by reading the columns: the top row of the source is the last column
+    let back: Vec<u8> = (0..fr.height as usize)
+        .flat_map(|y| (0..fr.width as usize).map(move |x| (x, y)))
+        .map(|(x, y)| r.rgba[(x * r.width as usize + (r.width as usize - 1 - y)) * 4])
+        .collect();
+    assert_eq!(read_synthetic_index(&back, fr.width, fr.height).map(|i| i + 1), Some(fr.index));
+}
+
+#[test]
+fn record_a_rotated_camera_turns_and_fits_its_clip() {
+    use crate::record::SyntheticFactory as F;
+    let dir = tmp("rotate");
+    let (mut s, _) = session((320, 180));
+    for bad in [json!(45), json!(-90), json!("90"), json!(360)] {
+        let p = json!({"camera": {"device": F::CAMERA, "rotate": bad}, "dir": dir.to_string_lossy()});
+        assert!(s.execute("record.start", p.clone()).is_err(), "{p}");
+    }
+    // with the screen leading: the 16:9 camera turned 90° is fitted inside the 16:9 frame
+    s.execute(
+        "record.start",
+        json!({"screen": {"display": F::DISPLAY}, "camera": {"device": F::CAMERA, "width": 320, "height": 180, "rotate": 90}, "dir": dir.to_string_lossy()}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height), (320, 180));
+    let id = filmcraft_project::ClipId(v["clips"]["camera"]["clip"].as_u64().unwrap());
+    let cam = q.find_item(id).unwrap().1.clone();
+    let m = cam.effect("motion").unwrap();
+    assert_eq!(m.f64_at("rotation", Tick::ZERO), 90.0);
+    assert_eq!(m.f64_at("scale", Tick::ZERO), 56.25);
+    let file = v["files"][1].as_str().unwrap();
+    let side: serde_json::Value = serde_json::from_slice(&std::fs::read(file.replace(".mov", ".recording.json")).unwrap()).unwrap();
+    assert_eq!(side["rotate"], 90, "{side}");
+    assert_eq!((side["width"].as_u64(), side["height"].as_u64()), (Some(320), Some(180)), "the file stays as captured");
+    // the camera alone, turned: an upright sequence it fills (100 %); the setting is the default
+    s.execute("record.settings", json!({"set": {"cameraRotate": 270}})).unwrap();
+    assert!(s.execute("record.settings", json!({"set": {"cameraRotate": 45}})).is_err());
+    s.execute("record.start", json!({"camera": {"device": F::CAMERA, "width": 320, "height": 180}, "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height), (180, 320));
+    let id = filmcraft_project::ClipId(v["clips"]["camera"]["clip"].as_u64().unwrap());
+    let m = q.find_item(id).unwrap().1.effect("motion").unwrap().clone();
+    assert_eq!((m.f64_at("rotation", Tick::ZERO), m.f64_at("scale", Tick::ZERO)), (270.0, 100.0));
+    std::fs::remove_dir_all(&dir).ok();
+}

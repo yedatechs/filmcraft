@@ -1009,6 +1009,7 @@ static CATEGORIES: &[Category] = &[
                     f("recording.cameraQuality", "Quality", Kind::Choice(rs::CAMERA_QUALITY), true),
                     f("recording.cameraFps", "Frame rate", Kind::Choice(rs::CAMERA_FPS), true),
                     b("recording.cameraMirror", "Mirror", true),
+                    f("recording.cameraRotate", "Rotate", Kind::Choice(rs::CAMERA_ROTATE), true),
                 ],
             ),
             Row::Group(

@@ -522,3 +522,30 @@ fn the_border_frames_the_screen_follows_the_recording_and_an_area_can_be_drawn()
     assert!(overlay(&mut d).is_null());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn rotate_turns_the_camera_preview_and_lands_on_the_clip() {
+    let dir = tmp("rotate");
+    let mut d = Driver::new(&dir);
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.ok("ui.set", json!({"record": {"screen": "", "cameras": [{"device": "synthetic:camera", "quality": "native"}], "mics": []}}));
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("320×180"));
+    d.click("record.panel.camera.1.rotate");
+    d.click("record.panel.camera.1.rotate.1"); // 0°, 90°, 180°, 270°
+    assert_eq!(d.harness.state().ui.record.cameras[0].rotate, 90);
+    // the preview stands upright like the clip will
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("180×320"));
+    d.click("record.panel.record");
+    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    d.run_for(0.6);
+    d.click("record.panel.record");
+    let s = &d.harness.state().session;
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height), (180, 320), "the turned camera alone: an upright sequence");
+    let m = q.video_tracks[0].items[0].effect("motion").unwrap();
+    assert_eq!(m.f64_at("rotation", filmcraft_engine::time::Tick::ZERO), 90.0);
+    // the Settings section has the default for new rows
+    d.click("record.panel.settings");
+    assert!(d.element("record.panel.settings.cameraRotate").is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}

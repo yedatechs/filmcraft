@@ -139,7 +139,7 @@ fn paint(ui: &egui::Ui, slot: &mut Option<Tex>, name: &str, tap: &CameraTap, ori
 
 /// How a row's picture is shown: (Mirror, Rotate degrees), like its clip will be.
 fn orient_of(c: &CameraRow) -> (bool, u32) {
-    (c.mirror, 0)
+    (c.mirror, c.rotate)
 }
 
 /// The cameras the panel wants live: the rows with a camera while the panel is open or a

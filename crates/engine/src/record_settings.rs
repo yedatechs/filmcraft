@@ -13,6 +13,7 @@ pub const SCREEN_FPS: &[(&str, &str)] = &[("15", "15 fps"), ("24", "24 fps"), ("
 pub const SCREEN_RESOLUTION: &[(&str, &str)] = &[("native", "Native"), ("1440p", "1440p"), ("1080p", "1080p"), ("720p", "720p")];
 pub const CAMERA_QUALITY: &[(&str, &str)] = &[("720p", "720p"), ("1080p", "1080p"), ("4k", "4K"), ("native", "Native (the camera's best)")];
 pub const CAMERA_FPS: &[(&str, &str)] = &[("24", "24 fps"), ("30", "30 fps"), ("60", "60 fps")];
+pub const CAMERA_ROTATE: &[(&str, &str)] = &[("0", "0°"), ("90", "90° clockwise"), ("180", "180°"), ("270", "90° counter-clockwise (270°)")];
 pub const CODECS: &[(&str, &str)] = &[("h264", "H.264"), ("hevc", "HEVC (H.265, hardware only)"), ("prores", "Apple ProRes 422 (large, edit-friendly)")];
 pub const QUALITIES: &[(&str, &str)] = &[("low", "Low"), ("medium", "Medium"), ("high", "High"), ("max", "Max")];
 pub const KEYFRAMES: &[(&str, &str)] = &[("1", "1 s"), ("2", "2 s (scrubs best in an editor)"), ("4", "4 s")];
@@ -41,6 +42,9 @@ pub struct RecordingSettings {
     /// 24 / 30 / 60.
     pub camera_fps: u32,
     pub camera_mirror: bool,
+    /// Turn new camera rows' clips clockwise: 0 / 90 / 180 / 270 degrees (the file stays as
+    /// captured; the clip's Motion turns it).
+    pub camera_rotate: u32,
     // Encoding
     /// `h264` / `hevc` / `prores`.
     pub codec: String,
@@ -81,6 +85,7 @@ impl Default for RecordingSettings {
             camera_quality: "1080p".into(),
             camera_fps: 30,
             camera_mirror: false,
+            camera_rotate: 0,
             codec: "h264".into(),
             quality: "high".into(),
             keyframe_seconds: 2,
@@ -108,6 +113,7 @@ impl RecordingSettings {
         let num = |opts: &[(&str, &str)], v: u32, def: u32| if is_choice(opts, &v.to_string()) { v } else { def };
         self.screen_fps = num(SCREEN_FPS, self.screen_fps, d.screen_fps);
         self.camera_fps = num(CAMERA_FPS, self.camera_fps, d.camera_fps);
+        self.camera_rotate = num(CAMERA_ROTATE, self.camera_rotate, d.camera_rotate);
         self.keyframe_seconds = num(KEYFRAMES, self.keyframe_seconds, d.keyframe_seconds);
         self.sample_rate = num(SAMPLE_RATES, self.sample_rate, d.sample_rate);
         self.countdown_seconds = num(COUNTDOWNS, self.countdown_seconds, d.countdown_seconds);
@@ -183,6 +189,17 @@ pub fn downscale(native: (u32, u32), height: u32) -> Option<(u32, u32)> {
     Some((nw.max(16), height.clamp(16, 8192) & !1))
 }
 
+/// A camera's `rotate` parameter: 0 / 90 / 180 / 270 (absent: `default`).
+pub fn rotate_of(v: &Value, key_owner_cmd: &str, default: u32) -> Result<u32> {
+    match v.get("rotate").filter(|x| !x.is_null()) {
+        None => Ok(default),
+        Some(x) => match x.as_u64() {
+            Some(r @ (0 | 90 | 180 | 270)) => Ok(r as u32),
+            _ => Err(bad(key_owner_cmd, format!("`rotate` must be 0, 90, 180 or 270, got {x}"))),
+        },
+    }
+}
+
 /// The size asked of a camera for a quality choice (None = the camera's best).
 pub fn camera_size(q: &str) -> Option<(u32, u32)> {
     match q {
@@ -245,6 +262,7 @@ pub fn check(r: &RecordingSettings) -> std::result::Result<(), String> {
     choice("screenResolution", SCREEN_RESOLUTION, &r.screen_resolution)?;
     choice("cameraQuality", CAMERA_QUALITY, &r.camera_quality)?;
     choice("cameraFps", CAMERA_FPS, &r.camera_fps.to_string())?;
+    choice("cameraRotate", CAMERA_ROTATE, &r.camera_rotate.to_string())?;
     choice("codec", CODECS, &r.codec)?;
     choice("quality", QUALITIES, &r.quality)?;
     choice("keyframeSeconds", KEYFRAMES, &r.keyframe_seconds.to_string())?;
