@@ -279,18 +279,20 @@ impl VideoInputFactory for UnavailableFactory {
 // ------------------------------------------------------------------------------------- synthetic
 
 /// Deterministic screen and camera sources for headless sessions and tests: one display, one
-/// window, one camera. `*_delay_ms` makes a source start late (clock skew in tests).
+/// window, two cameras. `*_delay_ms` makes a source start late (clock skew in tests).
 #[derive(Clone, Debug)]
 pub struct SyntheticFactory {
     pub display_size: (u32, u32),
     pub camera_size: (u32, u32),
     pub screen_delay_ms: u64,
     pub camera_delay_ms: u64,
+    /// The second camera ([`Self::CAMERA2`]) starts this late.
+    pub camera2_delay_ms: u64,
 }
 
 impl Default for SyntheticFactory {
     fn default() -> Self {
-        Self { display_size: (1280, 720), camera_size: (640, 360), screen_delay_ms: 0, camera_delay_ms: 0 }
+        Self { display_size: (1280, 720), camera_size: (640, 360), screen_delay_ms: 0, camera_delay_ms: 0, camera2_delay_ms: 0 }
     }
 }
 
@@ -298,6 +300,7 @@ impl SyntheticFactory {
     pub const DISPLAY: &'static str = "synthetic:display";
     pub const WINDOW: &'static str = "synthetic:window";
     pub const CAMERA: &'static str = "synthetic:camera";
+    pub const CAMERA2: &'static str = "synthetic:camera2";
 }
 
 impl VideoInputFactory for SyntheticFactory {
@@ -309,11 +312,10 @@ impl VideoInputFactory for SyntheticFactory {
         Ok(VideoDevices {
             displays: vec![DisplayInfo { id: Self::DISPLAY.into(), name: "Synthetic Display".into(), width: self.display_size.0, height: self.display_size.1 }],
             windows: vec![WindowInfo { id: Self::WINDOW.into(), title: "Synthetic Window".into(), app: "FilmCraft".into() }],
-            cameras: vec![CameraInfo {
-                id: Self::CAMERA.into(),
-                name: "Synthetic Camera".into(),
-                formats: vec![CameraFormat { width: cw, height: ch, fps: 30 }],
-            }],
+            cameras: vec![
+                CameraInfo { id: Self::CAMERA.into(), name: "Synthetic Camera".into(), formats: vec![CameraFormat { width: cw, height: ch, fps: 30 }] },
+                CameraInfo { id: Self::CAMERA2.into(), name: "Synthetic Camera 2".into(), formats: vec![CameraFormat { width: cw, height: ch, fps: 30 }] },
+            ],
             problems: Vec::new(),
         })
     }
@@ -331,6 +333,8 @@ impl VideoInputFactory for SyntheticFactory {
     fn open_camera(&self, device: &str) -> std::result::Result<Box<dyn VideoInput>, CaptureError> {
         if device == Self::CAMERA {
             Ok(Box::new(SyntheticVideoInput::new(self.camera_size, self.camera_delay_ms)))
+        } else if device == Self::CAMERA2 {
+            Ok(Box::new(SyntheticVideoInput::new(self.camera_size, self.camera2_delay_ms)))
         } else {
             Err(CaptureError::new(CaptureErrorKind::NoDevice, format!("no camera `{device}`")))
         }
@@ -541,6 +545,31 @@ impl SourceKind {
     }
 }
 
+/// Most cameras / microphones one recording takes.
+pub const MAX_PER_KIND: usize = 4;
+
+/// One source of a recording: its kind and its number among the sources of that kind (0-based;
+/// the second camera is `Src { kind: Camera, n: 1 }`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Src {
+    pub kind: SourceKind,
+    pub n: usize,
+}
+
+impl Src {
+    pub fn new(kind: SourceKind, n: usize) -> Self {
+        Self { kind, n }
+    }
+    /// The key in `record.stop` results: `screen`, `camera`, `camera2`, `mic`, `mic2`…
+    pub fn key(self) -> String {
+        if self.n == 0 { self.kind.name().to_string() } else { format!("{}{}", self.kind.name(), self.n + 1) }
+    }
+    /// The file label: `Screen`, `Camera`, `Camera 2`, `Mic 2`…
+    fn label(self) -> String {
+        if self.n == 0 { self.kind.file_label().to_string() } else { format!("{} {}", self.kind.file_label(), self.n + 1) }
+    }
+}
+
 const NONE: u64 = u64::MAX;
 
 /// Live counters of one source (shared with its threads).
@@ -594,9 +623,11 @@ struct Finished {
 type Worker = std::thread::JoinHandle<std::result::Result<Finished, String>>;
 
 struct VideoSource {
-    kind: SourceKind,
+    src: Src,
     device_id: String,
     device_name: String,
+    /// Flip the clip horizontally in the sequence (a camera seen as in a mirror).
+    mirror: bool,
     input: Box<dyn VideoInput>,
     queue: Arc<FrameQueue>,
     stats: Arc<SourceStats>,
@@ -604,10 +635,16 @@ struct VideoSource {
     path: PathBuf,
 }
 
+type MicWorker = std::thread::JoinHandle<(Box<dyn AudioInput>, std::result::Result<Finished, String>)>;
+
 struct MicSource {
+    src: Src,
     device: String,
+    /// The session's own input (the voice-over one): handed back at stop. Other microphones
+    /// use inputs made for the recording ([`AudioInput::spawn`]) and are dropped.
+    session_input: bool,
     stats: Arc<SourceStats>,
-    worker: Option<std::thread::JoinHandle<(Box<dyn AudioInput>, std::result::Result<Finished, String>)>>,
+    worker: Option<MicWorker>,
     path: PathBuf,
 }
 
@@ -617,18 +654,16 @@ pub struct Active {
     pub dir: PathBuf,
     pub clock: RecordClock,
     video: Vec<VideoSource>,
-    mic: Option<MicSource>,
+    mics: Vec<MicSource>,
     /// Set at stop: the time up to which every source records.
     stop_ns: Arc<AtomicU64>,
     microphones: Vec<String>,
 }
 
 impl Active {
-    fn files(&self) -> Vec<(SourceKind, PathBuf)> {
-        let mut v: Vec<(SourceKind, PathBuf)> = self.video.iter().map(|s| (s.kind, s.path.clone())).collect();
-        if let Some(m) = &self.mic {
-            v.push((SourceKind::Mic, m.path.clone()));
-        }
+    fn files(&self) -> Vec<(Src, PathBuf)> {
+        let mut v: Vec<(Src, PathBuf)> = self.video.iter().map(|s| (s.src, s.path.clone())).collect();
+        v.extend(self.mics.iter().map(|m| (m.src, m.path.clone())));
         v
     }
 }
@@ -859,8 +894,8 @@ pub fn check_name(name: &str) -> std::result::Result<String, String> {
     Ok(n.to_string())
 }
 
-fn file_name(name: &str, kind: SourceKind) -> String {
-    format!("{name} - {}.{}", kind.file_label(), kind.extension())
+fn file_name(name: &str, src: Src) -> String {
+    format!("{name} - {}.{}", src.label(), src.kind.extension())
 }
 
 fn sidecar_path(file: &Path) -> PathBuf {
@@ -870,7 +905,7 @@ fn sidecar_path(file: &Path) -> PathBuf {
 
 /// `Recording <n>` (or `name`, `name 2`…) such that none of this recording's files exists and no
 /// project item has the name.
-fn pick_name(s: &Session, dir: &Path, base: Option<&str>, kinds: &[SourceKind]) -> String {
+fn pick_name(s: &Session, dir: &Path, base: Option<&str>, kinds: &[Src]) -> String {
     let items: std::collections::HashSet<&str> = s.project.items.values().map(|i| i.name.as_str()).collect();
     let free = |n: &str| !items.contains(n) && kinds.iter().all(|k| !dir.join(file_name(n, *k)).exists() && !items.contains(file_name(n, *k).as_str()));
     match base {
@@ -884,7 +919,7 @@ fn pick_name(s: &Session, dir: &Path, base: Option<&str>, kinds: &[SourceKind]) 
     }
 }
 
-fn remove_files(files: &[(SourceKind, PathBuf)]) {
+fn remove_files(files: &[(Src, PathBuf)]) {
     for (_, f) in files {
         let _ = std::fs::remove_file(f);
         let _ = std::fs::remove_file(sidecar_path(f));
@@ -964,10 +999,40 @@ fn id_of(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_u64().map(|n| n.to_string())))
 }
 
+/// One camera of a recording.
+struct CameraPlan {
+    device: String,
+    req: VideoRequest,
+    mirror: bool,
+}
+
 struct Plan {
     screen: Option<(ScreenTarget, u32)>,
-    camera: Option<(String, VideoRequest)>,
-    mic: Option<String>,
+    cameras: Vec<CameraPlan>,
+    /// Device names ("" = the system default).
+    mics: Vec<String>,
+}
+
+/// `key` (a list) or `alias` (one object, a one-element list); `null` / `false` / absent = none.
+fn list_p<'a>(p: &'a Value, key: &str, alias: &str, cmd: &str) -> Result<Vec<&'a Value>> {
+    let many = p.get(key).filter(|v| !v.is_null());
+    let one = p.get(alias).filter(|v| !v.is_null() && v.as_bool() != Some(false));
+    if many.is_some() && one.is_some() {
+        return Err(bad(cmd, format!("give `{key}` or `{alias}`, not both")));
+    }
+    let v: Vec<&Value> = match (many, one) {
+        (Some(Value::Array(a)), _) => a.iter().collect(),
+        (Some(_), _) => return Err(bad(cmd, format!("`{key}` must be a list"))),
+        (None, Some(o)) => vec![o],
+        (None, None) => Vec::new(),
+    };
+    if v.len() > MAX_PER_KIND {
+        return Err(bad(cmd, format!("at most {MAX_PER_KIND} `{key}`, got {}", v.len())));
+    }
+    if let Some(x) = v.iter().find(|x| !x.is_object()) {
+        return Err(bad(cmd, format!("each of `{key}` must be an object, got {x}")));
+    }
+    Ok(v)
 }
 
 fn plan(s: &Session, p: &Value) -> Result<Plan> {
@@ -983,38 +1048,47 @@ fn plan(s: &Session, p: &Value) -> Result<Plan> {
             Some((target, fps_of(v, cmd, 30)?))
         }
     };
-    let camera = match p.get("camera").filter(|v| !v.is_null()) {
-        None => None,
-        Some(v) => {
-            let device = id_of(v, "device").ok_or_else(|| bad(cmd, "`camera` takes {device: id}"))?;
-            let req = VideoRequest { width: size_of(v, "width", cmd)?, height: size_of(v, "height", cmd)?, fps: fps_of(v, cmd, 30)? };
-            Some((device, req))
+    let mut cameras: Vec<CameraPlan> = Vec::new();
+    for v in list_p(p, "cameras", "camera", cmd)? {
+        let device = id_of(v, "device").ok_or_else(|| bad(cmd, "a camera takes {device: id}"))?;
+        if cameras.iter().any(|c| c.device == device) {
+            return Err(bad(cmd, format!("the camera `{device}` is chosen twice")));
         }
-    };
-    let mic = match p.get("mic").filter(|v| !v.is_null()) {
-        None => None,
-        Some(v) if v.as_bool() == Some(false) => None,
-        Some(v) => {
-            let dev = match v.get("device") {
-                None | Some(Value::Null) => String::new(),
-                Some(Value::String(d)) => d.clone(),
-                Some(_) => return Err(bad(cmd, "`mic.device` must be a device name")),
-            };
-            Some(if dev.is_empty() {
-                let vo = &s.prefs.voice_over;
-                if vo.source.is_empty() { s.prefs.audio_hardware.default_input.clone() } else { vo.source.clone() }
-            } else {
-                dev
-            })
+        let mirror = match v.get("mirror").filter(|x| !x.is_null()) {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(bad(cmd, "`mirror` must be true or false")),
+        };
+        let req = VideoRequest { width: size_of(v, "width", cmd)?, height: size_of(v, "height", cmd)?, fps: fps_of(v, cmd, 30)? };
+        cameras.push(CameraPlan { device, req, mirror });
+    }
+    let mut mics: Vec<String> = Vec::new();
+    for v in list_p(p, "mics", "mic", cmd)? {
+        let dev = match v.get("device") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(d)) => d.clone(),
+            Some(_) => return Err(bad(cmd, "`mic.device` must be a device name")),
+        };
+        let dev = if dev.is_empty() {
+            let vo = &s.prefs.voice_over;
+            if vo.source.is_empty() { s.prefs.audio_hardware.default_input.clone() } else { vo.source.clone() }
+        } else {
+            dev
+        };
+        if mics.contains(&dev) {
+            let shown = if dev.is_empty() { "the default input" } else { dev.as_str() };
+            return Err(bad(cmd, format!("the microphone `{shown}` is chosen twice")));
         }
-    };
-    if screen.is_none() && camera.is_none() && mic.is_none() {
+        mics.push(dev);
+    }
+    if screen.is_none() && cameras.is_empty() && mics.is_empty() {
         return Err(bad(cmd, "choose at least one source (screen, camera or mic)"));
     }
-    Ok(Plan { screen, camera, mic })
+    Ok(Plan { screen, cameras, mics })
 }
 
-/// Stop every started source of a failed start and delete its files; the mic input goes back.
+/// Stop every started source of a failed start and delete its files; the session's mic input
+/// goes back.
 fn abort(s: &mut Session, mut a: Active) {
     a.stop_ns.store(0, Ordering::Release);
     for v in &mut a.video {
@@ -1024,24 +1098,29 @@ fn abort(s: &mut Session, mut a: Active) {
             let _ = w.join();
         }
     }
-    if let Some(m) = a.mic.as_mut()
-        && let Some(w) = m.worker.take()
-        && let Ok((input, _)) = w.join()
-    {
-        s.voiceover.input = Some(input);
+    for m in &mut a.mics {
+        if let Some(w) = m.worker.take()
+            && let Ok((input, _)) = w.join()
+            && m.session_input
+        {
+            s.voiceover.input = Some(input);
+        }
     }
     remove_files(&a.files());
 }
 
-fn start_video(
-    kind: SourceKind,
-    mut input: Box<dyn VideoInput>,
+/// What a video source is and where it goes.
+struct VideoSetup {
+    src: Src,
     req: VideoRequest,
-    clock: RecordClock,
     path: PathBuf,
-    stop_ns: &Arc<AtomicU64>,
-    names: (String, String),
-) -> Result<VideoSource> {
+    device_id: String,
+    device_name: String,
+    mirror: bool,
+}
+
+fn start_video(mut input: Box<dyn VideoInput>, setup: VideoSetup, clock: RecordClock, stop_ns: &Arc<AtomicU64>) -> Result<VideoSource> {
+    let VideoSetup { src, req, path, device_id, device_name, mirror } = setup;
     let queue = Arc::new(FrameQueue::new(4));
     let stats = Arc::new(SourceStats::default());
     let (q, st) = (queue.clone(), stats.clone());
@@ -1050,7 +1129,7 @@ fn start_video(
             st.dropped.fetch_add(1, Ordering::Relaxed);
         }
     });
-    let label = kind.name();
+    let label = src.key();
     let fmt = input.start(&req, clock, sink).map_err(|e| EngineError::Other(format!("{label}: {e}")))?;
     let (w, h) = (fmt.width.clamp(16, 8192) & !1, fmt.height.clamp(16, 8192) & !1);
     let mut fps = fmt.fps.clamp(1, 60);
@@ -1085,7 +1164,66 @@ fn start_video(
             return Err(e);
         }
     };
-    Ok(VideoSource { kind, device_id: names.0, device_name: names.1, input, queue, stats, worker: Some(worker), path })
+    Ok(VideoSource { src, device_id, device_name, mirror, input, queue, stats, worker: Some(worker), path })
+}
+
+/// Start the microphone `device` into `path` (`input` moves onto the recording thread).
+fn start_mic(
+    s: &Session,
+    mut input: Box<dyn AudioInput>,
+    src: Src,
+    device: &str,
+    path: PathBuf,
+    clock: RecordClock,
+    stop_ns: &Arc<AtomicU64>,
+) -> std::result::Result<MicSource, (Box<dyn AudioInput>, EngineError)> {
+    let sr = s.active_sequence().map(|q| q.settings.sample_rate).unwrap_or(48_000).max(8_000);
+    let label = src.key();
+    let fmt = match input.start(device, sr) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err((
+                input,
+                EngineError::Other(format!(
+                    "{label}: {e} (on macOS, allow FilmCraft or the terminal that launched it in System Settings ▸ Privacy & Security ▸ Microphone)"
+                )),
+            ));
+        }
+    };
+    let first_ns = clock.now_ns();
+    let channel = (s.prefs.voice_over.input_channel as usize).min(usize::from(fmt.channels.max(1)) - 1);
+    let wav = match WavStream::create(&path, fmt.sample_rate.max(1)) {
+        Ok(w) => w,
+        Err(e) => {
+            input.stop();
+            return Err((input, EngineError::Other(format!("{}: {e}", path.display()))));
+        }
+    };
+    let stats = Arc::new(SourceStats::default());
+    stats.first_ns.store(first_ns, Ordering::Release);
+    let (st, stop) = (stats.clone(), stop_ns.clone());
+    // the input moves to the thread and comes back from it; if the thread cannot start, the
+    // input is lost with it, so a spare is made first for the session
+    let spare = input.spawn();
+    let spawned = std::thread::Builder::new().name(format!("filmcraft-record-{label}")).spawn(move || {
+        let mut input = input;
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| mic_worker(&mut input, wav, channel, clock, first_ns, &st, &stop)))
+            .unwrap_or_else(|p| Err(format!("the microphone recorder crashed: {}", panic_text(&p))));
+        (input, r)
+    });
+    match spawned {
+        Ok(w) => Ok(MicSource {
+            src,
+            device: if device.is_empty() { "Default".into() } else { device.to_string() },
+            session_input: false,
+            stats,
+            worker: Some(w),
+            path,
+        }),
+        Err(e) => {
+            Err((spare.unwrap_or_else(|| Box::new(SyntheticInput::clicks())), EngineError::Other(format!("{label}: cannot start the recording thread: {e}"))))
+        }
+    }
 }
 
 fn start(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1098,7 +1236,7 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let f = factory(s);
     // resolve devices before touching anything
-    let needs_video = plan.screen.is_some() || plan.camera.is_some();
+    let needs_video = plan.screen.is_some() || !plan.cameras.is_empty();
     let devs = if needs_video { f.devices().map_err(|e| EngineError::Other(e.message))? } else { VideoDevices::default() };
     let screen_name = match &plan.screen {
         Some((ScreenTarget::Display(id), _)) => {
@@ -1109,45 +1247,52 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
         }
         None => None,
     };
-    let camera_name = match &plan.camera {
-        Some((id, _)) => Some(devs.cameras.iter().find(|c| &c.id == id).map(|c| c.name.clone()).ok_or_else(|| bad(cmd, format!("no camera `{id}`")))?),
-        None => None,
-    };
-    let microphones = s.voiceover.input.get_or_insert_with(|| Box::new(SyntheticInput::clicks())).devices();
-    if let Some(m) = &plan.mic
-        && !m.is_empty()
-        && !microphones.iter().any(|d| d == m)
-    {
-        return Err(bad(cmd, format!("no microphone `{m}`")));
+    let mut camera_names = Vec::new();
+    for c in &plan.cameras {
+        let id = &c.device;
+        camera_names.push(devs.cameras.iter().find(|x| &x.id == id).map(|x| x.name.clone()).ok_or_else(|| bad(cmd, format!("no camera `{id}`")))?);
     }
-    let kinds: Vec<SourceKind> =
-        [plan.screen.as_ref().map(|_| SourceKind::Screen), plan.camera.as_ref().map(|_| SourceKind::Camera), plan.mic.as_ref().map(|_| SourceKind::Mic)]
-            .into_iter()
-            .flatten()
-            .collect();
+    let microphones = s.voiceover.input.get_or_insert_with(|| Box::new(SyntheticInput::clicks())).devices();
+    for m in &plan.mics {
+        if !m.is_empty() && !microphones.iter().any(|d| d == m) {
+            return Err(bad(cmd, format!("no microphone `{m}`")));
+        }
+    }
+    // a second microphone needs a second input of the same kind
+    let mut extra_inputs: Vec<Box<dyn AudioInput>> = Vec::new();
+    for _ in 1..plan.mics.len() {
+        match s.voiceover.input.as_ref().and_then(|i| i.spawn()) {
+            Some(i) => extra_inputs.push(i),
+            None => return Err(bad(cmd, "this system records one microphone at a time")),
+        }
+    }
+    let mut srcs: Vec<Src> = Vec::new();
+    if plan.screen.is_some() {
+        srcs.push(Src::new(SourceKind::Screen, 0));
+    }
+    srcs.extend((0..plan.cameras.len()).map(|n| Src::new(SourceKind::Camera, n)));
+    srcs.extend((0..plan.mics.len()).map(|n| Src::new(SourceKind::Mic, n)));
     let dir = record_dir(s, p);
     std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
-    let name = pick_name(s, &dir, name.as_deref(), &kinds);
+    let name = pick_name(s, &dir, name.as_deref(), &srcs);
     let clock = RecordClock::new();
     let stop_ns = Arc::new(AtomicU64::new(NONE));
-    let mut active = Active { name: name.clone(), dir: dir.clone(), clock, video: Vec::new(), mic: None, stop_ns: stop_ns.clone(), microphones };
+    let mut active = Active { name: name.clone(), dir: dir.clone(), clock, video: Vec::new(), mics: Vec::new(), stop_ns: stop_ns.clone(), microphones };
     // screen
     if let Some((target, fps)) = &plan.screen {
-        let path = dir.join(file_name(&name, SourceKind::Screen));
+        let src = Src::new(SourceKind::Screen, 0);
         let id = match target {
             ScreenTarget::Display(d) | ScreenTarget::Window(d) => d.clone(),
         };
-        let r = f.open_screen(target).map_err(|e| EngineError::Other(format!("screen: {e}"))).and_then(|input| {
-            start_video(
-                SourceKind::Screen,
-                input,
-                VideoRequest { width: None, height: None, fps: *fps },
-                clock,
-                path,
-                &stop_ns,
-                (id, screen_name.clone().unwrap_or_default()),
-            )
-        });
+        let setup = VideoSetup {
+            src,
+            req: VideoRequest { width: None, height: None, fps: *fps },
+            path: dir.join(file_name(&name, src)),
+            device_id: id,
+            device_name: screen_name.clone().unwrap_or_default(),
+            mirror: false,
+        };
+        let r = f.open_screen(target).map_err(|e| EngineError::Other(format!("screen: {e}"))).and_then(|input| start_video(input, setup, clock, &stop_ns));
         match r {
             Ok(v) => active.video.push(v),
             Err(e) => {
@@ -1156,13 +1301,15 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
-    // camera
-    if let Some((id, req)) = &plan.camera {
-        let path = dir.join(file_name(&name, SourceKind::Camera));
+    // cameras
+    for (n, (c, cname)) in plan.cameras.iter().zip(&camera_names).enumerate() {
+        let src = Src::new(SourceKind::Camera, n);
+        let setup =
+            VideoSetup { src, req: c.req, path: dir.join(file_name(&name, src)), device_id: c.device.clone(), device_name: cname.clone(), mirror: c.mirror };
         let r = f
-            .open_camera(id)
-            .map_err(|e| EngineError::Other(format!("camera: {e}")))
-            .and_then(|input| start_video(SourceKind::Camera, input, *req, clock, path, &stop_ns, (id.clone(), camera_name.clone().unwrap_or_default())));
+            .open_camera(&c.device)
+            .map_err(|e| EngineError::Other(format!("{}: {e}", src.key())))
+            .and_then(|input| start_video(input, setup, clock, &stop_ns));
         match r {
             Ok(v) => active.video.push(v),
             Err(e) => {
@@ -1171,52 +1318,35 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
-    // microphone
-    if let Some(device) = &plan.mic {
-        let path = dir.join(file_name(&name, SourceKind::Mic));
-        let mut input = s.voiceover.input.take().unwrap_or_else(|| Box::new(SyntheticInput::clicks()));
-        let sr = s.active_sequence().map(|q| q.settings.sample_rate).unwrap_or(48_000).max(8_000);
-        let fmt = match input.start(device, sr) {
-            Ok(f) => f,
-            Err(e) => {
-                s.voiceover.input = Some(input);
-                abort(s, active);
-                return Err(EngineError::Other(format!(
-                    "microphone: {e} (on macOS, allow FilmCraft or the terminal that launched it in System Settings ▸ Privacy & Security ▸ Microphone)"
-                )));
-            }
+    // microphones: the first on the session's input, the others on inputs made for them
+    let mut extra = extra_inputs.into_iter();
+    for (n, device) in plan.mics.iter().enumerate() {
+        let src = Src::new(SourceKind::Mic, n);
+        let path = dir.join(file_name(&name, src));
+        let input = if n == 0 {
+            s.voiceover.input.take().unwrap_or_else(|| Box::new(SyntheticInput::clicks()))
+        } else {
+            extra.next().unwrap_or_else(|| Box::new(SyntheticInput::clicks()))
         };
-        let first_ns = clock.now_ns();
-        let channel = (s.prefs.voice_over.input_channel as usize).min(usize::from(fmt.channels.max(1)) - 1);
-        let wav = match WavStream::create(&path, fmt.sample_rate.max(1)) {
-            Ok(w) => w,
-            Err(e) => {
-                input.stop();
-                s.voiceover.input = Some(input);
-                abort(s, active);
-                return Err(EngineError::Other(format!("{}: {e}", path.display())));
+        match start_mic(s, input, src, device, path, clock, &stop_ns) {
+            Ok(mut m) => {
+                m.session_input = n == 0;
+                active.mics.push(m);
             }
-        };
-        let stats = Arc::new(SourceStats::default());
-        stats.first_ns.store(first_ns, Ordering::Release);
-        let (st, stop) = (stats.clone(), stop_ns.clone());
-        // the input moves to the thread and comes back from it
-        let spawned = std::thread::Builder::new().name("filmcraft-record-mic".into()).spawn(move || {
-            let mut input = input;
-            let r = std::panic::catch_unwind(AssertUnwindSafe(|| mic_worker(&mut input, wav, channel, clock, first_ns, &st, &stop)))
-                .unwrap_or_else(|p| Err(format!("the microphone recorder crashed: {}", panic_text(&p))));
-            (input, r)
-        });
-        match spawned {
-            Ok(w) => active.mic = Some(MicSource { device: if device.is_empty() { "Default".into() } else { device.clone() }, stats, worker: Some(w), path }),
-            Err(e) => {
+            Err((input, e)) => {
+                if n == 0 {
+                    s.voiceover.input = Some(input);
+                }
                 abort(s, active);
-                return Err(EngineError::Other(format!("microphone: cannot start the recording thread: {e}")));
+                return Err(e);
             }
         }
     }
-    let files: Vec<Value> =
-        active.files().iter().map(|(k, f)| json!({"kind": k.name(), "path": f.to_string_lossy(), "sidecar": sidecar_path(f).to_string_lossy()})).collect();
+    let files: Vec<Value> = active
+        .files()
+        .iter()
+        .map(|(k, f)| json!({"kind": k.kind.name(), "key": k.key(), "path": f.to_string_lossy(), "sidecar": sidecar_path(f).to_string_lossy()}))
+        .collect();
     let clock_start = clock.unix_start_ns();
     s.record.active = Some(active);
     Ok(json!({"recording": true, "name": name, "clockStartNs": clock_start, "dir": dir.to_string_lossy(), "files": files}))
@@ -1228,22 +1358,24 @@ fn status_json(s: &Session) -> Value {
     let mut errors = Vec::new();
     for v in &a.video {
         sources.push(json!({
-            "kind": v.kind.name(),
+            "kind": v.src.kind.name(),
+            "key": v.src.key(),
             "device": v.device_name,
             "frames": v.stats.frames.load(Ordering::Relaxed),
             "dropped": v.stats.dropped.load(Ordering::Relaxed),
             "bytes": v.stats.bytes.load(Ordering::Relaxed),
         }));
         if let Some(e) = v.input.error() {
-            errors.push(format!("{}: {e}", v.kind.name()));
+            errors.push(format!("{}: {e}", v.src.key()));
         }
         if v.worker.as_ref().is_some_and(|w| w.is_finished()) {
-            errors.push(format!("{}: the encoder stopped", v.kind.name()));
+            errors.push(format!("{}: the encoder stopped", v.src.key()));
         }
     }
-    if let Some(m) = &a.mic {
+    for m in &a.mics {
         sources.push(json!({
-            "kind": "mic",
+            "kind": m.src.kind.name(),
+            "key": m.src.key(),
             "device": m.device,
             "frames": m.stats.frames.load(Ordering::Relaxed),
             "dropped": 0,
@@ -1251,7 +1383,7 @@ fn status_json(s: &Session) -> Value {
             "level": f32::from_bits(m.stats.level.load(Ordering::Relaxed)),
         }));
         if m.worker.as_ref().is_some_and(|w| w.is_finished()) {
-            errors.push("mic: the microphone stopped".into());
+            errors.push(format!("{}: the microphone stopped", m.src.key()));
         }
     }
     json!({
@@ -1269,10 +1401,11 @@ fn status(s: &mut Session, _p: &Value) -> Result<Value> {
 
 /// One source after stop.
 struct Done {
-    kind: SourceKind,
+    src: Src,
     path: PathBuf,
     device_id: String,
     device_name: String,
+    mirror: bool,
     first_ns: u64,
     last_ns: u64,
     dropped: u64,
@@ -1284,7 +1417,8 @@ fn write_sidecar(name: &str, clock: &RecordClock, d: &Done, offset_ms: f64) -> s
     let mut v = json!({
         "version": 1,
         "recording": name,
-        "source": d.kind.name(),
+        "source": d.src.kind.name(),
+        "index": d.src.n + 1,
         "file": file,
         "device": {"id": d.device_id, "name": d.device_name},
         "clock_start_ns": clock.unix_start_ns(),
@@ -1295,7 +1429,7 @@ fn write_sidecar(name: &str, clock: &RecordClock, d: &Done, offset_ms: f64) -> s
         "events": [],
     });
     if let Some(o) = v.as_object_mut() {
-        if d.kind == SourceKind::Mic {
+        if d.src.kind == SourceKind::Mic {
             o.insert("sample_rate".into(), json!(d.fin.sample_rate));
             o.insert("channels".into(), json!(1));
             o.insert("samples".into(), json!(d.fin.samples));
@@ -1306,8 +1440,12 @@ fn write_sidecar(name: &str, clock: &RecordClock, d: &Done, offset_ms: f64) -> s
             o.insert("fps".into(), json!(d.fin.fps));
             o.insert("encoder".into(), json!(d.fin.encoder));
         }
-        if d.kind == SourceKind::Camera {
+        if d.src.kind == SourceKind::Camera {
             o.insert("camera_offset_ms".into(), json!(offset_ms));
+            o.insert("mirror".into(), json!(d.mirror));
+            if d.mirror {
+                o.insert("mirror_note".into(), json!("the file is as the camera saw it; the clip has a Horizontal Flip effect"));
+            }
         }
     }
     let bytes = serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?;
@@ -1333,31 +1471,35 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             (Err(e), Some(ie)) => Err(format!("{e} ({ie})")),
             (r, _) => r,
         };
-        out.push(r.map_err(|e| format!("{}: {e}", v.kind.name())).map(|fin| Done {
-            kind: v.kind,
+        out.push(r.map_err(|e| format!("{}: {e}", v.src.key())).map(|fin| Done {
+            src: v.src,
             path: v.path.clone(),
             device_id: v.device_id.clone(),
             device_name: v.device_name.clone(),
+            mirror: v.mirror,
             first_ns: v.stats.first().unwrap_or(0),
             last_ns: v.stats.last().unwrap_or(0),
             dropped: v.stats.dropped.load(Ordering::Relaxed),
             fin,
         }));
     }
-    if let Some(m) = a.mic.as_mut() {
+    for m in &mut a.mics {
         let r = match m.worker.take().map(|w| w.join()) {
             Some(Ok((input, r))) => {
-                s.voiceover.input = Some(input);
+                if m.session_input {
+                    s.voiceover.input = Some(input);
+                }
                 r
             }
             Some(Err(p)) => Err(format!("the microphone recorder crashed: {}", panic_text(&p))),
             None => Err("the microphone was not running".into()),
         };
-        out.push(r.map_err(|e| format!("mic: {e}")).map(|fin| Done {
-            kind: SourceKind::Mic,
+        out.push(r.map_err(|e| format!("{}: {e}", m.src.key())).map(|fin| Done {
+            src: m.src,
             path: m.path.clone(),
             device_id: m.device.clone(),
             device_name: m.device.clone(),
+            mirror: false,
             first_ns: m.stats.first().unwrap_or(0),
             last_ns: m.stats.last().unwrap_or(0),
             dropped: 0,
@@ -1367,14 +1509,20 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
     (a, out)
 }
 
-/// Where each source starts in the new sequence, in ns (earliest = 0): first sample times, the
+/// Where each source starts in the new sequence, in ns (earliest = 0): first sample times, every
 /// camera moved by `camera_offset_ms`.
 pub fn sync_offsets(firsts: &[(SourceKind, u64)], camera_offset_ms: f64) -> Vec<(SourceKind, i64)> {
     let shift = (camera_offset_ms * 1e6).round() as i64;
-    let raw: Vec<(SourceKind, i64)> =
-        firsts.iter().map(|(k, f)| (*k, i64::try_from(*f).unwrap_or(i64::MAX / 4).saturating_add(if *k == SourceKind::Camera { shift } else { 0 }))).collect();
-    let min = raw.iter().map(|r| r.1).min().unwrap_or(0);
-    raw.into_iter().map(|(k, v)| (k, v.saturating_sub(min))).collect()
+    let shifted: Vec<(u64, i64)> = firsts.iter().map(|(k, f)| (*f, if *k == SourceKind::Camera { shift } else { 0 })).collect();
+    firsts.iter().map(|f| f.0).zip(sync_offsets_by(&shifted)).collect()
+}
+
+/// Where each source starts in the new sequence, in ns (earliest = 0), from its first sample
+/// time and a shift in ns (a camera offset).
+pub fn sync_offsets_by(firsts: &[(u64, i64)]) -> Vec<i64> {
+    let raw: Vec<i64> = firsts.iter().map(|(f, shift)| i64::try_from(*f).unwrap_or(i64::MAX / 4).saturating_add(*shift)).collect();
+    let min = raw.iter().copied().min().unwrap_or(0);
+    raw.into_iter().map(|v| v.saturating_sub(min)).collect()
 }
 
 /// A clip of `item` whose media time 0 sits at sequence time `exact`: frame-aligned at or after
@@ -1408,19 +1556,33 @@ fn placed(
     Some(ti)
 }
 
+fn offset_ms_of(v: &Value, cmd: &str, key: &str) -> Result<f64> {
+    let o = v.as_f64().filter(|f| f.is_finite()).ok_or_else(|| bad(cmd, format!("`{key}` must be a number")))?;
+    if !(-5000.0..=5000.0).contains(&o) {
+        return Err(bad(cmd, format!("`{key}` must be −5000…5000, got {o}")));
+    }
+    Ok(o)
+}
+
+/// The camera offsets of `record.stop`: `cameraOffsetsMs` (one per camera, in order) else the
+/// scalar `cameraOffsetMs` for every camera.
+fn camera_offsets(p: &Value, cmd: &str) -> Result<(f64, Vec<f64>)> {
+    let scalar = match p.get("cameraOffsetMs").filter(|v| !v.is_null()) {
+        None => 0.0,
+        Some(v) => offset_ms_of(v, cmd, "cameraOffsetMs")?,
+    };
+    let list = match p.get("cameraOffsetsMs").filter(|v| !v.is_null()) {
+        None => Vec::new(),
+        Some(Value::Array(a)) if a.len() <= MAX_PER_KIND => a.iter().map(|x| offset_ms_of(x, cmd, "cameraOffsetsMs")).collect::<Result<Vec<f64>>>()?,
+        Some(_) => return Err(bad(cmd, format!("`cameraOffsetsMs` must be a list of at most {MAX_PER_KIND} numbers"))),
+    };
+    Ok((scalar, list))
+}
+
 fn stop(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "record.stop";
     let discard = bool_p(p, "discard").unwrap_or(false);
-    let offset_ms = match p.get("cameraOffsetMs").filter(|v| !v.is_null()) {
-        None => 0.0,
-        Some(v) => {
-            let o = v.as_f64().filter(|f| f.is_finite()).ok_or_else(|| bad(cmd, "`cameraOffsetMs` must be a number"))?;
-            if !(-5000.0..=5000.0).contains(&o) {
-                return Err(bad(cmd, format!("`cameraOffsetMs` must be −5000…5000, got {o}")));
-            }
-            o
-        }
-    };
+    let (scalar, list) = camera_offsets(p, cmd)?;
     let a = s.record.active.take().ok_or_else(|| bad(cmd, "nothing is recording"))?;
     let (a, results) = finish_all(s, a);
     let files = a.files();
@@ -1438,21 +1600,23 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // a failed source leaves no half file behind
     for (k, f) in &files {
-        if !done.iter().any(|d| d.kind == *k) {
+        if !done.iter().any(|d| d.src == *k) {
             let _ = std::fs::remove_file(f);
         }
     }
     if done.is_empty() {
         return Err(EngineError::Other(format!("recording failed: {}", errors.join("; "))));
     }
+    let offset_of = |src: Src| if src.kind == SourceKind::Camera { list.get(src.n).copied().unwrap_or(scalar) } else { 0.0 };
     for d in &done {
-        if let Err(e) = write_sidecar(&a.name, &a.clock, d, offset_ms) {
-            errors.push(format!("{}: sidecar: {e}", d.kind.name()));
+        if let Err(e) = write_sidecar(&a.name, &a.clock, d, offset_of(d.src)) {
+            errors.push(format!("{}: sidecar: {e}", d.src.key()));
         }
     }
+    let offsets_ms: Vec<f64> = done.iter().map(|d| offset_of(d.src)).collect();
     // import + sequence, one undo step
     let n0 = s.history.undo.len();
-    let r = import_and_place(s, &a.name, &done, offset_ms);
+    let r = import_and_place(s, &a.name, &done, &offsets_ms);
     crate::clip_ops::collapse_history(s, n0, "Record");
     let mut v = r?;
     if let Some(o) = v.as_object_mut() {
@@ -1462,7 +1626,9 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(v)
 }
 
-fn import_and_place(s: &mut Session, name: &str, done: &[Done], offset_ms: f64) -> Result<Value> {
+/// Import the finished files and build the synced sequence: the screen on V1, the cameras on the
+/// next video tracks in order, the microphones on A1… (`offsets_ms[i]`: the shift of `done[i]`).
+fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f64]) -> Result<Value> {
     let bin = s.edit("New Bin", |pr, _| {
         let existing = pr.root.children.iter().find_map(|c| match c {
             filmcraft_project::BinEntry::Bin(b) if b.name == "Recordings" => Some(b.id),
@@ -1470,52 +1636,70 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offset_ms: f64) 
         });
         Ok(existing.unwrap_or_else(|| pr.add_bin("Recordings", None)))
     })?;
-    let mut items: Vec<(SourceKind, ItemId)> = Vec::new();
+    let mut items: Vec<(Src, ItemId)> = Vec::new();
     for d in done {
         let item = crate::commands::import_streamed(s, &d.path.to_string_lossy(), Some(bin))?;
-        items.push((d.kind, item));
+        items.push((d.src, item));
     }
-    let firsts: Vec<(SourceKind, u64)> = done.iter().map(|d| (d.kind, d.first_ns)).collect();
-    let offsets = sync_offsets(&firsts, offset_ms);
-    let off = |k: SourceKind| offsets.iter().find(|o| o.0 == k).map(|o| Tick::from_units(o.1, 1_000_000_000));
-    let item = |k: SourceKind| items.iter().find(|i| i.0 == k).map(|i| i.1);
-    // sequence settings: the screen's picture, else the camera's; the mic's rate
-    let lead = item(SourceKind::Screen).or(item(SourceKind::Camera)).or(item(SourceKind::Mic));
+    let firsts: Vec<(u64, i64)> = done.iter().zip(offsets_ms).map(|(d, o)| (d.first_ns, (o * 1e6).round() as i64)).collect();
+    let offsets: Vec<(Src, i64)> = done.iter().map(|d| d.src).zip(sync_offsets_by(&firsts)).collect();
+    let off = |k: Src| offsets.iter().find(|o| o.0 == k).map(|o| Tick::from_units(o.1, 1_000_000_000));
+    let item = |k: Src| items.iter().find(|i| i.0 == k).map(|i| i.1);
+    let of_kind = |kind: SourceKind| -> Vec<Src> { items.iter().map(|i| i.0).filter(|k| k.kind == kind).collect() };
+    let videos: Vec<Src> = of_kind(SourceKind::Screen).into_iter().chain(of_kind(SourceKind::Camera)).collect();
+    let audios: Vec<Src> = of_kind(SourceKind::Mic);
+    // sequence settings: the screen's picture, else the first camera's; the first mic's rate
+    let lead = videos.first().or(audios.first()).and_then(|k| item(*k));
     let info = |it: Option<ItemId>| it.and_then(|i| s.project.item(i)).and_then(|i| i.as_media()).map(|m| m.info.clone());
     let mut settings = info(lead).map(|i| crate::commands::default_seq_settings_for(&i)).unwrap_or_default();
-    if let Some(a) = info(item(SourceKind::Mic)).and_then(|i| i.audio) {
+    if let Some(a) = info(audios.first().and_then(|k| item(*k))).and_then(|i| i.audio) {
         settings.sample_rate = a.sample_rate.max(8000);
     }
-    let n_video = usize::from(item(SourceKind::Screen).is_some()) + usize::from(item(SourceKind::Camera).is_some());
-    let n_audio = usize::from(item(SourceKind::Mic).is_some()).max(1);
+    let mirrored: Vec<Src> = done.iter().filter(|d| d.mirror).map(|d| d.src).collect();
+    let comment = {
+        let cams: Vec<String> = done
+            .iter()
+            .zip(offsets_ms)
+            .filter(|(d, o)| d.src.kind == SourceKind::Camera && **o != 0.0)
+            .map(|(d, o)| if d.src.n == 0 { format!("camera offset {o} ms") } else { format!("camera {} offset {o} ms", d.src.n + 1) })
+            .collect();
+        cams.join(", ")
+    };
     let name_s = name.to_string();
     let seq = s.edit("Record", |pr, st| {
         for (k, it) in &items {
             if let Some(pi) = pr.item_mut(*it) {
                 pi.metadata.insert("Recording".into(), name_s.clone());
-                pi.metadata.insert("Recording Source".into(), k.name().into());
+                pi.metadata.insert("Recording Source".into(), k.key());
                 if let Some(o) = offsets.iter().find(|o| o.0 == *k) {
                     pi.metadata.insert("Recording Offset".into(), format!("{} ns", o.1));
                 }
             }
         }
-        let sid = pr.new_sequence(&name_s, settings.clone(), n_video.max(1), n_audio, Some(bin));
+        let sid = pr.new_sequence(&name_s, settings.clone(), videos.len().max(1), audios.len().max(1), Some(bin));
         let mut clips = Vec::new();
         let mut v_items = Vec::new();
-        for k in [SourceKind::Screen, SourceKind::Camera] {
-            if let (Some(it), Some(at)) = (item(k), off(k)) {
-                let ti = placed(pr, it, TrackKind::Video, at, &settings)
-                    .ok_or_else(|| EngineError::Other(format!("the {} recording is too short to place", k.name())))?;
-                clips.push((k, ti.id, ti.start));
+        for k in &videos {
+            if let (Some(it), Some(at)) = (item(*k), off(*k)) {
+                let mut ti = placed(pr, it, TrackKind::Video, at, &settings)
+                    .ok_or_else(|| EngineError::Other(format!("the {} recording is too short to place", k.key())))?;
+                if mirrored.contains(k)
+                    && let Some(flip) = filmcraft_project::find_effect("horizontal_flip").map(|d| d.instance())
+                {
+                    ti.effects.insert(0, flip);
+                }
+                clips.push((*k, ti.id, ti.start));
                 v_items.push(ti);
             }
         }
         let mut a_items = Vec::new();
-        if let (Some(it), Some(at)) = (item(SourceKind::Mic), off(SourceKind::Mic)) {
-            let ti =
-                placed(pr, it, TrackKind::Audio, at, &settings).ok_or_else(|| EngineError::Other("the microphone recording is too short to place".into()))?;
-            clips.push((SourceKind::Mic, ti.id, ti.start));
-            a_items.push(ti);
+        for k in &audios {
+            if let (Some(it), Some(at)) = (item(*k), off(*k)) {
+                let ti = placed(pr, it, TrackKind::Audio, at, &settings)
+                    .ok_or_else(|| EngineError::Other(format!("the {} recording is too short to place", k.key())))?;
+                clips.push((*k, ti.id, ti.start));
+                a_items.push(ti);
+            }
         }
         let marker = MarkerId(pr.alloc_id());
         let q = pr.sequence_mut(sid).ok_or(EngineError::NoSequence)?;
@@ -1525,13 +1709,12 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offset_ms: f64) 
         for (t, it) in q.audio_tracks.iter_mut().zip(a_items) {
             t.items.push(it);
         }
-        let comment = if offset_ms != 0.0 { format!("camera offset {offset_ms} ms") } else { String::new() };
         q.markers.push(Marker {
             id: marker,
             start: Tick::ZERO,
             duration: Tick::ZERO,
             name: "Recording".into(),
-            comment,
+            comment: comment.clone(),
             kind: MarkerKind::Comment,
             color: Label::Rose,
         });
@@ -1547,15 +1730,17 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offset_ms: f64) 
         Ok((sid, clips))
     })?;
     let (sid, clips) = seq;
-    let obj = |f: &dyn Fn(SourceKind) -> Option<Value>| {
+    let obj = |f: &dyn Fn(Src) -> Option<Value>| {
         let mut m = serde_json::Map::new();
-        for k in [SourceKind::Screen, SourceKind::Camera, SourceKind::Mic] {
-            if let Some(v) = f(k) {
-                m.insert(k.name().into(), v);
+        for (k, _) in &items {
+            if let Some(v) = f(*k) {
+                m.insert(k.key(), v);
             }
         }
         Value::Object(m)
     };
+    let keys = |kind: SourceKind| -> Vec<String> { items.iter().filter(|i| i.0.kind == kind).map(|i| i.0.key()).collect() };
+    let cam_offsets: Vec<f64> = done.iter().zip(offsets_ms).filter(|(d, _)| d.src.kind == SourceKind::Camera).map(|(_, o)| *o).collect();
     Ok(json!({
         "recording": false,
         "placed": true,
@@ -1564,7 +1749,10 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offset_ms: f64) 
         "items": obj(&|k| item(k).map(|i| json!(i.0))),
         "clips": obj(&|k| clips.iter().find(|c| c.0 == k).map(|c| json!({"clip": c.1.0, "start": c.2.0}))),
         "offsets": obj(&|k| off(k).map(|t| json!(t.0))),
-        "cameraOffsetMs": offset_ms,
+        "cameras": keys(SourceKind::Camera),
+        "mics": keys(SourceKind::Mic),
+        "cameraOffsetMs": cam_offsets.first().copied().unwrap_or(0.0),
+        "cameraOffsetsMs": cam_offsets,
     }))
 }
 
@@ -1589,13 +1777,13 @@ pub fn commands() -> Vec<CommandSpec> {
         spec(
             "record.start",
             "Start Recording",
-            r#"{"screen":{"display":id}|{"window":id}?,"camera":{"device":id,"width":n?,"height":n?,"fps":n?}?,"mic":{"device":str?}?,"name":str?,"dir":str?}"#,
+            r#"{"screen":{"display":id}|{"window":id}?,"cameras":[{"device":id,"width":n?,"height":n?,"fps":n?,"mirror":bool?}]?,"camera":{..}?,"mics":[{"device":str?}]?,"mic":{..}?,"name":str?,"dir":str?}"#,
             can_start,
             start,
             true,
         ),
         spec("record.status", "Recording Status", "{}", crate::commands::always, status, false),
-        spec("record.stop", "Stop Recording", r#"{"discard":bool?,"cameraOffsetMs":f64?}"#, is_recording, stop, true),
+        spec("record.stop", "Stop Recording", r#"{"discard":bool?,"cameraOffsetMs":f64?,"cameraOffsetsMs":[f64]?}"#, is_recording, stop, true),
         spec("record.cancel", "Cancel Recording", "{}", is_recording, cancel, true),
     ]
 }

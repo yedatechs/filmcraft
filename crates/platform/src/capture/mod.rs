@@ -115,6 +115,10 @@ impl filmcraft_engine::record::VideoInputFactory for MacCaptureFactory {
         let mut out = filmcraft_engine::record::VideoDevices::default();
         match screen::devices() {
             Ok((displays, windows)) => {
+                if displays.is_empty() {
+                    // ScreenCaptureKit leaves out a display that is asleep (or a locked screen)
+                    out.problems.push("screen: macOS lists no display right now (is it asleep or locked?): wake it, then press Refresh".into());
+                }
                 out.displays = displays;
                 out.windows = windows;
             }

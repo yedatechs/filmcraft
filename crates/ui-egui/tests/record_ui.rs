@@ -99,11 +99,15 @@ fn record_and_stop_builds_a_synced_sequence() {
     for id in [
         "record.panel",
         "record.panel.screen",
-        "record.panel.camera",
-        "record.panel.quality",
-        "record.panel.mic",
+        "record.panel.camera.1.device",
+        "record.panel.camera.1.quality",
+        "record.panel.camera.1.mirror",
+        "record.panel.camera.1.offset",
+        "record.panel.camera.1.remove",
+        "record.panel.camera.add",
+        "record.panel.mic.1.device",
+        "record.panel.mic.add",
         "record.panel.name",
-        "record.panel.offset",
         "record.panel.record",
         "record.panel.cancel",
     ] {
@@ -113,10 +117,10 @@ fn record_and_stop_builds_a_synced_sequence() {
     let ui = d.ok("ui.inspect", json!({}))["ui"]["record"].clone();
     assert_eq!(ui["open"], true);
     assert_eq!(ui["screen"], "display:synthetic:display");
-    assert_eq!(ui["camera"], "synthetic:camera");
-    assert_eq!(ui["mic"], "default");
+    assert_eq!(ui["cameras"][0]["device"], "synthetic:camera");
+    assert_eq!(ui["mics"][0]["device"], "default");
     // the panel is driven by ui.set like any other state
-    d.ok("ui.set", json!({"record": {"quality": "native", "name": "Panel Take", "offsetMs": -40}}));
+    d.ok("ui.set", json!({"record": {"cameras": [{"device": "synthetic:camera", "quality": "native", "offsetMs": -40}], "name": "Panel Take"}}));
     d.frames(2);
     let before = d.sequences();
     d.click("record.panel.record");
@@ -187,11 +191,45 @@ fn cancel_discards_and_leaves_no_files() {
 fn a_refused_start_shows_the_error_in_the_panel() {
     let dir = tmp("error");
     let mut d = Driver::new(&dir);
-    d.ok("ui.set", json!({"record": {"open": true, "initialized": true, "screen": "display:gone", "camera": "", "mic": ""}}));
+    d.ok("ui.set", json!({"record": {"open": true, "initialized": true, "screen": "display:gone", "cameras": [], "mics": []}}));
     d.frames(3);
     d.click("record.panel.record");
     assert!(!d.harness.state().session.record.recording());
     let e = d.element("record.panel.error").unwrap();
     assert!(e["label"].as_str().unwrap().contains("no display"), "{e}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_second_camera_row_records_to_its_own_track() {
+    let dir = tmp("rows");
+    let mut d = Driver::new(&dir);
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.frames(3);
+    assert!(d.element("record.panel.camera.2.device").is_none());
+    d.click("record.panel.camera.add");
+    let ui = d.ok("ui.inspect", json!({}))["ui"]["record"].clone();
+    assert_eq!(ui["cameras"].as_array().unwrap().len(), 2);
+    assert_eq!(ui["cameras"][1]["device"], "synthetic:camera2", "the new row takes the next free camera");
+    assert!(d.element("record.panel.camera.2.device").is_some());
+    d.click("record.panel.camera.2.mirror");
+    d.click("record.panel.mic.add");
+    d.click("record.panel.mic.2.device");
+    d.click("record.panel.mic.2.device.3"); // Off, Default Input, Synthetic Input, Synthetic Input 2
+    let ui = d.ok("ui.inspect", json!({}))["ui"]["record"].clone();
+    assert_eq!(ui["cameras"][1]["mirror"], true);
+    assert_eq!(ui["mics"][1]["device"], "Synthetic Input 2");
+    d.click("record.panel.record");
+    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    d.run_for(0.8);
+    d.click("record.panel.record");
+    let s = &d.harness.state().session;
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (3, 2));
+    assert_eq!(q.video_tracks[2].items[0].effects.first().map(|e| e.effect.as_str()), Some("horizontal_flip"));
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 10, "five files and five sidecars");
+    // a row's − removes it
+    d.click("record.panel.camera.2.remove");
+    assert_eq!(d.harness.state().ui.record.cameras.len(), 1);
     std::fs::remove_dir_all(&dir).ok();
 }

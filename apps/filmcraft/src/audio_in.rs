@@ -211,6 +211,9 @@ impl AudioInput for CpalIn {
             report_error(&self.error, "audio input worker panicked".into());
         }
     }
+    fn spawn(&self) -> Option<Box<dyn AudioInput>> {
+        Some(Box::new(CpalIn::new(&self.host)))
+    }
 }
 
 impl Drop for CpalIn {

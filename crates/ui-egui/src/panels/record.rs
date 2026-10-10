@@ -1,16 +1,19 @@
 //! The Record panel (Window ▸ Record, or the red dot at the right of the Program monitor's
-//! transport): pick a screen (a display or a window), a camera and its quality, a microphone and a
-//! name, press Record, and Stop builds a synced sequence of the three files. Recording itself is
-//! the engine's `record.*` commands (`filmcraft_engine::record`, docs/recording.md).
+//! transport): pick a screen (a display or a window), up to four cameras (each with its quality,
+//! Mirror and offset), up to four microphones and a name, press Record, and Stop builds a synced
+//! sequence of the files. Recording itself is the engine's `record.*` commands
+//! (`filmcraft_engine::record`, docs/recording.md).
 //!
 //! Automation ids: `record.panel` (the window), `record.panel.screen` (+ `.screen.<i>`, 0 = Off),
-//! `record.panel.camera` (+ `.camera.<i>`), `record.panel.quality` (+ `.quality.<i>`),
-//! `record.panel.mic` (+ `.mic.<i>`), `record.panel.name`, `record.panel.offset`,
-//! `record.panel.record` (Record / Stop), `record.panel.cancel`, `record.panel.refresh`,
-//! `record.panel.counters`, `record.panel.level`, `record.panel.error`, `record.panel.close`; the
-//! Program monitor button is `program.transport.record`. UI command: `window.record` (open).
-//! The panel state is `UiState::record` ([`RecordUi`]), so `ui.set {"record": {...}}` drives it.
-//! No keyboard shortcuts.
+//! per camera row `n` (1-based) `record.panel.camera.<n>.device` (+ `.device.<i>`, 0 = Off),
+//! `.quality` (+ `.quality.<i>`), `.mirror`, `.offset`, `.remove`, and `record.panel.camera.add`;
+//! per microphone row `record.panel.mic.<n>.device` (+ `.device.<i>`), `.remove`, and
+//! `record.panel.mic.add`; `record.panel.name`, `record.panel.record` (Record / Stop),
+//! `record.panel.cancel`, `record.panel.refresh`, `record.panel.counters`, `record.panel.level`,
+//! `record.panel.error`, `record.panel.close`; the Program monitor button is
+//! `program.transport.record`. UI command: `window.record` (open). The panel state is
+//! `UiState::record` ([`RecordUi`]), so `ui.set {"record": {...}}` drives it. No keyboard
+//! shortcuts.
 
 use egui::{Color32, Rect, RichText, Sense, vec2};
 use serde::{Deserialize, Serialize};
@@ -54,6 +57,30 @@ impl Quality {
     }
 }
 
+/// Most camera / microphone rows (the engine's limit).
+pub const MAX_ROWS: usize = filmcraft_engine::record::MAX_PER_KIND;
+
+/// One camera row of the panel.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CameraRow {
+    /// `""` = Off, else a camera id.
+    pub device: String,
+    pub quality: Quality,
+    /// Flip the camera horizontally in the sequence.
+    pub mirror: bool,
+    /// "Offset … ms", applied at Stop.
+    pub offset_ms: f64,
+}
+
+/// One microphone row of the panel.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MicRow {
+    /// `""` = Off, `default` = the default input, else a microphone name.
+    pub device: String,
+}
+
 /// Record panel state (`UiState::record`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -61,15 +88,12 @@ pub struct RecordUi {
     pub open: bool,
     /// `""` = Off, `display:<id>` or `window:<id>`.
     pub screen: String,
-    /// `""` = Off, else a camera id.
-    pub camera: String,
-    pub quality: Quality,
-    /// `""` = Off, `default` = the default input, else a microphone name.
-    pub mic: String,
+    /// Camera rows (at most [`MAX_ROWS`]).
+    pub cameras: Vec<CameraRow>,
+    /// Microphone rows (at most [`MAX_ROWS`]).
+    pub mics: Vec<MicRow>,
     /// Recording name (`""` = `Recording <n>`).
     pub name: String,
-    /// "Offset camera by … ms", applied at Stop.
-    pub offset_ms: f64,
     /// The last error (a permission, a device), shown in the panel.
     pub error: String,
     /// The outcome of the last recording ("Recorded …").
@@ -110,13 +134,13 @@ fn refresh(app: &mut FilmcraftApp) {
                 {
                     r.screen = format!("display:{id}");
                 }
-                if r.camera.is_empty()
+                if r.cameras.is_empty()
                     && let Some(id) = v["cameras"][0]["id"].as_str()
                 {
-                    r.camera = id.to_string();
+                    r.cameras.push(CameraRow { device: id.to_string(), ..Default::default() });
                 }
-                if r.mic.is_empty() {
-                    r.mic = "default".into();
+                if r.mics.is_empty() {
+                    r.mics.push(MicRow { device: "default".into() });
                 }
             }
             r.error = v["error"].as_str().unwrap_or("").to_string();
@@ -158,22 +182,31 @@ pub fn start_params(r: &RecordUi) -> Value {
     } else if let Some(id) = r.screen.strip_prefix("window:") {
         p.insert("screen".into(), json!({"window": id}));
     }
-    if !r.camera.is_empty() {
-        let mut c = json!({"device": r.camera});
-        if let (Some((w, h)), Some(o)) = (r.quality.size(), c.as_object_mut()) {
-            o.insert("width".into(), json!(w));
-            o.insert("height".into(), json!(h));
-        }
-        p.insert("camera".into(), c);
+    let cameras: Vec<Value> = r
+        .cameras
+        .iter()
+        .filter(|c| !c.device.is_empty())
+        .map(|c| {
+            let mut v = json!({"device": c.device});
+            if let Some(o) = v.as_object_mut() {
+                if let Some((w, h)) = c.quality.size() {
+                    o.insert("width".into(), json!(w));
+                    o.insert("height".into(), json!(h));
+                }
+                if c.mirror {
+                    o.insert("mirror".into(), json!(true));
+                }
+            }
+            v
+        })
+        .collect();
+    if !cameras.is_empty() {
+        p.insert("cameras".into(), Value::Array(cameras));
     }
-    match r.mic.as_str() {
-        "" => {}
-        "default" => {
-            p.insert("mic".into(), json!({}));
-        }
-        m => {
-            p.insert("mic".into(), json!({"device": m}));
-        }
+    let mics: Vec<Value> =
+        r.mics.iter().filter(|m| !m.device.is_empty()).map(|m| if m.device == "default" { json!({}) } else { json!({"device": m.device}) }).collect();
+    if !mics.is_empty() {
+        p.insert("mics".into(), Value::Array(mics));
     }
     if !r.name.trim().is_empty() {
         p.insert("name".into(), json!(r.name.trim()));
@@ -181,13 +214,17 @@ pub fn start_params(r: &RecordUi) -> Value {
     Value::Object(p)
 }
 
+/// The `record.stop` parameters: each recorded camera's offset, in row order.
+pub fn stop_params(r: &RecordUi) -> Value {
+    let offsets: Vec<f64> =
+        r.cameras.iter().filter(|c| !c.device.is_empty()).map(|c| if c.offset_ms.is_finite() { c.offset_ms.clamp(-5000.0, 5000.0) } else { 0.0 }).collect();
+    if offsets.iter().all(|o| *o == 0.0) { json!({}) } else { json!({"cameraOffsetsMs": offsets}) }
+}
+
 /// Record / Stop.
 pub fn toggle(app: &mut FilmcraftApp) {
     if app.session.record.recording() {
-        let mut p = json!({});
-        if !app.ui.record.camera.is_empty() && app.ui.record.offset_ms != 0.0 {
-            p = json!({"cameraOffsetMs": app.ui.record.offset_ms.clamp(-5000.0, 5000.0)});
-        }
+        let p = stop_params(&app.ui.record);
         match app.session.execute("record.stop", p) {
             Ok(v) => {
                 let errs: Vec<&str> = v["errors"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
@@ -232,10 +269,10 @@ pub fn cancel(app: &mut FilmcraftApp) {
     app.ui.record.live.clear();
 }
 
-fn combo(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, id: &str, value: &mut String, options: &[(String, String)], enabled: bool) {
+fn combo(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, id: &str, value: &mut String, options: &[(String, String)], enabled: bool, width: f32) {
     let shown = options.iter().find(|o| o.0 == *value).map(|o| o.1.clone()).unwrap_or_else(|| if value.is_empty() { "Off".into() } else { value.clone() });
     let cb = ui.add_enabled_ui(enabled, |ui| {
-        egui::ComboBox::from_id_salt(id).selected_text(&shown).width(260.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(id).selected_text(&shown).width(width).show_ui(ui, |ui| {
             for (i, (val, label)) in options.iter().enumerate() {
                 let r = ui.selectable_label(value == val, label);
                 elems.push((format!("{id}.{i}"), r.rect, label.clone()));
@@ -300,27 +337,77 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             egui::Grid::new("record-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Screen:");
-                combo(ui, &mut elems, "record.panel.screen", &mut r.screen, &screens, !recording);
+                combo(ui, &mut elems, "record.panel.screen", &mut r.screen, &screens, !recording, 300.0);
                 ui.end_row();
-                ui.label("Camera:");
-                combo(ui, &mut elems, "record.panel.camera", &mut r.camera, &cameras, !recording);
-                ui.end_row();
-                ui.label("Quality:");
-                let mut q = r.quality.label().to_string();
                 let qs: Vec<(String, String)> = Quality::ALL.iter().map(|q| (q.label().to_string(), q.label().to_string())).collect();
-                combo(ui, &mut elems, "record.panel.quality", &mut q, &qs, !recording && !r.camera.is_empty());
-                r.quality = Quality::ALL.into_iter().find(|x| x.label() == q).unwrap_or(r.quality);
-                ui.end_row();
-                ui.label("Microphone:");
-                combo(ui, &mut elems, "record.panel.mic", &mut r.mic, &mics, !recording);
+                let mut remove_cam = None;
+                for (i, c) in r.cameras.iter_mut().enumerate() {
+                    let n = i + 1;
+                    let id = format!("record.panel.camera.{n}");
+                    ui.label(if n == 1 { "Camera:".to_string() } else { format!("Camera {n}:") });
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            combo(ui, &mut elems, &format!("{id}.device"), &mut c.device, &cameras, !recording, 220.0);
+                            let mut q = c.quality.label().to_string();
+                            combo(ui, &mut elems, &format!("{id}.quality"), &mut q, &qs, !recording && !c.device.is_empty(), 70.0);
+                            c.quality = Quality::ALL.into_iter().find(|x| x.label() == q).unwrap_or(c.quality);
+                            let x = ui.add_enabled(!recording, egui::Button::new("−").small());
+                            elems.push((format!("{id}.remove"), x.rect, format!("Remove camera {n}")));
+                            if x.clicked() {
+                                remove_cam = Some(i);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let m = ui.add_enabled(!recording && !c.device.is_empty(), egui::Checkbox::new(&mut c.mirror, "Mirror"));
+                            elems.push((format!("{id}.mirror"), m.rect, format!("Mirror {}", c.mirror)));
+                            ui.label("Offset:");
+                            let o =
+                                ui.add_enabled(!c.device.is_empty(), egui::DragValue::new(&mut c.offset_ms).speed(1.0).range(-5000.0..=5000.0).suffix(" ms"));
+                            elems.push((format!("{id}.offset"), o.rect, format!("{}", c.offset_ms)));
+                        });
+                    });
+                    ui.end_row();
+                }
+                if let Some(i) = remove_cam {
+                    r.cameras.remove(i);
+                }
+                let mut remove_mic = None;
+                for (i, m) in r.mics.iter_mut().enumerate() {
+                    let n = i + 1;
+                    let id = format!("record.panel.mic.{n}");
+                    ui.label(if n == 1 { "Microphone:".to_string() } else { format!("Microphone {n}:") });
+                    ui.horizontal(|ui| {
+                        combo(ui, &mut elems, &format!("{id}.device"), &mut m.device, &mics, !recording, 300.0);
+                        let x = ui.add_enabled(!recording, egui::Button::new("−").small());
+                        elems.push((format!("{id}.remove"), x.rect, format!("Remove microphone {n}")));
+                        if x.clicked() {
+                            remove_mic = Some(i);
+                        }
+                    });
+                    ui.end_row();
+                }
+                if let Some(i) = remove_mic {
+                    r.mics.remove(i);
+                }
+                ui.label("");
+                ui.horizontal(|ui| {
+                    let a = ui.add_enabled(!recording && r.cameras.len() < MAX_ROWS, egui::Button::new("+ Camera"));
+                    elems.push(("record.panel.camera.add".into(), a.rect, "+ Camera".into()));
+                    if a.clicked() {
+                        let used: Vec<&str> = r.cameras.iter().map(|c| c.device.as_str()).collect();
+                        let next = cameras.iter().map(|c| c.0.clone()).find(|id| !id.is_empty() && !used.contains(&id.as_str())).unwrap_or_default();
+                        r.cameras.push(CameraRow { device: next, ..Default::default() });
+                    }
+                    let a = ui.add_enabled(!recording && r.mics.len() < MAX_ROWS, egui::Button::new("+ Microphone"));
+                    elems.push(("record.panel.mic.add".into(), a.rect, "+ Microphone".into()));
+                    if a.clicked() {
+                        r.mics.push(MicRow::default());
+                    }
+                });
                 ui.end_row();
                 ui.label("Name:");
-                let t = ui.add_enabled(!recording, egui::TextEdit::singleline(&mut r.name).hint_text("Recording <n>").desired_width(260.0));
+                let t = ui.add_enabled(!recording, egui::TextEdit::singleline(&mut r.name).hint_text("Recording <n>").desired_width(300.0));
                 elems.push(("record.panel.name".into(), t.rect, r.name.clone()));
-                ui.end_row();
-                ui.label("Offset camera by:");
-                let o = ui.add_enabled(!r.camera.is_empty(), egui::DragValue::new(&mut r.offset_ms).speed(1.0).range(-5000.0..=5000.0).suffix(" ms"));
-                elems.push(("record.panel.offset".into(), o.rect, format!("{}", r.offset_ms)));
                 ui.end_row();
             });
             ui.add_space(6.0);
@@ -420,15 +507,31 @@ mod tests {
     fn params_from_the_choices() {
         let r = RecordUi {
             screen: "display:7".into(),
-            camera: "cam".into(),
-            quality: Quality::P720,
-            mic: "default".into(),
+            cameras: vec![CameraRow { device: "cam".into(), quality: Quality::P720, ..Default::default() }],
+            mics: vec![MicRow { device: "default".into() }],
             name: " Take ".into(),
             ..Default::default()
         };
-        assert_eq!(start_params(&r), json!({"screen": {"display": "7"}, "camera": {"device": "cam", "width": 1280, "height": 720}, "mic": {}, "name": "Take"}));
-        let r = RecordUi { screen: "window:42".into(), quality: Quality::Native, mic: "USB Mic".into(), ..Default::default() };
-        assert_eq!(start_params(&r), json!({"screen": {"window": "42"}, "mic": {"device": "USB Mic"}}));
+        assert_eq!(
+            start_params(&r),
+            json!({"screen": {"display": "7"}, "cameras": [{"device": "cam", "width": 1280, "height": 720}], "mics": [{}], "name": "Take"})
+        );
+        assert_eq!(stop_params(&r), json!({}));
+        let r = RecordUi {
+            screen: "window:42".into(),
+            cameras: vec![
+                CameraRow { device: "a".into(), quality: Quality::Native, mirror: true, offset_ms: 0.0 },
+                CameraRow::default(),
+                CameraRow { device: "b".into(), quality: Quality::Native, mirror: false, offset_ms: -80.0 },
+            ],
+            mics: vec![MicRow { device: "USB Mic".into() }, MicRow::default()],
+            ..Default::default()
+        };
+        assert_eq!(
+            start_params(&r),
+            json!({"screen": {"window": "42"}, "cameras": [{"device": "a", "mirror": true}, {"device": "b"}], "mics": [{"device": "USB Mic"}]})
+        );
+        assert_eq!(stop_params(&r), json!({"cameraOffsetsMs": [0.0, -80.0]}));
         assert_eq!(start_params(&RecordUi::default()), json!({}));
         assert_eq!(mmss(75.9), "01:15");
         assert_eq!(mmss(f64::NAN), "00:00");

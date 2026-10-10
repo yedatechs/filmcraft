@@ -18,7 +18,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 /// A session recording from small synthetic sources; the camera starts `camera_delay_ms` late.
 fn session(camera_delay_ms: u64) -> Session {
     let mut s = Session::default();
-    s.record.factory = Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), screen_delay_ms: 0, camera_delay_ms }));
+    s.record.factory = Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), camera_delay_ms, ..Default::default() }));
     s
 }
 
@@ -265,4 +265,128 @@ fn synthetic_index_round_trips() {
         assert_eq!(read_synthetic_index(&luma, 320, 180), Some(k));
     }
     assert_eq!(read_synthetic_index(&[], 320, 180), None);
+}
+
+#[test]
+fn two_cameras_and_two_mics_each_get_a_file_and_a_track() {
+    let dir = tmp("multi");
+    let mut s = Session::default();
+    s.record.factory = Some(Arc::new(SyntheticFactory {
+        display_size: (320, 180),
+        camera_size: (320, 180),
+        camera_delay_ms: 100,
+        camera2_delay_ms: 400,
+        ..Default::default()
+    }));
+    let r = s
+        .execute(
+            "record.start",
+            json!({
+                "screen": {"display": SyntheticFactory::DISPLAY},
+                "cameras": [{"device": SyntheticFactory::CAMERA}, {"device": SyntheticFactory::CAMERA2}],
+                "mics": [{}, {"device": "Synthetic Input 2"}],
+                "dir": dir.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+    let keys: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, ["screen", "camera", "camera2", "mic", "mic2"]);
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!(st["sources"].as_array().unwrap().len(), 5, "{st}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let v = s.execute("record.stop", json!({"cameraOffsetsMs": [0, 100]})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    let files: Vec<String> = v["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+    for (f, label) in files.iter().zip(["Screen.mov", "Camera.mov", "Camera 2.mov", "Mic.wav", "Mic 2.wav"]) {
+        assert!(f.ends_with(&format!("Recording 1 - {label}")), "{f}");
+        assert!(std::fs::metadata(f).unwrap().len() > 1000, "{f}");
+    }
+    let sides: Vec<Value> = files.iter().map(|f| sidecar(f)).collect();
+    assert_eq!(sides[2]["source"], "camera");
+    assert_eq!(sides[2]["index"], 2);
+    assert_eq!(sides[2]["device"]["id"], SyntheticFactory::CAMERA2);
+    assert_eq!(sides[2]["camera_offset_ms"], 100.0);
+    assert_eq!(sides[1]["camera_offset_ms"], 0.0);
+    assert_eq!(sides[4]["index"], 2);
+    assert!(sides.iter().all(|sd| sd["clock_start_ns"] == sides[0]["clock_start_ns"]));
+    let first = |i: usize| sides[i]["first_sample_ns"].as_u64().unwrap() as f64 / 1e9;
+    let (skew1, skew2) = (first(1) - first(0), first(2) - first(0));
+    assert!((0.09..0.16).contains(&skew1), "{skew1}");
+    assert!((0.39..0.46).contains(&skew2), "{skew2}");
+    // V1 screen, V2 camera, V3 camera 2; A1 mic, A2 mic 2
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (3, 2));
+    for (t, key) in q.video_tracks.iter().zip(["screen", "camera", "camera2"]) {
+        assert_eq!(t.items.len(), 1);
+        assert_eq!(t.items[0].id, clip(&s, &v, key).id, "{key}");
+    }
+    for (t, key) in q.audio_tracks.iter().zip(["mic", "mic2"]) {
+        assert_eq!(t.items[0].id, clip(&s, &v, key).id, "{key}");
+    }
+    let at = |key: &str| {
+        let c = clip(&s, &v, key);
+        secs(c.start) - secs(c.source_in)
+    };
+    assert!((at("camera") - skew1).abs() < 0.002, "camera at its first sample: {} vs {skew1}", at("camera"));
+    assert!((at("camera2") - (skew2 + 0.1)).abs() < 0.002, "camera 2 moved by its own 100 ms: {} vs {skew2}", at("camera2"));
+    assert_eq!(q.markers[0].comment, "camera 2 offset 100 ms");
+    assert_eq!(v["cameras"], json!(["camera", "camera2"]));
+    assert_eq!(v["mics"], json!(["mic", "mic2"]));
+    let item = filmcraft_project::ItemId(v["items"]["camera2"].as_u64().unwrap());
+    assert_eq!(s.project.item(item).unwrap().metadata.get("Recording Source").map(String::as_str), Some("camera2"));
+    assert!(s.voiceover.input.is_some(), "the session's microphone input is back");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_same_device_twice_or_too_many_is_refused() {
+    let dir = tmp("twice");
+    let mut s = session(0);
+    let d = dir.to_string_lossy().into_owned();
+    let cam = json!({"device": SyntheticFactory::CAMERA});
+    for p in [
+        json!({"cameras": [cam, cam], "dir": d}),
+        json!({"mics": [{}, {}], "dir": d}),
+        json!({"mics": [{"device": "Synthetic Input 2"}, {"device": "Synthetic Input 2"}], "dir": d}),
+        json!({"cameras": [cam, {"device": SyntheticFactory::CAMERA2}, cam, cam, cam], "dir": d}),
+        json!({"camera": cam, "cameras": [cam], "dir": d}),
+        json!({"cameras": cam, "dir": d}),
+        json!({"cameras": [7], "dir": d}),
+        json!({"cameras": [{"device": SyntheticFactory::CAMERA, "mirror": "yes"}], "dir": d}),
+        json!({"mics": [{}, {"device": "nope"}], "dir": d}),
+    ] {
+        let e = s.execute("record.start", p.clone());
+        assert!(e.is_err(), "{p}");
+        assert!(!s.record.recording(), "{p}");
+    }
+    let e = s.execute("record.start", json!({"cameras": [cam, cam], "dir": d})).unwrap_err().to_string();
+    assert!(e.contains("twice"), "{e}");
+    assert!(s.voiceover.input.is_some());
+    // `cameras: []` with a mic is just the mic; offsets are checked like the scalar
+    s.execute("record.start", json!({"cameras": [], "mic": {}, "dir": d})).unwrap();
+    assert!(s.execute("record.stop", json!({"cameraOffsetsMs": [0, 9000]})).is_err());
+    assert!(s.execute("record.stop", json!({"cameraOffsetsMs": "x"})).is_err());
+    assert!(s.record.recording());
+    s.execute("record.cancel", json!({})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_mirrored_camera_is_flipped_in_the_sequence() {
+    let dir = tmp("mirror");
+    let mut s = session(0);
+    s.execute("record.start", json!({"cameras": [{"device": SyntheticFactory::CAMERA, "mirror": true}], "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(900));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    let cam = clip(&s, &v, "camera");
+    assert_eq!(cam.effects.first().map(|e| e.effect.as_str()), Some("horizontal_flip"), "{:?}", cam.effects.iter().map(|e| &e.effect).collect::<Vec<_>>());
+    let file = v["files"][0].as_str().unwrap().to_string();
+    assert_eq!(sidecar(&file)["mirror"], true);
+    // the rendered picture is the camera's, mirrored: the burnt-in index reads back right to left
+    let img = s.render_program_at(1.0, Tick::from_seconds_f64(0.5)).unwrap();
+    let luma: Vec<u8> = img.px.chunks(4).map(|p| (p[1].clamp(0.0, 1.0) * 255.0) as u8).collect();
+    let mirrored: Vec<u8> = luma.chunks(img.w).flat_map(|row| row.iter().rev().copied().collect::<Vec<_>>()).collect();
+    let k = read_synthetic_index(&mirrored, img.w as u32, img.h as u32).unwrap();
+    assert!((5..=25).contains(&k), "frame {k} at 0.5 s once unflipped");
+    std::fs::remove_dir_all(&dir).ok();
 }

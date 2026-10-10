@@ -61,6 +61,11 @@ pub trait AudioInput: Send {
     /// Drop everything captured so far: the next sample read is "now".
     fn discard(&mut self);
     fn stop(&mut self);
+    /// A new, independent input of the same kind (another device recorded at the same time:
+    /// Record with several microphones). None: this input cannot be opened twice.
+    fn spawn(&self) -> Option<Box<dyn AudioInput>> {
+        None
+    }
 }
 
 /// The signal a [`SyntheticInput`] produces.
@@ -82,6 +87,8 @@ pub struct SyntheticInput {
 
 impl SyntheticInput {
     pub const DEVICE: &'static str = "Synthetic Input";
+    /// A second device name (recordings with two microphones); it produces the same signal.
+    pub const DEVICE2: &'static str = "Synthetic Input 2";
     pub fn new(signal: Synthetic) -> Self {
         Self { signal, rate: 48_000, pos: 0 }
     }
@@ -93,7 +100,7 @@ impl SyntheticInput {
 
 impl AudioInput for SyntheticInput {
     fn devices(&self) -> Vec<String> {
-        vec![Self::DEVICE.to_string()]
+        vec![Self::DEVICE.to_string(), Self::DEVICE2.to_string()]
     }
     fn channels(&self, _device: &str) -> u16 {
         match &self.signal {
@@ -124,6 +131,9 @@ impl AudioInput for SyntheticInput {
         self.pos = 0;
     }
     fn stop(&mut self) {}
+    fn spawn(&self) -> Option<Box<dyn AudioInput>> {
+        Some(Box::new(SyntheticInput::new(self.signal.clone())))
+    }
 }
 
 // ------------------------------------------------------------------------------------- settings
