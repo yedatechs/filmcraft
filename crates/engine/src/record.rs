@@ -37,7 +37,7 @@ use filmcraft_project::{ItemId, Label, Marker, MarkerId, MarkerKind, SequenceSet
 use filmcraft_time::{FrameRate, Tick, TimeRange};
 
 use crate::commands::{CommandSpec, bad, bool_p, str_p};
-use crate::record_settings::{AUTO_GAIN_TARGET_DB, AutoGain, RecordingSettings, WavFormat, wav_header};
+use crate::record_settings::{AUTO_GAIN_TARGET_DB, AutoGain, CameraRotate, RecordingSettings, WavFormat, wav_header};
 use crate::voiceover::{AudioInput, SyntheticInput};
 use crate::{EngineError, Result, Session};
 use filmcraft_export::recorder::{CaptureCodec, CaptureEncoding, MovRecorder};
@@ -222,6 +222,13 @@ pub trait VideoInput: Send {
     fn error(&self) -> Option<String> {
         None
     }
+    /// The orientation the camera reports now: degrees (0 / 90 / 180 / 270) its pictures must be
+    /// turned clockwise to stand upright (None: this input reports none; screens). Read when a
+    /// recording starts (Rotate Auto), while it runs (a change is noted, the file keeps the start
+    /// value) and by the preview; it must be cheap and never block.
+    fn rotation(&self) -> Option<u16> {
+        None
+    }
     /// Also deliver the sound the system plays (a screen input; called before [`Self::start`]),
     /// preferably at `sample_rate` with `channels`. False: this input cannot.
     fn capture_audio(&mut self, _sample_rate: u32, _channels: u16, _sink: AudioSink) -> bool {
@@ -367,11 +374,22 @@ pub struct SyntheticFactory {
     pub camera2_delay_ms: u64,
     /// How many times a camera was opened (tests: a preview and a recording share one).
     pub camera_opens: Arc<AtomicU64>,
+    /// The orientation the synthetic cameras report (degrees clockwise; tests change it while
+    /// they run, as a camera's own software would).
+    pub camera_rotation: Arc<AtomicU32>,
 }
 
 impl Default for SyntheticFactory {
     fn default() -> Self {
-        Self { display_size: (1280, 720), camera_size: (640, 360), screen_delay_ms: 0, camera_delay_ms: 0, camera2_delay_ms: 0, camera_opens: Arc::default() }
+        Self {
+            display_size: (1280, 720),
+            camera_size: (640, 360),
+            screen_delay_ms: 0,
+            camera_delay_ms: 0,
+            camera2_delay_ms: 0,
+            camera_opens: Arc::default(),
+            camera_rotation: Arc::default(),
+        }
     }
 }
 
@@ -424,10 +442,15 @@ impl VideoInputFactory for SyntheticFactory {
         if device == Self::CAMERA || device == Self::CAMERA2 {
             self.camera_opens.fetch_add(1, Ordering::Relaxed);
         }
+        let camera = |delay| {
+            let mut i = SyntheticVideoInput::new(self.camera_size, delay);
+            i.rotation = Some(self.camera_rotation.clone());
+            Box::new(i)
+        };
         if device == Self::CAMERA {
-            Ok(Box::new(SyntheticVideoInput::new(self.camera_size, self.camera_delay_ms)))
+            Ok(camera(self.camera_delay_ms))
         } else if device == Self::CAMERA2 {
-            Ok(Box::new(SyntheticVideoInput::new(self.camera_size, self.camera2_delay_ms)))
+            Ok(camera(self.camera2_delay_ms))
         } else {
             Err(CaptureError::new(CaptureErrorKind::NoDevice, format!("no camera `{device}`")))
         }
@@ -447,6 +470,8 @@ pub struct SyntheticVideoInput {
     thread: Option<std::thread::JoinHandle<()>>,
     error: Arc<Mutex<Option<String>>>,
     audio: Option<(u32, u16, AudioSink)>,
+    /// A camera's reported orientation (None: a screen, which reports none).
+    rotation: Option<Arc<AtomicU32>>,
 }
 
 /// The tone of the synthetic system audio.
@@ -454,7 +479,7 @@ pub const SYNTHETIC_TONE_HZ: f64 = 440.0;
 
 impl SyntheticVideoInput {
     pub fn new(native: (u32, u32), delay_ms: u64) -> Self {
-        Self { native, delay_ms, stop: Arc::new(AtomicBool::new(false)), thread: None, error: Arc::new(Mutex::new(None)), audio: None }
+        Self { native, delay_ms, stop: Arc::new(AtomicBool::new(false)), thread: None, error: Arc::new(Mutex::new(None)), audio: None, rotation: None }
     }
 }
 
@@ -574,6 +599,9 @@ impl VideoInput for SyntheticVideoInput {
     }
     fn error(&self) -> Option<String> {
         self.error.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+    fn rotation(&self) -> Option<u16> {
+        self.rotation.as_ref().map(|r| u16::try_from(r.load(Ordering::Acquire)).unwrap_or(0))
     }
     fn capture_audio(&mut self, sample_rate: u32, channels: u16, sink: AudioSink) -> bool {
         self.audio = Some((sample_rate.clamp(8_000, 192_000), channels.clamp(1, 2), sink));
@@ -817,8 +845,19 @@ struct VideoSource {
     device_name: String,
     /// Flip the clip horizontally in the sequence (a camera seen as in a mirror).
     mirror: bool,
-    /// Turn the clip clockwise by this many degrees (cameras).
+    /// The file's display rotation (degrees clockwise, cameras): the Rotate setting, or with Auto
+    /// the camera's orientation at the start.
     rotate: u32,
+    /// The camera's Rotate (Auto or fixed).
+    rotate_setting: CameraRotate,
+    /// The orientation the camera reported at the start (None: it reports none).
+    camera_rotation: Option<u16>,
+    /// With Auto: the camera's orientation changed during the recording (the file keeps the
+    /// start's): the last value seen, how many changes, and when the first was seen (ns after the
+    /// recording's start).
+    rotation_seen: Option<u16>,
+    rotation_changes: u32,
+    rotation_changed_at_ns: Option<u64>,
     /// The part of the display recorded (screens; sidecar `area`).
     area: Option<[u32; 4]>,
     input: Box<dyn VideoInput>,
@@ -876,6 +915,23 @@ pub struct Active {
 }
 
 impl Active {
+    /// With Rotate Auto: notice a camera whose orientation changed since the start (the file's
+    /// single track header keeps the start's; the sidecar and Stop say so).
+    fn watch_rotation(&mut self) {
+        let origin = self.origin.load(Ordering::Acquire);
+        let now = self.raw.now_ns();
+        for v in self.video.iter_mut().filter(|v| v.src.kind == SourceKind::Camera && v.rotate_setting == CameraRotate::Auto) {
+            let r = v.input.rotation();
+            if r.is_none() || r == v.rotation_seen {
+                continue;
+            }
+            v.rotation_seen = r;
+            v.rotation_changes = v.rotation_changes.saturating_add(1);
+            if v.rotation_changed_at_ns.is_none() {
+                v.rotation_changed_at_ns = Some(if origin == NONE { 0 } else { now.saturating_sub(origin) });
+            }
+        }
+    }
     /// The inputs of the screen sources (to refresh what they leave out).
     pub(crate) fn screen_inputs(&mut self) -> impl Iterator<Item = &mut Box<dyn VideoInput>> {
         self.video.iter_mut().filter(|v| v.src.kind == SourceKind::Screen).map(|v| &mut v.input)
@@ -1543,8 +1599,8 @@ struct CameraPlan {
     device: String,
     req: VideoRequest,
     mirror: bool,
-    /// Turn the clip clockwise by this many degrees (0 / 90 / 180 / 270).
-    rotate: u32,
+    /// Auto (the camera's orientation) or 0 / 90 / 180 / 270 degrees clockwise.
+    rotate: CameraRotate,
 }
 
 struct Plan {
@@ -1689,7 +1745,7 @@ struct VideoSetup {
     device_id: String,
     device_name: String,
     mirror: bool,
-    rotate: u32,
+    rotate: CameraRotate,
     enc: CaptureEncoding,
 }
 
@@ -1767,10 +1823,13 @@ fn start_video(
             return Err(format!("{label} encoder: {e}"));
         }
     };
-    // a turned camera: the file's track header says so (as iPhones do); the pictures stay as captured
-    if src.kind == SourceKind::Camera {
-        rec.set_rotation(u16::try_from(rotate).unwrap_or(0));
-    }
+    // a turned camera: the file's track header says so (as iPhones do); the pictures stay as
+    // captured. Auto takes the orientation the camera reports now, at the start (a change made
+    // while it previewed, in the camera's own software, counts); a fixed Rotate wins.
+    let camera_rotation = if src.kind == SourceKind::Camera { input.rotation() } else { None };
+    let rotate_setting = rotate;
+    let rotate = if src.kind == SourceKind::Camera { rotate.effective(camera_rotation) } else { 0 };
+    rec.set_rotation(u16::try_from(rotate).unwrap_or(0));
     let (q, st, stop, o) = (queue.clone(), stats.clone(), stop_ns.clone(), origin.clone());
     let rate = FrameRate::new(i64::from(fps), 1);
     let worker = std::thread::Builder::new()
@@ -1788,7 +1847,25 @@ fn start_video(
             return Err(e);
         }
     };
-    Ok(VideoSource { src, notes, device_id, device_name, mirror, rotate, area: req.area, input, queue, stats, worker: Some(worker), path })
+    Ok(VideoSource {
+        src,
+        notes,
+        device_id,
+        device_name,
+        mirror,
+        rotate,
+        rotate_setting,
+        camera_rotation,
+        rotation_seen: camera_rotation,
+        rotation_changes: 0,
+        rotation_changed_at_ns: None,
+        area: req.area,
+        input,
+        queue,
+        stats,
+        worker: Some(worker),
+        path,
+    })
 }
 
 /// Ask a screen input for its system audio, into `path`; None when it cannot (the start goes on
@@ -2190,7 +2267,7 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
                 device_id: id,
                 device_name: screen_name.clone().unwrap_or_default(),
                 mirror: false,
-                rotate: 0,
+                rotate: CameraRotate::Fixed(0),
                 enc,
             };
             let input = f.open_screen(&sp.target).map_err(|e| EngineError::Other(format!("screen: {e}")))?;
@@ -2357,6 +2434,9 @@ pub fn tick(s: &mut Session) -> Option<Value> {
             }
         }
     }
+    if let Some(a) = s.record.active.as_mut() {
+        a.watch_rotation();
+    }
     let due = s.record.active.as_ref().and_then(|a| a.stop_after_ms.map(|l| now.saturating_sub(a.started_ms) >= l)).unwrap_or(false);
     if due {
         let minutes = s.record.active.as_ref().map_or(0, |a| a.settings.stop_after_minutes);
@@ -2454,6 +2534,10 @@ struct Done {
     device_name: String,
     mirror: bool,
     rotate: u32,
+    rotate_setting: CameraRotate,
+    camera_rotation: Option<u16>,
+    rotation_changes: u32,
+    rotation_changed_at_ns: Option<u64>,
     area: Option<[u32; 4]>,
     first_ns: u64,
     last_ns: u64,
@@ -2520,6 +2604,16 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
                 o.insert("mirror_note".into(), json!("the file is as the camera saw it; the clip has a Horizontal Flip effect"));
             }
             o.insert("rotate".into(), json!(d.rotate));
+            o.insert("rotate_setting".into(), json!(d.rotate_setting));
+            o.insert("camera_rotation".into(), json!(d.camera_rotation));
+            if let Some(at) = d.rotation_changed_at_ns {
+                o.insert("rotation_changed_at_ns".into(), json!(at));
+                o.insert("rotation_changes".into(), json!(d.rotation_changes));
+                o.insert(
+                    "rotation_note".into(),
+                    json!("the camera turned during the recording: the file keeps the orientation it had at the start (a track header has one rotation)"),
+                );
+            }
             if d.rotate != 0 {
                 o.insert(
                     "rotate_note".into(),
@@ -2535,6 +2629,7 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
 /// Stop every source and collect what each produced (`Err`: that source's failure).
 fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Result<Done, String>>) {
     // sample times are on the start clock
+    a.watch_rotation();
     let stop = a.raw.now_ns();
     a.stop_ns.store(stop, Ordering::Release);
     let mut out = Vec::new();
@@ -2559,6 +2654,10 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_name: v.device_name.clone(),
             mirror: v.mirror,
             rotate: v.rotate,
+            rotate_setting: v.rotate_setting,
+            camera_rotation: v.camera_rotation,
+            rotation_changes: v.rotation_changes,
+            rotation_changed_at_ns: v.rotation_changed_at_ns,
             area: v.area,
             first_ns: v.stats.first().unwrap_or(0),
             last_ns: v.stats.last().unwrap_or(0),
@@ -2586,6 +2685,10 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_name: m.device.clone(),
             mirror: false,
             rotate: 0,
+            rotate_setting: CameraRotate::Fixed(0),
+            camera_rotation: None,
+            rotation_changes: 0,
+            rotation_changed_at_ns: None,
             area: None,
             first_ns: m.stats.first().unwrap_or(0),
             last_ns: m.stats.last().unwrap_or(0),
@@ -2610,6 +2713,10 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_name: "System Audio".into(),
             mirror: false,
             rotate: 0,
+            rotate_setting: CameraRotate::Fixed(0),
+            camera_rotation: None,
+            rotation_changes: 0,
+            rotation_changed_at_ns: None,
             area: None,
             first_ns: sa.stats.first().unwrap_or(0),
             last_ns: sa.stats.last().unwrap_or(0),
@@ -2744,6 +2851,10 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
         o.insert("files".into(), json!(done.iter().map(|d| d.path.to_string_lossy().into_owned()).collect::<Vec<_>>()));
         o.insert("errors".into(), json!(errors));
         o.insert("notes".into(), json!(a.notes));
+        // Auto cameras that turned while recording (the files keep the start's orientation)
+        let turned: Vec<Value> =
+            done.iter().filter_map(|d| d.rotation_changed_at_ns.map(|at| json!({"source": d.src.key(), "atNs": at, "rotate": d.rotate}))).collect();
+        o.insert("rotationChanged".into(), json!(turned));
     }
     Ok(v)
 }

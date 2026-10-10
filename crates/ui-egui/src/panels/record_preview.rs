@@ -144,9 +144,10 @@ fn paint(ui: &egui::Ui, slot: &mut Option<Tex>, name: &str, tap: &CameraTap, ori
     label(tap, f.as_deref(), orient.1)
 }
 
-/// How a row's picture is shown: (Mirror, Rotate degrees), like its clip will be.
-fn orient_of(c: &CameraRow) -> (bool, u32) {
-    (c.mirror, c.rotate)
+/// How a row's picture is shown: (Mirror, Rotate degrees), like its file will be: with Auto the
+/// orientation the camera reports now (it follows a turn made in the camera's own software).
+fn orient_of(c: &CameraRow, tap: &CameraTap) -> (bool, u32) {
+    (c.mirror, c.rotate.effective(tap.rotation()))
 }
 
 /// The cameras the panel wants live: the rows with a camera while the panel is open or a
@@ -224,7 +225,7 @@ pub fn sync(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     Arc::new(Popout {
                         tap: tap.clone(),
                         title: format!("{PREVIEW_TITLE} — {name}"),
-                        orient: Mutex::new(orient_of(c)),
+                        orient: Mutex::new(orient_of(c, &tap)),
                         closed: AtomicBool::new(false),
                         tex: Mutex::new(None),
                         drawn: Mutex::new(None),
@@ -232,7 +233,7 @@ pub fn sync(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 })
                 .clone()
         };
-        *pop.orient.lock().unwrap_or_else(PoisonError::into_inner) = orient_of(c);
+        *pop.orient.lock().unwrap_or_else(PoisonError::into_inner) = orient_of(c, &tap);
         if created {
             // a preview window opened during a display recording: leave it out of the file
             super::record_overlay::schedule_refresh(app);
@@ -317,7 +318,7 @@ pub fn thumbnail(
             let mut st = cache.lock();
             let slot = st.textures.remove(&c.device);
             let mut slot = slot;
-            let l = paint(ui, &mut slot, &format!("record-thumb-{}", c.device), t, orient_of(c), rect);
+            let l = paint(ui, &mut slot, &format!("record-thumb-{}", c.device), t, orient_of(c, t), rect);
             if let Some(s) = slot {
                 st.textures.insert(c.device.clone(), s);
             }

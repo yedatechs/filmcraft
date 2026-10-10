@@ -10,6 +10,14 @@
 //!   (720p / 1080p / 2160p, else the device's best); the frame rate is the one asked for when
 //!   the active format supports it (`activeVideoMin/MaxFrameDuration`), else the format's best.
 //! - Camera audio is not captured: the microphone source records sound.
+//! - Orientation ([`VideoInput::rotation`], Rotate Auto): on macOS 14+ an
+//!   `AVCaptureDeviceRotationCoordinator` made for the device (the object FaceTime-style apps use to
+//!   stand a turned camera upright) gives `videoRotationAngleForHorizonLevelCapture`, less the
+//!   angle the data output's connection already applies (`videoRotationAngle`, 0 unless set);
+//!   before macOS 14 (no coordinator) it is the connection's own angle (`videoOrientation`
+//!   mapped to degrees). Read on demand (at record start, by the engine's frame loop while
+//!   recording and by the preview), never pushed: the pictures are never turned here, the turn
+//!   goes into the file's track header. Mirroring is not read: Mirror stays the user's choice.
 //!
 //! The Camera permission is checked first; an undetermined one is requested (the system prompt)
 //! without waiting, and the start fails with a message naming the System Settings pane.
@@ -21,8 +29,8 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, Bool, ProtocolObject};
-use objc2::{AnyThread, DefinedClass, define_class, msg_send};
+use objc2::runtime::{AnyClass, AnyObject, Bool, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
 use objc2_av_foundation::{
     AVAuthorizationStatus, AVCaptureConnection, AVCaptureDevice, AVCaptureDeviceInput, AVCaptureOutput, AVCaptureSession, AVCaptureSessionPreset,
     AVCaptureSessionPreset1280x720, AVCaptureSessionPreset1920x1080, AVCaptureSessionPreset3840x2160, AVCaptureSessionPresetHigh, AVCaptureVideoDataOutput,
@@ -169,6 +177,10 @@ impl SampleDelegate {
 struct Running {
     session: Retained<AVCaptureSession>,
     _output: Retained<AVCaptureVideoDataOutput>,
+    /// The output's video connection (its applied rotation angle).
+    connection: Option<Retained<AVCaptureConnection>>,
+    /// An `AVCaptureDeviceRotationCoordinator` for the device (macOS 14+).
+    coordinator: Option<Retained<AnyObject>>,
     _delegate: Retained<SampleDelegate>,
     _queue: DispatchRetained<DispatchQueue>,
     shared: Arc<Shared>,
@@ -265,6 +277,87 @@ impl VideoInput for CameraInput {
 
     fn error(&self) -> Option<String> {
         self.error.as_ref().and_then(|s| s.error.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+
+    fn rotation(&self) -> Option<u16> {
+        let r = &self.running.as_ref()?.0;
+        let read = || {
+            // SAFETY: the connection and coordinator are retained by `Running`; both selectors are
+            // checked with `respondsToSelector:` first (videoRotationAngle and the coordinator's
+            // angle are CGFloat = f64 on every Mac we run on), and `videoOrientation` exists on
+            // every macOS (deprecated since 14).
+            unsafe {
+                let applied = r.connection.as_ref().map(|c| {
+                    if c.respondsToSelector(sel!(videoRotationAngle)) {
+                        let a: f64 = msg_send![&**c, videoRotationAngle];
+                        quarter_turn(a)
+                    } else {
+                        #[allow(deprecated)]
+                        let o = c.videoOrientation().0;
+                        orientation_degrees(o)
+                    }
+                });
+                let level = r
+                    .coordinator
+                    .as_ref()
+                    .filter(|c| {
+                        let ok: bool = msg_send![&***c, respondsToSelector: sel!(videoRotationAngleForHorizonLevelCapture)];
+                        ok
+                    })
+                    .map(|c| {
+                        let a: f64 = msg_send![&**c, videoRotationAngleForHorizonLevelCapture];
+                        quarter_turn(a)
+                    });
+                camera_turn(applied, level)
+            }
+        };
+        super::catch_objc("reading the camera's orientation", read).ok().flatten()
+    }
+}
+
+/// `degrees` to the nearest quarter turn, 0 / 90 / 180 / 270 (not finite: 0).
+fn quarter_turn(degrees: f64) -> u16 {
+    if !degrees.is_finite() {
+        return 0;
+    }
+    ((degrees / 90.0).round().rem_euclid(4.0) as u16).saturating_mul(90)
+}
+
+/// A connection's (pre-macOS 14) `videoOrientation` as a rotation angle, the way Apple maps the
+/// two: landscape right 0°, portrait 90°, landscape left 180°, portrait upside down 270°.
+/// (`AVCaptureVideoOrientation`'s raw values: 1 portrait, 2 upside down, 3 right, 4 left.)
+fn orientation_degrees(o: isize) -> u16 {
+    match o {
+        1 => 90,
+        4 => 180,
+        2 => 270,
+        _ => 0,
+    }
+}
+
+/// The turn the recorded pictures need: with a rotation coordinator (`level`, the angle that
+/// stands the device's capture upright) less what the connection already turns (`applied`);
+/// without one, the connection's angle. None when there is neither.
+fn camera_turn(applied: Option<u16>, level: Option<u16>) -> Option<u16> {
+    match (applied, level) {
+        (a, Some(l)) => Some((l + 360 - a.unwrap_or(0) % 360) % 360),
+        (Some(a), None) => Some(a % 360),
+        (None, None) => None,
+    }
+}
+
+/// An `AVCaptureDeviceRotationCoordinator` for `device` (no preview layer), or None before
+/// macOS 14 (the class is missing).
+///
+/// # Safety
+/// `device` must be a valid capture device.
+unsafe fn rotation_coordinator(device: &AVCaptureDevice) -> Option<Retained<AnyObject>> {
+    let cls = AnyClass::get(c"AVCaptureDeviceRotationCoordinator")?;
+    // SAFETY: `cls` is AVCaptureDeviceRotationCoordinator (macOS 14+), whose designated
+    // initializer is `initWithDevice:previewLayer:`; a nil preview layer is allowed.
+    unsafe {
+        let obj: objc2::rc::Allocated<AnyObject> = msg_send![cls, alloc];
+        msg_send![obj, initWithDevice: device, previewLayer: std::ptr::null_mut::<AnyObject>()]
     }
 }
 
@@ -367,8 +460,11 @@ impl CameraInput {
             let dim = CMVideoFormatDescriptionGetDimensions(&desc);
             let w = u32::try_from(dim.width).unwrap_or(1280).clamp(16, 8192) & !1;
             let h = u32::try_from(dim.height).unwrap_or(720).clamp(16, 8192) & !1;
+            // what tells the orientation (Rotate Auto); a failure only means "reports none"
+            let connection = media(false).and_then(|m| super::catch_objc("reading the camera connection", || output.connectionWithMediaType(m)).ok().flatten());
+            let coordinator = super::catch_objc("making the camera's rotation coordinator", || rotation_coordinator(&device)).ok().flatten();
             self.error = Some(shared.clone());
-            self.running = Some(Sendable(Running { session, _output: output, _delegate: delegate, _queue: queue, shared }));
+            self.running = Some(Sendable(Running { session, _output: output, connection, coordinator, _delegate: delegate, _queue: queue, shared }));
             Ok(VideoFormat { width: w, height: h, fps, format: PixelFormat::Bgra8 })
         }
     }
@@ -392,6 +488,26 @@ mod tests {
             assert!(c.formats.iter().all(|f| f.width > 0 && f.height > 0));
         }
         assert!(matches!(permission(false), Permission::Granted | Permission::Denied | Permission::Undetermined));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn orientation_becomes_a_quarter_turn() {
+        assert_eq!([0.0, 89.6, 90.0, 180.0, 270.0, 360.0, -90.0, f64::NAN].map(quarter_turn), [0, 90, 90, 180, 270, 0, 270, 0]);
+        let o = [
+            objc2_av_foundation::AVCaptureVideoOrientation::LandscapeRight,
+            objc2_av_foundation::AVCaptureVideoOrientation::Portrait,
+            objc2_av_foundation::AVCaptureVideoOrientation::LandscapeLeft,
+            objc2_av_foundation::AVCaptureVideoOrientation::PortraitUpsideDown,
+        ];
+        assert_eq!(o.map(|o| orientation_degrees(o.0)), [0, 90, 180, 270]);
+        // the coordinator's angle less what the connection already turns
+        assert_eq!(camera_turn(Some(0), Some(90)), Some(90));
+        assert_eq!(camera_turn(Some(90), Some(90)), Some(0));
+        assert_eq!(camera_turn(Some(180), Some(90)), Some(270));
+        assert_eq!(camera_turn(None, Some(270)), Some(270));
+        assert_eq!(camera_turn(Some(90), None), Some(90), "before macOS 14: the connection's");
+        assert_eq!(camera_turn(None, None), None);
     }
 
     #[test]

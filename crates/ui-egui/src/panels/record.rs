@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::FilmcraftApp;
+use filmcraft_engine::record_settings::CameraRotate;
 
 const RED: Color32 = Color32::from_rgb(0xd8, 0x50, 0x3f);
 
@@ -69,8 +70,9 @@ pub struct CameraRow {
     pub quality: Quality,
     /// Flip the camera horizontally in the sequence.
     pub mirror: bool,
-    /// Turn the camera's clip clockwise: 0 / 90 / 180 / 270 degrees.
-    pub rotate: u32,
+    /// Rotate: Auto (the camera's own orientation) or 0 / 90 / 180 / 270 degrees clockwise,
+    /// written into the file's track header.
+    pub rotate: CameraRotate,
     /// "Offset … ms", applied at Stop.
     pub offset_ms: f64,
     /// The live preview is popped out into its own always-on-top window.
@@ -254,9 +256,7 @@ pub fn start_params(r: &RecordUi) -> Value {
                 if c.mirror {
                     o.insert("mirror".into(), json!(true));
                 }
-                if matches!(c.rotate, 90 | 180 | 270) {
-                    o.insert("rotate".into(), json!(c.rotate));
-                }
+                o.insert("rotate".into(), json!(c.rotate));
             }
             v
         })
@@ -282,6 +282,18 @@ pub fn stop_params(r: &RecordUi) -> Value {
     if offsets.iter().all(|o| *o == 0.0) { json!({}) } else { json!({"cameraOffsetsMs": offsets}) }
 }
 
+/// What Stop says when a camera (Rotate Auto) turned while recording: the file keeps the
+/// orientation of the start ("" when none did).
+fn turned_note(stop: &Value) -> String {
+    match stop["rotationChanged"].as_array().map(Vec::len) {
+        Some(n) if n > 0 => {
+            let who = if n == 1 { "the camera" } else { "cameras" };
+            format!(". Note: {who} turned during the recording; the file keeps the orientation it had at the start")
+        }
+        _ => String::new(),
+    }
+}
+
 /// Run what the engine has due (a counted-down start, Stop after) and show what happened.
 pub fn tick(app: &mut FilmcraftApp) {
     let Some(ev) = filmcraft_engine::record::tick(&mut app.session) else { return };
@@ -294,10 +306,11 @@ pub fn tick(app: &mut FilmcraftApp) {
         Some("stoppedAfter") => {
             let v = &ev["result"];
             app.ui.record.last = format!(
-                "Stopped after {} min: {} — {} file(s) in a new sequence",
+                "Stopped after {} min: {} — {} file(s) in a new sequence{}",
                 ev["minutes"],
                 v["name"].as_str().unwrap_or("Recording"),
-                v["files"].as_array().map_or(0, Vec::len)
+                v["files"].as_array().map_or(0, Vec::len),
+                turned_note(v)
             );
             app.ui.status = app.ui.record.last.clone();
             app.ui.record.live.clear();
@@ -327,7 +340,7 @@ pub fn toggle(app: &mut FilmcraftApp) {
             Ok(v) => {
                 let errs: Vec<&str> = v["errors"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
                 let name = v["name"].as_str().unwrap_or("Recording");
-                app.ui.record.last = format!("Recorded {name}: {} file(s) in a new sequence", v["files"].as_array().map_or(0, Vec::len));
+                app.ui.record.last = format!("Recorded {name}: {} file(s) in a new sequence{}", v["files"].as_array().map_or(0, Vec::len), turned_note(&v));
                 app.ui.record.error = errs.join("; ");
                 app.ui.status = app.ui.record.last.clone();
             }
@@ -558,7 +571,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 });
                 ui.end_row();
                 let qs: Vec<(String, String)> = Quality::ALL.iter().map(|q| (q.label().to_string(), q.label().to_string())).collect();
-                let rotations: Vec<(String, String)> = [0, 90, 180, 270].iter().map(|r| (r.to_string(), format!("{r}°"))).collect();
+                let rotations: Vec<(String, String)> = std::iter::once(("auto".to_string(), "Auto".to_string()))
+                    .chain([0, 90, 180, 270].iter().map(|r| (r.to_string(), format!("{r}°"))))
+                    .collect();
                 let mut remove_cam = None;
                 for (i, c) in r.cameras.iter_mut().enumerate() {
                     let n = i + 1;
@@ -585,9 +600,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                             ui.horizontal(|ui| {
                                 let m = ui.add_enabled(!recording && !c.device.is_empty(), egui::Checkbox::new(&mut c.mirror, "Mirror"));
                                 elems.push((format!("{id}.mirror"), m.rect, format!("Mirror {}", c.mirror)));
-                                let mut rot = c.rotate.to_string();
+                                let mut rot = c.rotate.id();
                                 combo(ui, &mut elems, &format!("{id}.rotate"), &mut rot, &rotations, !recording && !c.device.is_empty(), 60.0);
-                                c.rotate = rot.parse().ok().filter(|r| matches!(r, 0 | 90 | 180 | 270)).unwrap_or(0);
+                                c.rotate = CameraRotate::from_id(&rot).unwrap_or_default();
                                 ui.label("Offset:");
                                 let o = ui
                                     .add_enabled(!c.device.is_empty(), egui::DragValue::new(&mut c.offset_ms).speed(1.0).range(-5000.0..=5000.0).suffix(" ms"));
@@ -832,7 +847,7 @@ fn settings_section(
         choice(ui, elems, patch, "cameraQuality", "Quality:", rs.camera_quality.clone(), opts(k::CAMERA_QUALITY), false, en);
         choice(ui, elems, patch, "cameraFps", "Frame rate:", rs.camera_fps.to_string(), opts(k::CAMERA_FPS), true, en);
         check(ui, elems, patch, "cameraMirror", "Mirror", rs.camera_mirror, en);
-        choice(ui, elems, patch, "cameraRotate", "Rotate:", rs.camera_rotate.to_string(), opts(k::CAMERA_ROTATE), true, en);
+        choice(ui, elems, patch, "cameraRotate", "Rotate:", rs.camera_rotate.id(), opts(k::CAMERA_ROTATE), true, en);
         head(ui, "Encoding");
         let codecs: Vec<(String, String)> = opts(k::CODECS).into_iter().filter(|(v, _)| cx.hevc || v != "hevc" || rs.codec == "hevc").collect();
         choice(ui, elems, patch, "codec", "Codec:", rs.codec.clone(), codecs, false, en);
@@ -891,20 +906,20 @@ mod tests {
     fn params_from_the_choices() {
         let r = RecordUi {
             screen: "display:7".into(),
-            cameras: vec![CameraRow { device: "cam".into(), quality: Quality::P720, rotate: 45, ..Default::default() }],
+            cameras: vec![CameraRow { device: "cam".into(), quality: Quality::P720, rotate: CameraRotate::Fixed(45), ..Default::default() }],
             mics: vec![MicRow { device: "default".into() }],
             name: " Take ".into(),
             ..Default::default()
         };
         assert_eq!(
             start_params(&r),
-            json!({"screen": {"display": "7"}, "cameras": [{"device": "cam", "width": 1280, "height": 720}], "mics": [{}], "name": "Take"})
+            json!({"screen": {"display": "7"}, "cameras": [{"device": "cam", "width": 1280, "height": 720, "rotate": 45}], "mics": [{}], "name": "Take"})
         );
         assert_eq!(stop_params(&r), json!({}));
         let r = RecordUi {
             screen: "window:42".into(),
             cameras: vec![
-                CameraRow { device: "a".into(), quality: Quality::Native, mirror: true, rotate: 270, ..Default::default() },
+                CameraRow { device: "a".into(), quality: Quality::Native, mirror: true, rotate: CameraRotate::Fixed(270), ..Default::default() },
                 CameraRow::default(),
                 CameraRow { device: "b".into(), quality: Quality::Native, mirror: false, offset_ms: -80.0, ..Default::default() },
             ],
@@ -913,7 +928,7 @@ mod tests {
         };
         assert_eq!(
             start_params(&r),
-            json!({"screen": {"window": "42"}, "cameras": [{"device": "a", "quality": "native", "mirror": true, "rotate": 270}, {"device": "b", "quality": "native"}], "mics": [{"device": "USB Mic"}]})
+            json!({"screen": {"window": "42"}, "cameras": [{"device": "a", "quality": "native", "mirror": true, "rotate": 270}, {"device": "b", "quality": "native", "rotate": "auto"}], "mics": [{"device": "USB Mic"}]})
         );
         assert_eq!(stop_params(&r), json!({"cameraOffsetsMs": [0.0, -80.0]}));
         assert_eq!(start_params(&RecordUi::default()), json!({}));

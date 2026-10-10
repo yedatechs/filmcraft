@@ -13,7 +13,8 @@ pub const SCREEN_FPS: &[(&str, &str)] = &[("15", "15 fps"), ("24", "24 fps"), ("
 pub const SCREEN_RESOLUTION: &[(&str, &str)] = &[("native", "Native"), ("1440p", "1440p"), ("1080p", "1080p"), ("720p", "720p")];
 pub const CAMERA_QUALITY: &[(&str, &str)] = &[("720p", "720p"), ("1080p", "1080p"), ("4k", "4K"), ("native", "Native (the camera's best)")];
 pub const CAMERA_FPS: &[(&str, &str)] = &[("24", "24 fps"), ("30", "30 fps"), ("60", "60 fps")];
-pub const CAMERA_ROTATE: &[(&str, &str)] = &[("0", "0°"), ("90", "90° clockwise"), ("180", "180°"), ("270", "90° counter-clockwise (270°)")];
+pub const CAMERA_ROTATE: &[(&str, &str)] =
+    &[("auto", "Auto (the camera's own orientation)"), ("0", "0°"), ("90", "90° clockwise"), ("180", "180°"), ("270", "90° counter-clockwise (270°)")];
 pub const CODECS: &[(&str, &str)] = &[("h264", "H.264"), ("hevc", "HEVC (H.265, hardware only)"), ("prores", "Apple ProRes 422 (large, edit-friendly)")];
 pub const QUALITIES: &[(&str, &str)] = &[("low", "Low"), ("medium", "Medium"), ("high", "High"), ("max", "Max")];
 pub const KEYFRAMES: &[(&str, &str)] = &[("1", "1 s"), ("2", "2 s (scrubs best in an editor)"), ("4", "4 s")];
@@ -42,9 +43,9 @@ pub struct RecordingSettings {
     /// 24 / 30 / 60.
     pub camera_fps: u32,
     pub camera_mirror: bool,
-    /// Turn new camera rows' clips clockwise: 0 / 90 / 180 / 270 degrees (the file stays as
-    /// captured; the clip's Motion turns it).
-    pub camera_rotate: u32,
+    /// New camera rows' Rotate: Auto (the camera's own orientation) or 0 / 90 / 180 / 270
+    /// degrees clockwise, written into the file's track header (nothing is added to the clip).
+    pub camera_rotate: CameraRotate,
     // Encoding
     /// `h264` / `hevc` / `prores`.
     pub codec: String,
@@ -85,7 +86,7 @@ impl Default for RecordingSettings {
             camera_quality: "1080p".into(),
             camera_fps: 30,
             camera_mirror: false,
-            camera_rotate: 0,
+            camera_rotate: CameraRotate::Auto,
             codec: "h264".into(),
             quality: "high".into(),
             keyframe_seconds: 2,
@@ -113,7 +114,9 @@ impl RecordingSettings {
         let num = |opts: &[(&str, &str)], v: u32, def: u32| if is_choice(opts, &v.to_string()) { v } else { def };
         self.screen_fps = num(SCREEN_FPS, self.screen_fps, d.screen_fps);
         self.camera_fps = num(CAMERA_FPS, self.camera_fps, d.camera_fps);
-        self.camera_rotate = num(CAMERA_ROTATE, self.camera_rotate, d.camera_rotate);
+        if !is_choice(CAMERA_ROTATE, &self.camera_rotate.id()) {
+            self.camera_rotate = d.camera_rotate;
+        }
         self.keyframe_seconds = num(KEYFRAMES, self.keyframe_seconds, d.keyframe_seconds);
         self.sample_rate = num(SAMPLE_RATES, self.sample_rate, d.sample_rate);
         self.countdown_seconds = num(COUNTDOWNS, self.countdown_seconds, d.countdown_seconds);
@@ -189,13 +192,76 @@ pub fn downscale(native: (u32, u32), height: u32) -> Option<(u32, u32)> {
     Some((nw.max(16), height.clamp(16, 8192) & !1))
 }
 
-/// A camera's `rotate` parameter: 0 / 90 / 180 / 270 (absent: `default`).
-pub fn rotate_of(v: &Value, key_owner_cmd: &str, default: u32) -> Result<u32> {
+/// A camera's Rotate: Auto follows the orientation the camera reports (0 when it reports none);
+/// a fixed value (0 / 90 / 180 / 270 degrees clockwise) wins over the camera's. Serialised as
+/// `"auto"` or the number of degrees; reads either (and a number as text).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CameraRotate {
+    #[default]
+    Auto,
+    Fixed(u32),
+}
+
+impl CameraRotate {
+    /// `auto`, `0`, `90`, `180` or `270` (the choice id).
+    pub fn id(self) -> String {
+        match self {
+            CameraRotate::Auto => "auto".into(),
+            CameraRotate::Fixed(d) => d.to_string(),
+        }
+    }
+    /// The choice `id` (None: not one of them).
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id.trim() {
+            "auto" => Some(CameraRotate::Auto),
+            t => match t.parse::<u32>() {
+                Ok(d @ (0 | 90 | 180 | 270)) => Some(CameraRotate::Fixed(d)),
+                _ => None,
+            },
+        }
+    }
+    /// The degrees the recording is turned: the fixed value, else the camera's (`camera`), else 0.
+    pub fn effective(self, camera: Option<u16>) -> u32 {
+        let d = match self {
+            CameraRotate::Fixed(d) => d,
+            CameraRotate::Auto => camera.map_or(0, u32::from),
+        };
+        if matches!(d, 90 | 180 | 270) { d } else { 0 }
+    }
+}
+
+impl Serialize for CameraRotate {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            CameraRotate::Auto => s.serialize_str("auto"),
+            CameraRotate::Fixed(d) => s.serialize_u32(*d),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CameraRotate {
+    /// Lenient (preferences and UI state must load): an unknown text is Auto, any whole number is
+    /// kept for [`check`] / [`RecordingSettings::clamp`] to refuse or fix.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(match Value::deserialize(d)? {
+            Value::Number(n) => n.as_u64().and_then(|x| u32::try_from(x).ok()).map_or(CameraRotate::Auto, CameraRotate::Fixed),
+            Value::String(t) => match t.trim().parse::<u32>() {
+                Ok(x) => CameraRotate::Fixed(x),
+                Err(_) => CameraRotate::Auto,
+            },
+            _ => CameraRotate::Auto,
+        })
+    }
+}
+
+/// A camera's `rotate` parameter: `"auto"` or 0 / 90 / 180 / 270 (absent: `default`).
+pub fn rotate_of(v: &Value, key_owner_cmd: &str, default: CameraRotate) -> Result<CameraRotate> {
     match v.get("rotate").filter(|x| !x.is_null()) {
         None => Ok(default),
+        Some(Value::String(t)) if t == "auto" => Ok(CameraRotate::Auto),
         Some(x) => match x.as_u64() {
-            Some(r @ (0 | 90 | 180 | 270)) => Ok(r as u32),
-            _ => Err(bad(key_owner_cmd, format!("`rotate` must be 0, 90, 180 or 270, got {x}"))),
+            Some(r @ (0 | 90 | 180 | 270)) => Ok(CameraRotate::Fixed(r as u32)),
+            _ => Err(bad(key_owner_cmd, format!("`rotate` must be \"auto\", 0, 90, 180 or 270, got {x}"))),
         },
     }
 }
@@ -234,6 +300,11 @@ pub fn merge(cur: &RecordingSettings, patch: &Value) -> std::result::Result<Reco
             return Err(format!("unknown recording setting `{k}` (one of {})", keys().join(", ")));
         };
         let x = match (&*slot, x) {
+            // Rotate is `"auto"` or a number of degrees (checked below)
+            (_, x) if k == "cameraRotate" => match x {
+                Value::String(t) => CameraRotate::from_id(t).map(|r| json!(r)).ok_or_else(|| format!("`{k}` must be auto, 0, 90, 180 or 270, got {t}"))?,
+                x => x.clone(),
+            },
             // numeric choices arrive as strings from dialogs and agents
             (Value::Number(_), Value::String(t)) => t.trim().parse::<u64>().map(Value::from).map_err(|_| format!("`{k}` must be a whole number"))?,
             (Value::Number(_), Value::Number(n)) => {
@@ -262,7 +333,7 @@ pub fn check(r: &RecordingSettings) -> std::result::Result<(), String> {
     choice("screenResolution", SCREEN_RESOLUTION, &r.screen_resolution)?;
     choice("cameraQuality", CAMERA_QUALITY, &r.camera_quality)?;
     choice("cameraFps", CAMERA_FPS, &r.camera_fps.to_string())?;
-    choice("cameraRotate", CAMERA_ROTATE, &r.camera_rotate.to_string())?;
+    choice("cameraRotate", CAMERA_ROTATE, &r.camera_rotate.id())?;
     choice("codec", CODECS, &r.codec)?;
     choice("quality", QUALITIES, &r.quality)?;
     choice("keyframeSeconds", KEYFRAMES, &r.keyframe_seconds.to_string())?;

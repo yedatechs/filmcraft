@@ -377,3 +377,79 @@ fn record_a_rotated_camera_writes_the_turn_into_the_file() {
     assert_eq!(file_rotation(v["files"][0].as_str().unwrap()), (turned(270, 320, 180), (180, 320)));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn sidecar_of(file: &str) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(file.replace(".mov", ".recording.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn rotate_auto_takes_the_cameras_orientation_at_record_start() {
+    use crate::record::SyntheticFactory as F;
+    let dir = tmp("rotate-auto");
+    let (mut s, f) = session((320, 180));
+    assert_eq!(s.prefs.recording.camera_rotate, crate::record_settings::CameraRotate::Auto, "Auto is the default");
+    // previewed sideways; then the camera's own software turns it (the preview follows)
+    s.execute("record.preview", json!({"camera": {"device": F::CAMERA, "width": 320, "height": 180}})).unwrap();
+    wait_frame(&s, F::CAMERA, 2);
+    let tap = preview_of(&s, F::CAMERA).unwrap();
+    assert_eq!(tap.rotation(), Some(0));
+    f.camera_rotation.store(90, Ordering::Release);
+    assert_eq!(tap.rotation(), Some(90), "the preview reads the orientation live");
+    // Record: the value at the start is the file's
+    s.execute("record.start", json!({"camera": {"device": F::CAMERA, "width": 320, "height": 180}, "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    let file = v["files"][0].as_str().unwrap();
+    assert_eq!(file_rotation(file), (turned(90, 320, 180), (180, 320)));
+    let side = sidecar_of(file);
+    assert_eq!((side["rotate"].clone(), side["rotate_setting"].clone(), side["camera_rotation"].clone()), (json!(90), json!("auto"), json!(90)), "{side}");
+    assert!(side.get("rotation_changed_at_ns").is_none(), "{side}");
+    assert_eq!(v["rotationChanged"], json!([]));
+    // a fixed Rotate wins over the camera's
+    s.execute("record.start", json!({"camera": {"device": F::CAMERA, "width": 320, "height": 180, "rotate": 180}, "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    let file = v["files"][0].as_str().unwrap();
+    assert_eq!(file_rotation(file), (turned(180, 320, 180), (320, 180)));
+    let side = sidecar_of(file);
+    assert_eq!((side["rotate"].clone(), side["rotate_setting"].clone(), side["camera_rotation"].clone()), (json!(180), json!(180), json!(90)), "{side}");
+    // "auto" explicitly, and the setting takes it as text too
+    s.execute("record.settings", json!({"set": {"cameraRotate": "90"}})).unwrap();
+    assert_eq!(s.prefs.recording.camera_rotate, crate::record_settings::CameraRotate::Fixed(90));
+    s.execute("record.settings", json!({"set": {"cameraRotate": "auto"}})).unwrap();
+    assert!(s.execute("record.settings", json!({"set": {"cameraRotate": "sideways"}})).is_err());
+    assert!(s.execute("record.start", json!({"camera": {"device": F::CAMERA, "rotate": "Auto"}, "dir": dir.to_string_lossy()})).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rotate_auto_a_turn_during_the_recording_is_noted_and_the_file_keeps_the_start() {
+    use crate::record::SyntheticFactory as F;
+    let dir = tmp("rotate-turned");
+    let (mut s, f) = session((320, 180));
+    f.camera_rotation.store(90, Ordering::Release);
+    s.execute("record.start", json!({"camera": {"device": F::CAMERA, "width": 320, "height": 180, "rotate": "auto"}, "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    s.execute("record.status", json!({})).unwrap();
+    f.camera_rotation.store(270, Ordering::Release);
+    std::thread::sleep(Duration::from_millis(200));
+    s.execute("record.status", json!({})).unwrap(); // the frame loop notices it
+    let v = s.execute("record.stop", json!({})).unwrap();
+    let file = v["files"][0].as_str().unwrap();
+    assert_eq!(file_rotation(file), (turned(90, 320, 180), (180, 320)), "the start's orientation");
+    let side = sidecar_of(file);
+    let at = side["rotation_changed_at_ns"].as_u64().unwrap();
+    assert!((100_000_000..2_000_000_000).contains(&at), "{side}");
+    assert_eq!(side["rotation_changes"], 1);
+    assert_eq!(v["rotationChanged"][0]["source"], "camera", "{v}");
+    assert_eq!(v["rotationChanged"][0]["rotate"], 90);
+    // a fixed Rotate ignores the camera's turns
+    s.execute("record.start", json!({"camera": {"device": F::CAMERA, "width": 320, "height": 180, "rotate": 0}, "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    f.camera_rotation.store(90, Ordering::Release);
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["rotationChanged"], json!([]));
+    assert!(sidecar_of(v["files"][0].as_str().unwrap()).get("rotation_changed_at_ns").is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use egui_kittest::Harness;
 use filmcraft_engine::Session;
 use filmcraft_engine::record::SyntheticFactory;
+use filmcraft_engine::record_settings::CameraRotate;
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
 use serde_json::{Value, json};
@@ -17,6 +18,8 @@ use serde_json::{Value, json};
 struct Driver {
     harness: Harness<'static, FilmcraftApp>,
     tx: Sender<ControlRequest>,
+    /// The synthetic sources (tests turn its cameras).
+    factory: SyntheticFactory,
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -33,14 +36,15 @@ impl Driver {
 
     fn with_display(dir: &std::path::Path, display_size: (u32, u32)) -> Self {
         let mut session = Session::default();
-        session.record.factory = Some(Arc::new(SyntheticFactory { display_size, camera_size: (320, 180), ..Default::default() }));
+        let factory = SyntheticFactory { display_size, camera_size: (320, 180), ..Default::default() };
+        session.record.factory = Some(Arc::new(factory.clone()));
         Arc::make_mut(&mut session.project).settings.scratch.captured = Some(dir.to_string_lossy().into_owned());
         // Record starts at once (the countdown test turns it back on)
         session.prefs.recording.countdown_seconds = 0;
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
         let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
-        let mut d = Driver { harness, tx };
+        let mut d = Driver { harness, tx, factory };
         d.frames(4);
         d
     }
@@ -530,9 +534,15 @@ fn rotate_turns_the_camera_preview_and_is_written_into_the_file() {
     d.ok("ui.menu.invoke", json!({"id": "window.record"}));
     d.ok("ui.set", json!({"record": {"screen": "", "cameras": [{"device": "synthetic:camera", "quality": "native"}], "mics": []}}));
     wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("320×180"));
+    // Auto (the default): the preview follows the orientation the camera reports, live
+    assert_eq!(d.harness.state().ui.record.cameras[0].rotate, CameraRotate::Auto);
+    d.factory.camera_rotation.store(270, std::sync::atomic::Ordering::Release);
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("180×320"));
+    d.factory.camera_rotation.store(0, std::sync::atomic::Ordering::Release);
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("320×180"));
     d.click("record.panel.camera.1.rotate");
-    d.click("record.panel.camera.1.rotate.1"); // 0°, 90°, 180°, 270°
-    assert_eq!(d.harness.state().ui.record.cameras[0].rotate, 90);
+    d.click("record.panel.camera.1.rotate.2"); // Auto, 0°, 90°, 180°, 270°
+    assert_eq!(d.harness.state().ui.record.cameras[0].rotate, CameraRotate::Fixed(90));
     // the preview stands upright like the clip will
     wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("180×320"));
     d.click("record.panel.record");
@@ -581,5 +591,27 @@ fn the_camera_thumbnail_never_overlaps_the_rows_below_and_shrinks_while_recordin
     assert!(small[2].as_f64().unwrap() <= 130.0 && small[3].as_f64().unwrap() <= 75.0, "smaller while recording: {small}");
     d.click("record.panel.record");
     assert!(!d.harness.state().session.record.recording());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_camera_that_turns_while_recording_is_noted_after_stop() {
+    let dir = tmp("rotate-turned");
+    let mut d = Driver::new(&dir);
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.ok("ui.set", json!({"record": {"screen": "", "cameras": [{"device": "synthetic:camera", "quality": "native"}], "mics": []}}));
+    d.factory.camera_rotation.store(90, std::sync::atomic::Ordering::Release);
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("180×320"));
+    d.click("record.panel.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
+    d.run_for(0.3);
+    d.factory.camera_rotation.store(180, std::sync::atomic::Ordering::Release);
+    d.run_for(0.3);
+    d.click("record.panel.record");
+    let last = d.harness.state().ui.record.last.clone();
+    assert!(last.contains("the camera turned during the recording"), "{last}");
+    let s = &d.harness.state().session;
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height), (180, 320), "the start's orientation (90°)");
     std::fs::remove_dir_all(&dir).ok();
 }

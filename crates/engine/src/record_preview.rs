@@ -14,7 +14,7 @@
 //! Frames arrive on the capture thread; the UI reads [`CameraTap::latest`] at its own rate (an
 //! `Arc` clone, never a copy of the picture).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use serde_json::{Value, json};
@@ -161,7 +161,12 @@ pub struct CameraTap {
     previewing: Arc<AtomicBool>,
     frames: Arc<AtomicU64>,
     attached: Arc<Mutex<Attached>>,
+    /// The last orientation read from the camera ([`NO_ROTATION`]: none).
+    rotation: AtomicU32,
 }
+
+/// [`CameraTap::rotation`]'s "the camera reports none".
+const NO_ROTATION: u32 = u32::MAX;
 
 impl CameraTap {
     fn new(device: &str, input: Box<dyn VideoInput>) -> Arc<Self> {
@@ -198,6 +203,7 @@ impl CameraTap {
             previewing,
             frames,
             attached,
+            rotation: AtomicU32::new(NO_ROTATION),
         })
     }
 
@@ -223,6 +229,23 @@ impl CameraTap {
     /// A failure of the camera after it started.
     pub fn error(&self) -> Option<String> {
         self.input.lock().unwrap_or_else(PoisonError::into_inner).error()
+    }
+    /// The orientation the camera reports now (degrees clockwise; None: it reports none). Never
+    /// waits: while the camera is being (re)started the last value read is returned.
+    pub fn rotation(&self) -> Option<u16> {
+        let input = match self.input.try_lock() {
+            Ok(i) => Some(i),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        match input {
+            Some(i) => {
+                let r = i.rotation();
+                self.rotation.store(r.map_or(NO_ROTATION, u32::from), Ordering::Release);
+                r
+            }
+            None => Some(self.rotation.load(Ordering::Acquire)).filter(|r| *r != NO_ROTATION).and_then(|r| u16::try_from(r).ok()),
+        }
     }
 
     /// Start the camera with `req` (stamped on `clock`) if it is not running; restart it when it
@@ -300,6 +323,9 @@ impl VideoInput for TapInput {
     }
     fn error(&self) -> Option<String> {
         self.tap.error()
+    }
+    fn rotation(&self) -> Option<u16> {
+        self.tap.rotation()
     }
 }
 
