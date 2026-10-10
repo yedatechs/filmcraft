@@ -366,3 +366,74 @@ fn record_says_starting_until_every_source_is_live() {
     assert!(q.video_tracks[0].items[0].start == filmcraft_time::Tick::ZERO && q.audio_tracks[0].items[0].start == filmcraft_time::Tick::ZERO);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Wait (stepping frames) until element `id`'s label satisfies `ok`.
+fn wait_label(d: &mut Driver, id: &str, ok: impl Fn(&str) -> bool) -> String {
+    let t0 = Instant::now();
+    loop {
+        d.frames(1);
+        if let Some(e) = d.element(id) {
+            let l = e["label"].as_str().unwrap_or("").to_string();
+            if ok(&l) {
+                return l;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "{id}: {l}");
+        } else {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{id} is not on screen");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn frame_no(label: &str) -> u64 {
+    label.rsplit("frame ").next().and_then(|n| n.trim().parse().ok()).unwrap_or(0)
+}
+
+#[test]
+fn a_camera_row_shows_a_live_preview_and_pops_out() {
+    let dir = tmp("preview");
+    let mut d = Driver::new(&dir);
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.ok("ui.set", json!({"record": {"cameras": [{"device": "synthetic:camera", "quality": "native"}]}}));
+    // the row's camera runs live: "320×180 @ 30 fps · frame n", n going up
+    let l = wait_label(&mut d, "record.panel.camera.1.preview", |l| l.contains("320×180 @ 30 fps") && frame_no(l) > 2);
+    let n = frame_no(&l);
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| frame_no(l) > n + 3);
+    let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
+    assert_eq!(st["preview"], json!(["synthetic:camera"]), "{st}");
+    // the thumbnail is a 16:9 box about 240 px wide
+    let e = d.element("record.panel.camera.1.preview").unwrap();
+    assert_eq!((e["rect"][2].as_f64().unwrap(), e["rect"][3].as_f64().unwrap()), (240.0, 135.0));
+    // Pop out: a preview window that keeps showing the camera
+    d.click("record.panel.camera.1.popout");
+    assert!(d.harness.state().ui.record.cameras[0].popout);
+    let l = wait_label(&mut d, "record.preview.1", |l| frame_no(l) > 0);
+    assert!(l.contains("320×180"), "{l}");
+    // recording keeps the preview (and the window) going, through the same capture
+    d.click("record.panel.record");
+    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    let l = d.element("record.preview.1").unwrap()["label"].as_str().unwrap().to_string();
+    let n = frame_no(&l);
+    d.run_for(0.8);
+    wait_label(&mut d, "record.preview.1", |l| frame_no(l) > n + 5);
+    d.click("record.panel.record"); // Stop
+    assert!(!d.harness.state().session.record.recording());
+    let q = d.harness.state().session.active_sequence().unwrap();
+    assert_eq!(q.video_tracks.len(), 2, "screen and camera");
+    // the camera set to Off stops its preview and closes the window
+    d.ok("ui.set", json!({"record": {"cameras": [{"device": ""}]}}));
+    d.frames(3);
+    let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
+    assert_eq!(st["preview"], json!([]), "{st}");
+    assert!(d.element("record.preview.1").is_none());
+    assert_eq!(d.element("record.panel.camera.1.preview").unwrap()["label"], "Camera off");
+    // back on, then closing the panel (nothing recording) stops it too
+    d.ok("ui.set", json!({"record": {"cameras": [{"device": "synthetic:camera", "quality": "native"}]}}));
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| frame_no(l) > 0);
+    d.click("record.panel.close");
+    d.frames(2);
+    assert!(!d.harness.state().ui.record.open);
+    let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
+    assert_eq!(st["preview"], json!([]), "{st}");
+    std::fs::remove_dir_all(&dir).ok();
+}

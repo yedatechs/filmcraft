@@ -80,6 +80,12 @@ impl RecordClock {
     pub fn shifted(&self, ns: u64) -> Self {
         let start = self.start.checked_add(std::time::Duration::from_nanos(ns)).unwrap_or(self.start);
         Self { start, unix_ns: self.unix_ns.saturating_add(ns) }
+
+    /// Nanoseconds from `earlier`'s start to this clock's start (0 when this one started first): a
+    /// frame stamped `t` on `earlier` is at `t - ns_after(earlier)` on this clock (a camera
+    /// preview's frames handed to a recording).
+    pub fn ns_after(&self, earlier: &RecordClock) -> u64 {
+        u64::try_from(self.start.saturating_duration_since(earlier.start).as_nanos()).unwrap_or(u64::MAX)
     }
 }
 
@@ -335,11 +341,13 @@ pub struct SyntheticFactory {
     pub camera_delay_ms: u64,
     /// The second camera ([`Self::CAMERA2`]) starts this late.
     pub camera2_delay_ms: u64,
+    /// How many times a camera was opened (tests: a preview and a recording share one).
+    pub camera_opens: Arc<AtomicU64>,
 }
 
 impl Default for SyntheticFactory {
     fn default() -> Self {
-        Self { display_size: (1280, 720), camera_size: (640, 360), screen_delay_ms: 0, camera_delay_ms: 0, camera2_delay_ms: 0 }
+        Self { display_size: (1280, 720), camera_size: (640, 360), screen_delay_ms: 0, camera_delay_ms: 0, camera2_delay_ms: 0, camera_opens: Arc::default() }
     }
 }
 
@@ -381,6 +389,9 @@ impl VideoInputFactory for SyntheticFactory {
         }
     }
     fn open_camera(&self, device: &str) -> std::result::Result<Box<dyn VideoInput>, CaptureError> {
+        if device == Self::CAMERA || device == Self::CAMERA2 {
+            self.camera_opens.fetch_add(1, Ordering::Relaxed);
+        }
         if device == Self::CAMERA {
             Ok(Box::new(SyntheticVideoInput::new(self.camera_size, self.camera_delay_ms)))
         } else if device == Self::CAMERA2 {
@@ -462,6 +473,8 @@ impl VideoInput for SyntheticVideoInput {
         if self.thread.is_some() {
             return Err(CaptureError::new(CaptureErrorKind::Failed, "already started"));
         }
+        // a stopped input can start again (a camera preview restarted for a recording)
+        self.stop.store(false, Ordering::Release);
         let (w, h) = (req.width.unwrap_or(self.native.0), req.height.unwrap_or(self.native.1));
         let (w, h) = req.max_height.and_then(|mh| crate::record_settings::downscale((w, h), mh)).unwrap_or((w, h));
         let (w, h) = (w.clamp(16, 8192) & !1, h.clamp(16, 8192) & !1);
@@ -837,6 +850,11 @@ pub struct Countdown {
 pub struct Recorder {
     /// Overrides the registered capture factory (tests, the desktop app on systems without one).
     pub factory: Option<Arc<dyn VideoInputFactory>>,
+    /// Cameras shown live (`record.preview`); a recording of one of them shares its capture.
+    pub previews: Vec<Arc<crate::record_preview::CameraTap>>,
+    /// Every camera capture alive (previewed or recorded), so a preview and a recording of the
+    /// same camera share one device session.
+    pub(crate) taps: Vec<std::sync::Weak<crate::record_preview::CameraTap>>,
     pub active: Option<Active>,
     /// A start counting down (`record.start {countdown}`); [`tick`] starts it when due.
     pub countdown: Option<Countdown>,
@@ -882,7 +900,7 @@ pub(crate) fn factory(s: &Session) -> Arc<dyn VideoInputFactory> {
 /// Copy a captured frame into a straight RGBA picture of `w × h`: as is when the sizes match,
 /// else scaled (nearest pixel; a source that delivers more than was negotiated, e.g. a screen
 /// whose capture cannot be scaled by the system).
-fn to_rgba(f: &CapturedFrame, w: u32, h: u32, out: &mut Vec<u8>) -> bool {
+pub(crate) fn to_rgba(f: &CapturedFrame, w: u32, h: u32, out: &mut Vec<u8>) -> bool {
     let (fw, fh) = (f.width as usize, f.height as usize);
     let need = f.stride.checked_mul(fh.saturating_sub(1)).and_then(|n| n.checked_add(fw.saturating_mul(4)));
     if fw == 0 || fh == 0 || f.stride < fw.saturating_mul(4) || need.is_none_or(|n| f.data.len() < n) {
@@ -1414,7 +1432,7 @@ fn devices(s: &mut Session, _p: &Value) -> Result<Value> {
     }))
 }
 
-fn fps_of(v: &Value, cmd: &str, default: u32) -> Result<u32> {
+pub(crate) fn fps_of(v: &Value, cmd: &str, default: u32) -> Result<u32> {
     match v.get("fps").filter(|x| !x.is_null()) {
         None => Ok(default),
         Some(x) => {
@@ -1427,7 +1445,7 @@ fn fps_of(v: &Value, cmd: &str, default: u32) -> Result<u32> {
     }
 }
 
-fn size_of(v: &Value, key: &str, cmd: &str) -> Result<Option<u32>> {
+pub(crate) fn size_of(v: &Value, key: &str, cmd: &str) -> Result<Option<u32>> {
     match v.get(key).filter(|x| !x.is_null()) {
         None => Ok(None),
         Some(x) => {
@@ -1440,11 +1458,11 @@ fn size_of(v: &Value, key: &str, cmd: &str) -> Result<Option<u32>> {
     }
 }
 
-fn id_of(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn id_of(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str().map(str::to_string).or_else(|| x.as_u64().map(|n| n.to_string())))
 }
 
-fn bool_of(v: &Value, key: &str, cmd: &str, default: bool) -> Result<bool> {
+pub(crate) fn bool_of(v: &Value, key: &str, cmd: &str, default: bool) -> Result<bool> {
     match v.get(key).filter(|x| !x.is_null()) {
         None => Ok(default),
         Some(Value::Bool(b)) => Ok(*b),
@@ -1452,7 +1470,7 @@ fn bool_of(v: &Value, key: &str, cmd: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn choice_of(v: &Value, key: &str, cmd: &str, opts: &[(&str, &str)], default: &str) -> Result<String> {
+pub(crate) fn choice_of(v: &Value, key: &str, cmd: &str, opts: &[(&str, &str)], default: &str) -> Result<String> {
     match v.get(key).filter(|x| !x.is_null()) {
         None => Ok(default.to_string()),
         Some(Value::String(c)) if opts.iter().any(|o| o.0 == c) => Ok(c.clone()),
@@ -2125,7 +2143,7 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
             mirror: c.mirror,
             enc,
         };
-        let input = f.open_camera(&c.device).map_err(|e| EngineError::Other(format!("{}: {e}", src.key())))?;
+        let input = crate::record_preview::camera_input(&mut s.record, &f, &c.device).map_err(|e| EngineError::Other(format!("{}: {e}", src.key())))?;
         cameras.push((input, setup));
     }
     // microphones: the first on the session's input, the others on inputs made for them
@@ -2285,8 +2303,9 @@ pub fn tick(s: &mut Session) -> Option<Value> {
 }
 
 fn status_json(s: &Session) -> Value {
+    let preview = crate::record_preview::preview_ids(s);
     let Some(a) = &s.record.active else {
-        let mut v = json!({"recording": false, "sources": []});
+        let mut v = json!({"recording": false, "sources": [], "preview": preview});
         if let (Some(o), Some(st)) = (v.as_object_mut(), &s.record.starting) {
             o.insert("starting".into(), json!(true));
             o.insert("label".into(), json!(st.label));
@@ -2350,6 +2369,7 @@ fn status_json(s: &Session) -> Value {
         "stopAfterMinutes": a.settings.stop_after_minutes,
         "notes": a.notes,
         "error": (!errors.is_empty()).then(|| errors.join("; ")),
+        "preview": preview,
     })
 }
 
@@ -2814,6 +2834,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec("record.status", "Recording Status", "{}", crate::commands::always, status, false),
         spec("record.stop", "Stop Recording", r#"{"discard":bool?,"cameraOffsetMs":f64?,"cameraOffsetsMs":[f64]?}"#, is_recording, stop, true),
         spec("record.cancel", "Cancel Recording", "{}", is_recording, cancel, true),
+        crate::record_preview::preview_spec(),
         spec("record.settings", "Recording Settings", r#"{"get":bool?}|{"set":{field:value}}"#, crate::commands::always, crate::record_settings::command, true),
     ]
 }

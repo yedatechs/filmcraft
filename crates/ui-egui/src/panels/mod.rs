@@ -35,6 +35,7 @@ pub mod project;
 pub mod project_dialogs;
 pub mod project_views;
 pub mod record;
+pub mod record_preview;
 pub mod redact;
 pub mod reference;
 pub mod remix;

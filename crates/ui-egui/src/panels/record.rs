@@ -47,7 +47,7 @@ impl Quality {
             Quality::Native => "Native",
         }
     }
-    fn size(self) -> Option<(u32, u32)> {
+    pub(crate) fn size(self) -> Option<(u32, u32)> {
         match self {
             Quality::P720 => Some((1280, 720)),
             Quality::P1080 => Some((1920, 1080)),
@@ -71,6 +71,8 @@ pub struct CameraRow {
     pub mirror: bool,
     /// "Offset … ms", applied at Stop.
     pub offset_ms: f64,
+    /// The live preview is popped out into its own always-on-top window.
+    pub popout: bool,
 }
 
 /// One microphone row of the panel.
@@ -91,7 +93,7 @@ impl Quality {
 /// A new camera row with the Settings ▸ Recording camera defaults.
 pub fn camera_row(app: &FilmcraftApp, device: String) -> CameraRow {
     let rs = &app.session.prefs.recording;
-    CameraRow { device, quality: Quality::from_id(&rs.camera_quality), mirror: rs.camera_mirror, offset_ms: 0.0 }
+    CameraRow { device, quality: Quality::from_id(&rs.camera_quality), mirror: rs.camera_mirror, offset_ms: 0.0, popout: false }
 }
 
 /// Record panel state (`UiState::record`).
@@ -120,6 +122,9 @@ pub struct RecordUi {
     /// `record.devices`, refreshed when the panel opens (not saved).
     #[serde(skip)]
     pub devices: Option<Value>,
+    /// Camera preview textures and pop-out windows (not saved).
+    #[serde(skip)]
+    pub preview: super::record_preview::PreviewCache,
 }
 
 /// UI command `window.record`: open the panel (and list the devices).
@@ -373,6 +378,8 @@ fn combo(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, id: &str, v
 /// Every frame: the panel (while open or recording) and the live status-bar line.
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     tick(app);
+    // live camera previews (and their pop-out windows, which stay while recording)
+    super::record_preview::sync(app, ctx);
     let counting = app.session.record.countdown.is_some();
     if counting {
         app.ui.record.live = status_line(app).unwrap_or_default();
@@ -440,11 +447,13 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let (mut do_toggle, mut do_cancel, mut do_refresh, mut close) = (false, false, false, false);
     let accent = app.tokens.accent;
     let dim = app.tokens.text_dim;
+    let preview = app.ui.record.preview.clone();
+    let session = &app.session;
     let win = egui::Window::new("Record")
         .id(egui::Id::new("record-panel"))
         .collapsible(false)
         .resizable(false)
-        .default_pos(ctx.content_rect().center() - vec2(200.0, 200.0))
+        .default_pos(ctx.content_rect().center_top() + vec2(-260.0, 40.0))
         .show(ctx, |ui| {
             egui::Grid::new("record-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Screen:");
@@ -456,25 +465,29 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     let n = i + 1;
                     let id = format!("record.panel.camera.{n}");
                     ui.label(if n == 1 { "Camera:".to_string() } else { format!("Camera {n}:") });
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            combo(ui, &mut elems, &format!("{id}.device"), &mut c.device, &cameras, !recording, 220.0);
-                            let mut q = c.quality.label().to_string();
-                            combo(ui, &mut elems, &format!("{id}.quality"), &mut q, &qs, !recording && !c.device.is_empty(), 70.0);
-                            c.quality = Quality::ALL.into_iter().find(|x| x.label() == q).unwrap_or(c.quality);
-                            let x = ui.add_enabled(!recording, egui::Button::new("−").small());
-                            elems.push((format!("{id}.remove"), x.rect, format!("Remove camera {n}")));
-                            if x.clicked() {
-                                remove_cam = Some(i);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let m = ui.add_enabled(!recording && !c.device.is_empty(), egui::Checkbox::new(&mut c.mirror, "Mirror"));
-                            elems.push((format!("{id}.mirror"), m.rect, format!("Mirror {}", c.mirror)));
-                            ui.label("Offset:");
-                            let o =
-                                ui.add_enabled(!c.device.is_empty(), egui::DragValue::new(&mut c.offset_ms).speed(1.0).range(-5000.0..=5000.0).suffix(" ms"));
-                            elems.push((format!("{id}.offset"), o.rect, format!("{}", c.offset_ms)));
+                    ui.horizontal(|ui| {
+                        super::record_preview::thumbnail(ui, &mut elems, &preview, session, n, c);
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                combo(ui, &mut elems, &format!("{id}.device"), &mut c.device, &cameras, !recording, 220.0);
+                                let mut q = c.quality.label().to_string();
+                                combo(ui, &mut elems, &format!("{id}.quality"), &mut q, &qs, !recording && !c.device.is_empty(), 70.0);
+                                c.quality = Quality::ALL.into_iter().find(|x| x.label() == q).unwrap_or(c.quality);
+                                let x = ui.add_enabled(!recording, egui::Button::new("−").small());
+                                elems.push((format!("{id}.remove"), x.rect, format!("Remove camera {n}")));
+                                if x.clicked() {
+                                    remove_cam = Some(i);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                let m = ui.add_enabled(!recording && !c.device.is_empty(), egui::Checkbox::new(&mut c.mirror, "Mirror"));
+                                elems.push((format!("{id}.mirror"), m.rect, format!("Mirror {}", c.mirror)));
+                                ui.label("Offset:");
+                                let o = ui
+                                    .add_enabled(!c.device.is_empty(), egui::DragValue::new(&mut c.offset_ms).speed(1.0).range(-5000.0..=5000.0).suffix(" ms"));
+                                elems.push((format!("{id}.offset"), o.rect, format!("{}", c.offset_ms)));
+                            });
+                            super::record_preview::popout_button(ui, &mut elems, session, n, c);
                         });
                     });
                     ui.end_row();
@@ -784,9 +797,9 @@ mod tests {
         let r = RecordUi {
             screen: "window:42".into(),
             cameras: vec![
-                CameraRow { device: "a".into(), quality: Quality::Native, mirror: true, offset_ms: 0.0 },
+                CameraRow { device: "a".into(), quality: Quality::Native, mirror: true, ..Default::default() },
                 CameraRow::default(),
-                CameraRow { device: "b".into(), quality: Quality::Native, mirror: false, offset_ms: -80.0 },
+                CameraRow { device: "b".into(), quality: Quality::Native, mirror: false, offset_ms: -80.0, ..Default::default() },
             ],
             mics: vec![MicRow { device: "USB Mic".into() }, MicRow::default()],
             ..Default::default()

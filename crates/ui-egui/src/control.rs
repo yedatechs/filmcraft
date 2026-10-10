@@ -231,10 +231,11 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             if let Some(patch) = p.get("record").filter(|v| v.is_object()) {
                 let was_open = app.ui.record.open;
                 let devices = app.ui.record.devices.take();
+                let preview = app.ui.record.preview.clone();
                 let mut cur = serde_json::to_value(&app.ui.record).unwrap_or_default();
                 merge(&mut cur, patch);
                 match serde_json::from_value::<crate::panels::record::RecordUi>(cur) {
-                    Ok(v) => app.ui.record = crate::panels::record::RecordUi { devices, ..v },
+                    Ok(v) => app.ui.record = crate::panels::record::RecordUi { devices, preview, ..v },
                     Err(e) => {
                         app.ui.record.devices = devices;
                         return err(format!("`record`: {e}"));

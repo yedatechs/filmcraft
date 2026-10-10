@@ -38,6 +38,7 @@ pub mod project_panel;
 pub mod project_tools;
 pub mod proxies;
 pub mod record;
+pub mod record_preview;
 pub mod record_settings;
 pub mod redact;
 pub mod relink;
@@ -1096,6 +1097,8 @@ mod project_manager_tests;
 mod project_panel_tests;
 #[cfg(test)]
 mod proxies_tests;
+#[cfg(test)]
+mod record_preview_tests;
 #[cfg(test)]
 mod record_tests;
 #[cfg(test)]
