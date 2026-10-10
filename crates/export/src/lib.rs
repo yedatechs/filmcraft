@@ -22,6 +22,7 @@ mod pace;
 mod pcm;
 mod pipeline;
 pub mod presets;
+pub mod recorder;
 pub mod settings;
 pub use audio_out::LoudnessReport;
 pub use job::{Exporter, Step, stepped};

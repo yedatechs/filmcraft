@@ -4,10 +4,10 @@
 
 ## 2. Engine (headless)
 
-- [ ] 2.1 `record.rs`: `VideoInput` / `VideoInputFactory` traits, `RecordClock`, synthetic display / window / camera inputs, bounded drop-oldest frame queue, encoder threads under `catch_unwind`
-- [ ] 2.2 `filmcraft_export::recorder::MovRecorder` (streaming MOV, slot-based frame durations) and a streaming WAV writer
-- [ ] 2.3 `record.devices / start / status / stop / cancel`; sidecars; import + sync + sequence as one undo step; `cameraOffsetMs`
-- [ ] 2.4 `record_tests.rs`: devices, three decodable files with sidecars, skew → offsets, camera offset, undo, double start, hostile params, cancel
+- [x] 2.1 `record.rs`: `VideoInput` / `VideoInputFactory` traits, `RecordClock`, synthetic display / window / camera inputs, bounded drop-oldest frame queue, encoder threads under `catch_unwind`
+- [x] 2.2 `filmcraft_export::recorder::MovRecorder` (streaming MOV, slot-based frame durations) and a streaming WAV writer
+- [x] 2.3 `record.devices / start / status / stop / cancel`; sidecars; import + sync + sequence as one undo step; `cameraOffsetMs`
+- [x] 2.4 `record_tests.rs`: devices, three decodable files with sidecars, skew → offsets, camera offset, undo, double start, hostile params, cancel
 
 ## 3. macOS capture
 

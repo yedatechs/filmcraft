@@ -273,6 +273,9 @@ fn can_start(s: &Session) -> std::result::Result<(), String> {
     if s.voiceover.recording() {
         return Err("a voice-over is already recording".into());
     }
+    if s.record.recording() {
+        return Err("a recording (Window ▸ Record) is using the microphone".into());
+    }
     if s.active_sequence().is_some_and(|q| q.audio_tracks.is_empty()) {
         return Err("the sequence has no audio track".into());
     }
