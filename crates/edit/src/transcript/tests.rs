@@ -566,12 +566,13 @@ fn a_speed_changed_clip_before_the_span_gets_an_insert() {
     let mut next = 1000;
     restore_cut(&mut q, &sp[0], &mut ctx(&mut next)).unwrap();
     q.check().unwrap();
+    // the inserted piece (media 2–3 s at 1×) runs straight into the clip after it (media 3–5 s),
+    // so the two join: one piece of media 2–5 s from 1 s
     for t in [&q.audio_tracks[0], &q.video_tracks[0]] {
-        assert_eq!(t.items.len(), 3, "{}", t.name);
+        assert_eq!(t.items.len(), 2, "{}", t.name);
         assert_eq!((t.items[0].duration, t.items[0].speed), (s(1.0), 2.0));
         let n = &t.items[1];
-        assert_eq!((n.start, n.duration, n.source_in, n.speed, n.link), (s(1.0), s(1.0), s(2.0), 1.0, Some(1)));
-        assert_eq!(t.items[2].start, s(2.0));
+        assert_eq!((n.start, n.duration, n.source_in, n.speed, n.link), (s(1.0), s(3.0), s(2.0), 1.0, Some(1)));
     }
     assert!(spans(&q).is_empty());
 }

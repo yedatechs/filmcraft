@@ -610,8 +610,12 @@ fn restore(
             n.speed = 1.0;
             n.reverse = false;
             n.frame_hold = None;
+            let id = n.id;
             let idx = tr.items.partition_point(|i| i.start <= at);
             tr.items.insert(idx, n);
+            // a piece that runs straight into the clip after it (the last take of a group put
+            // back) joins it, as the other tracks' pieces do, so the edit points line up
+            join_continuation(tr, id);
         }
     }
     // 5. transitions
