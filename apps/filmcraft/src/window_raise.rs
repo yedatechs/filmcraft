@@ -26,3 +26,38 @@ pub fn raise_without_focus() -> bool {
         false
     }
 }
+
+/// Put FilmCraft's recording border window (Window ▸ Record; its title starts with `title`) over
+/// `frame` (points, desktop coordinates from the top left of the main display) above the menu bar:
+/// macOS keeps ordinary windows below the menu bar, which would leave the top of the display
+/// unframed. Returns whether a window was placed (macOS).
+pub fn place_overlay(title: &str, frame: [f64; 4]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let Some(mtm) = objc2::MainThreadMarker::new() else { return false };
+        // AppKit measures from the bottom left of the main (menu bar) display
+        let Some(main) = objc2_app_kit::NSScreen::screens(mtm).firstObject() else { return false };
+        let main_h = main.frame().size.height;
+        let [x, y, w, h] = frame;
+        if ![x, y, w, h, main_h].iter().all(|v| v.is_finite()) || w < 1.0 || h < 1.0 {
+            return false;
+        }
+        let rect = NSRect::new(NSPoint::new(x, main_h - y - h), NSSize::new(w, h));
+        let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        let mut placed = false;
+        for win in app.windows().iter() {
+            if win.title().to_string().starts_with(title) {
+                win.setLevel(objc2_app_kit::NSStatusWindowLevel + 1);
+                win.setFrame_display(rect, true);
+                placed = true;
+            }
+        }
+        placed
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, frame);
+        false
+    }
+}

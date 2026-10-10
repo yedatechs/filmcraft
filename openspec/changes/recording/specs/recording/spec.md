@@ -73,3 +73,34 @@ With Stop after set to `m` minutes, a recording SHALL stop by itself after `m` m
 
 ### Requirement: System audio
 With System audio on and a screen source, the sound the system plays SHALL be recorded (ScreenCaptureKit `capturesAudio` on macOS 13+, FilmCraft's own sound excluded) to `<Name> - System Audio.wav` on the recording clock, gaps filled with silence, and placed on the next free audio track. Where it cannot be captured the recording SHALL go on without it and say so in its `notes`, and the panel SHALL show the control disabled with "(not available yet)".
+
+### Requirement: Live camera preview
+`record.preview {camera: {device, quality?, width?, height?, fps?} | null}` (or `cameras: [...]`) SHALL run exactly the listed cameras without writing anything, keeping each camera's latest picture as RGBA at most 640 pixels wide for the UI, and `record.status` SHALL list them as `preview`. A recording of a previewed camera SHALL reuse its capture session (the device is not opened twice); only a recording that asks the camera for another size or rate SHALL restart it, once. While the Record panel is open (or a recording runs), each camera row SHALL show its camera live in a 16:9 thumbnail (`record.panel.camera.<n>.preview`, labelled `W×H @ fps fps · frame k`), mirrored and rotated like its clip; Pop out (`record.panel.camera.<n>.popout`) SHALL open an always-on-top, resizable preview window titled `FilmCraft Camera Preview — <camera>` that stays during a recording with the panel closed. The preview SHALL stop when its row is removed or set to Off, or when the panel closes with nothing recording.
+
+#### Scenario: Recording while previewing
+- **WHEN** the synthetic camera is previewed and then recorded for 1.5 s
+- **THEN** the camera was opened once, the preview keeps updating during the recording and after Stop, and the camera file holds about 45 frames in index order with its first sample near the clock start
+
+### Requirement: A border around what is recorded
+While the Record panel is open with a screen chosen, a borderless, transparent, always-on-top window that lets the mouse through (titled `FilmCraft Recording Overlay`) SHALL frame the chosen display, the chosen window (following it every 0.5 s) or the chosen area with a 3 pt border: grey before recording, red with a `● REC mm:ss` pill while recording. It SHALL close when the screen is set to Off, when the panel closes with nothing recording and when the recording stops, and Esc SHALL not close it. Its state SHALL be in `ui.inspect` as `ui.record.overlay` (`state`, `target`, `rect`, `frame`) and its automation id is `record.overlay`.
+
+### Requirement: Area of a display
+The Screen picker SHALL offer "Area of <display>…" per display (`record.panel.screen.area.<display>`): the border becomes a drawing surface (crosshair, "Drag the area to record (Esc cancels)"); the dragged rectangle, in even display pixels and at least 64 × 64, SHALL become the area (`ui.record.screenArea`), shown in the panel as "Area W×H" with "Edit…". `record.start {screen: {display, area: [x, y, w, h]}}` SHALL record only that part of the display at its native pixel size (ScreenCaptureKit `sourceRect` in points = the area ÷ the display's backing scale), refuse an area that is not four whole numbers, smaller than 64 or outside the display, or given with a window, and write `area` in the sidecar.
+
+#### Scenario: Drawing an area
+- **WHEN** the synthetic 1280 × 720 display's area entry is chosen and a drag from (101, 99) to (741, 459) is made on `record.overlay`, then Record and Stop are pressed
+- **THEN** `screenArea` is `[100, 98, 640, 360]`, the screen file and the sequence are 640 × 360 and the sidecar's `area` is `[100, 98, 640, 360]`
+
+### Requirement: The border and previews are never in the file
+A display recording SHALL leave out this process's windows whose titles start with `FilmCraft Recording Overlay` or `FilmCraft Camera Preview` (ScreenCaptureKit `initWithDisplay:excludingWindows:`, matched by the owning process id and the title), and only those: FilmCraft's main window stays recordable. The panel SHALL show the border before it starts a screen recording so the exclusion list built at the start holds it; a border or preview window that appears during a display recording SHALL be added to the running stream's filter (`updateContentFilter`), never by restarting the stream. A window source needs no exclusion.
+
+#### Scenario: The exclusion list
+- **WHEN** the window list holds FilmCraft's main window, its border, a pop-out preview, another app's window titled like the border and an untitled FilmCraft window
+- **THEN** only the border and the pop-out preview are left out
+
+### Requirement: Rotate per camera
+`record.start` cameras SHALL take `rotate` (0 / 90 / 180 / 270, anything else refused; default the `cameraRotate` setting), shown as a Rotate picker in the camera row (`record.panel.camera.<n>.rotate`) and recorded in the sidecar; the file SHALL stay as captured and the clip's Motion SHALL turn it by that angle, scaled to fit the sequence frame without cropping and never enlarged; when a turned camera leads the sequence (no screen), the sequence SHALL be made upright. The preview SHALL be turned the same way.
+
+#### Scenario: A camera on its side next to a screen
+- **WHEN** a 320 × 180 screen and a 320 × 180 camera with `rotate: 90` are recorded
+- **THEN** the sequence is 320 × 180, the camera clip's Motion has Rotation 90° and Scale 56.25 %, and the camera's sidecar says `rotate: 90` with the file still 320 × 180

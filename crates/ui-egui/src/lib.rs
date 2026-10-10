@@ -98,6 +98,10 @@ pub struct HostHooks {
     /// (macOS: `orderFrontRegardless`). Without it the app only requests a repaint: it never
     /// activates itself for an agent, because the user's keystrokes would land here.
     pub raise_without_focus: Option<Box<dyn FnMut()>>,
+    /// Put the recording border window (title prefix, frame in desktop points) over the whole
+    /// display, the menu bar included (macOS keeps ordinary windows below it). Without it the
+    /// border frames what the system lets it cover.
+    pub place_overlay: Option<Box<dyn FnMut(&str, [f64; 4]) -> bool>>,
     /// Open a file in its default application, or (`true`) reveal it in the file manager (Edit ▸
     /// Edit Original, Help ▸ Reveal Log Files).
     pub open_path: Option<Box<dyn FnMut(&str, bool) -> Result<(), String>>>,

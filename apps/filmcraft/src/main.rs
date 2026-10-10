@@ -194,6 +194,7 @@ fn main() -> eframe::Result {
             app.hooks.raise_without_focus = Some(Box::new(|| {
                 window_raise::raise_without_focus();
             }));
+            app.hooks.place_overlay = Some(Box::new(window_raise::place_overlay));
             app.hooks.pick_open_file = Some(Box::new(|filter: &str, exts: &[&str]| {
                 rfd::FileDialog::new().add_filter(filter, exts).pick_file().map(|p| p.to_string_lossy().to_string())
             }));

@@ -47,8 +47,14 @@ pub struct OverlayInfo {
     pub target: String,
     /// The framed rectangle in the target's pixels `[x, y, w, h]` (the area, or all of it).
     pub rect: [u32; 4],
-    /// Where the border window is: points, desktop coordinates `[x, y, w, h]`.
+    /// Where the border window is asked to be: the target's frame, points, desktop coordinates
+    /// `[x, y, w, h]`.
     pub frame: [f64; 4],
+    /// Where the system put the border window's content (points, desktop coordinates; natively
+    /// only, once known). The drawing follows it, so a window the system moved (below the menu
+    /// bar) still frames and maps the display right.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<[f64; 4]>,
 }
 
 /// Reads a target's frame every 0.5 s on its own thread (ScreenCaptureKit can take a while).
@@ -189,22 +195,25 @@ struct Look {
     pill_inset: f32,
 }
 
-/// Paint the border (and the drawing surface) into `rect`.
-fn paint(ui: &mut egui::Ui, rect: Rect, look: &Look, drag_from: &mut Option<Pos2>) -> Option<Drawn> {
-    let painter = ui.painter_at(rect);
+/// Paint the border (and the drawing surface): `rect` is the whole target (display or window) in
+/// the surface's coordinates, `visible` the part the surface covers (the same, unless the system
+/// kept the window off the menu bar).
+fn paint(ui: &mut egui::Ui, rect: Rect, visible: Rect, look: &Look, drag_from: &mut Option<Pos2>) -> Option<Drawn> {
+    let visible = visible.intersect(rect);
+    let painter = ui.painter_at(visible);
     let k = if look.px.0 > 0 { rect.width() / look.px.0 as f32 } else { 1.0 };
     let framed = match look.area {
         Some([x, y, w, h]) => {
             let r = Rect::from_min_size(rect.min + vec2(x as f32 * k, y as f32 * k), vec2(w as f32 * k, h as f32 * k));
             // around the area (the picture stays clear), within the display
-            r.expand(BORDER).intersect(rect)
+            r.expand(BORDER).intersect(visible)
         }
-        None => rect,
+        None => visible,
     };
     if look.state == "drawing" {
-        painter.rect_filled(rect, 0.0, Color32::from_black_alpha(70));
+        painter.rect_filled(visible, 0.0, Color32::from_black_alpha(70));
         let id = ui.id().with("record-overlay-draw");
-        let resp = ui.interact(rect, id, Sense::click_and_drag());
+        let resp = ui.interact(visible, id, Sense::click_and_drag());
         if resp.hovered() || resp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
@@ -225,7 +234,7 @@ fn paint(ui: &mut egui::Ui, rect: Rect, look: &Look, drag_from: &mut Option<Pos2
             }
         }
         painter.text(
-            rect.center_top() + vec2(0.0, 60.0),
+            visible.center_top() + vec2(0.0, 60.0),
             egui::Align2::CENTER_TOP,
             "Drag the area to record (Esc cancels)",
             egui::FontId::proportional(18.0),
@@ -244,7 +253,10 @@ fn paint(ui: &mut egui::Ui, rect: Rect, look: &Look, drag_from: &mut Option<Pos2
         let text = format!("● REC {:02}:{:02}", s / 60, s % 60);
         let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
         let size = galley.size() + vec2(18.0, 8.0);
-        let top = framed.top() + BORDER + look.pill_inset + 6.0;
+        // below the menu bar when the border is at the very top of the display
+        let from_top = framed.top() - rect.top();
+        let inset = if from_top < look.pill_inset { look.pill_inset - from_top } else { 0.0 };
+        let top = framed.top() + BORDER + inset + 6.0;
         let pill = Rect::from_min_size(pos2(framed.center().x - size.x / 2.0, top), size);
         painter.rect_filled(pill, size.y / 2.0, RED);
         painter.galley(pill.min + vec2(9.0, 4.0), galley, Color32::WHITE);
@@ -328,20 +340,20 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let area = if is_display { r.screen_area } else { None };
     let rect_px = area.unwrap_or([0, 0, f.pixels.0, f.pixels.1]);
     let screen = r.screen.clone();
-    app.ui.record.overlay = Some(OverlayInfo { state: state.into(), target: screen.clone(), rect: rect_px, frame: [f.x, f.y, f.w, f.h] });
+    app.ui.record.overlay = Some(OverlayInfo { state: state.into(), target: screen.clone(), rect: rect_px, frame: [f.x, f.y, f.w, f.h], window: None });
     let look = Look { state, px: f.pixels, area, elapsed, pill_inset: if is_display && area.is_none() { 26.0 } else { 0.0 } };
     let label = format!("{state} {} {},{} {}×{}", screen, rect_px[0], rect_px[1], rect_px[2], rect_px[3]);
     let first = cache.lock().shown_frames == 0;
     let mut drag_from = cache.lock().drag_from;
-    let (drawn, auto_rect) = if embedded {
+    let (drawn, auto_rect, window) = if embedded {
         let avail = ctx.content_rect();
         let k = (avail.width() / f.w as f32).min(avail.height() / f.h as f32).min(1.0);
         let rect = Rect::from_min_size(avail.min, vec2(f.w as f32 * k, f.h as f32 * k));
         let out = egui::Area::new(egui::Id::new("record-overlay")).order(egui::Order::Foreground).fixed_pos(rect.min).interactable(drawing).show(ctx, |ui| {
             ui.set_min_size(rect.size());
-            paint(ui, rect, &look, &mut drag_from)
+            paint(ui, rect, rect, &look, &mut drag_from)
         });
-        (out.inner, rect)
+        (out.inner, rect, None)
     } else {
         if drawing && !cache.lock().focused {
             ctx.send_viewport_cmd_to(viewport_id(), egui::ViewportCommand::Focus);
@@ -367,11 +379,32 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             if ui.input(|i| i.viewport().close_requested()) {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             }
-            let rect = ui.max_rect();
-            paint(ui, rect, &look, &mut drag_from)
+            let visible = ui.max_rect();
+            // the target in this window's coordinates, from where the system put the window
+            let inner = ui.input(|i| i.viewport().inner_rect);
+            let rect = match inner {
+                Some(r) => Rect::from_min_size(visible.min + vec2(f.x as f32 - r.min.x, f.y as f32 - r.min.y), vec2(f.w as f32, f.h as f32)),
+                None => visible,
+            };
+            (paint(ui, rect, visible, &look, &mut drag_from), inner)
         });
-        (out, Rect::from_min_size(pos2(f.x as f32, f.y as f32), vec2(f.w as f32, f.h as f32)))
+        (out.0, Rect::from_min_size(pos2(f.x as f32, f.y as f32), vec2(f.w as f32, f.h as f32)), out.1)
     };
+    if let (Some(o), Some(w)) = (app.ui.record.overlay.as_mut(), window) {
+        o.window = Some([f64::from(w.min.x), f64::from(w.min.y), f64::from(w.width()), f64::from(w.height())]);
+    }
+    // the system kept the window off part of the target (the menu bar): ask the host to place it
+    // over all of it, now and then (not every frame)
+    if let Some(w) = window {
+        let off = (f64::from(w.min.y) - f.y).abs() > 1.0 || (f64::from(w.height()) - f.h).abs() > 1.0 || (f64::from(w.min.x) - f.x).abs() > 1.0;
+        let n = cache.lock().shown_frames;
+        if off
+            && n % 30 == 2
+            && let Some(place) = app.hooks.place_overlay.as_mut()
+        {
+            place(OVERLAY_TITLE, [f.x, f.y, f.w, f.h]);
+        }
+    }
     {
         let mut st = cache.lock();
         st.drag_from = drag_from;
