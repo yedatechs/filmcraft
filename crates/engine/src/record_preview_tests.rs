@@ -341,7 +341,8 @@ fn record_a_rotated_camera_writes_the_turn_into_the_file() {
     let cam = q.find_item(id).unwrap().1.clone();
     let m = cam.effect("motion").unwrap();
     assert_eq!(m.f64_at("rotation", Tick::ZERO), 0.0, "nothing is added to the clip");
-    assert_eq!(m.f64_at("scale", Tick::ZERO), 100.0, "Default Media Scaling is None");
+    assert_eq!(m.f64_at("scale", Tick::ZERO), 100.0, "Default Media Scaling is None: no Motion scale");
+    assert!(cam.scale_to_frame, "a portrait camera next to a 16:9 screen is fitted, never cropped");
     let media = s.project.resolve_media(cam.item).unwrap().1.info.video.clone().unwrap();
     assert_eq!((media.width, media.height), (180, 320), "the item is upright");
     let file = v["files"][1].as_str().unwrap();
@@ -360,8 +361,10 @@ fn record_a_rotated_camera_writes_the_turn_into_the_file() {
     let v = s.execute("record.stop", json!({})).unwrap();
     let q = s.active_sequence().unwrap();
     let id = filmcraft_project::ClipId(v["clips"]["camera"]["clip"].as_u64().unwrap());
-    let m = q.find_item(id).unwrap().1.effect("motion").unwrap().clone();
+    let fitted = q.find_item(id).unwrap().1.clone();
+    let m = fitted.effect("motion").unwrap().clone();
     assert_eq!((m.f64_at("rotation", Tick::ZERO), m.f64_at("scale", Tick::ZERO)), (0.0, 56.3));
+    assert!(!fitted.scale_to_frame, "Set to Frame Size writes the scale instead");
     s.prefs.media.default_media_scaling = "none".into();
     // the camera alone, turned: an upright sequence it fills; the setting is the default
     s.execute("record.settings", json!({"set": {"cameraRotate": 270}})).unwrap();
@@ -372,8 +375,10 @@ fn record_a_rotated_camera_writes_the_turn_into_the_file() {
     let q = s.active_sequence().unwrap();
     assert_eq!((q.settings.width, q.settings.height), (180, 320));
     let id = filmcraft_project::ClipId(v["clips"]["camera"]["clip"].as_u64().unwrap());
-    let m = q.find_item(id).unwrap().1.effect("motion").unwrap().clone();
+    let alone = q.find_item(id).unwrap().1.clone();
+    let m = alone.effect("motion").unwrap().clone();
     assert_eq!((m.f64_at("rotation", Tick::ZERO), m.f64_at("scale", Tick::ZERO)), (0.0, 100.0));
+    assert!(!alone.scale_to_frame, "the sequence has the camera's own aspect: nothing to fit");
     assert_eq!(file_rotation(v["files"][0].as_str().unwrap()), (turned(270, 320, 180), (180, 320)));
     std::fs::remove_dir_all(&dir).ok();
 }

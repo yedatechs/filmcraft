@@ -182,9 +182,10 @@ says how to show them (90°: `{0, 1, 0, −1, 0, 0, h, 0, 1}`, 180°: `{−1, 0,
 270°: `{0, −1, 0, 1, 0, 0, 0, w, 1}`, 16.16 fixed point; the header's width and height stay the
 coded size). FilmCraft's importer, QuickTime and every other player show the file upright: a
 320 × 180 camera turned 90° imports as a 180 × 320 item, its thumbnail stands upright, and Place ▸
-Full and Scale to Frame treat it like any portrait clip. Placed next to a screen it is fitted by
-Settings ▸ Media ▸ Default Media Scaling like any clip of another size; when it leads (no screen)
-the sequence takes its upright size. Recordings made before this change keep the Motion effect
+Full and Scale to Frame treat it like any portrait clip. Placed next to a screen, a camera of
+another aspect is never cropped: it gets Scale to Frame (or the Motion scale when Settings ▸ Media
+▸ Default Media Scaling is Set to Frame Size), and the layouts take that into account; when it
+leads (no screen) the sequence takes its upright size. Recordings made before this change keep the Motion effect
 they were given.
 
 **Auto** reads the orientation the camera reports when the recording starts (a turn made while

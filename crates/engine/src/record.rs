@@ -2926,12 +2926,19 @@ fn import_and_place(s: &mut Session, name: &str, done: &[Done], offsets_ms: &[f6
                 {
                     ti.effects.insert(0, flip);
                 }
-                // fitted like any clip of another size (Settings ▸ Media ▸ Default Media Scaling)
+                // fitted like any clip of another size (Settings ▸ Media ▸ Default Media Scaling);
+                // and whatever that setting, a camera of another aspect (a portrait camera next
+                // to a 16:9 screen) is scaled to the frame rather than cropped: a recording must
+                // come in whole, and the layouts take Scale to Frame into account
                 let frame = (settings.width, settings.height);
                 if let Some(size) = pr.resolve_media(it).and_then(|(_, m, _)| m.info.video.as_ref().map(|v| (v.width, v.height)))
                     && size != frame
                 {
                     crate::settings::apply_media_scaling(&mut ti, &scaling, frame, size);
+                    let aspect_differs = size.1 > 0 && frame.1 > 0 && ((size.0 as f64 / size.1 as f64) - (frame.0 as f64 / frame.1 as f64)).abs() > 0.01;
+                    if aspect_differs && !matches!(scaling.as_str(), "setToFrameSize") {
+                        ti.scale_to_frame = true;
+                    }
                 }
                 clips.push((*k, ti.id, ti.start));
                 v_items.push(ti);
