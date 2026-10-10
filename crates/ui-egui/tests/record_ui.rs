@@ -142,6 +142,14 @@ fn record_and_stop_builds_a_synced_sequence() {
     let counters = d.element("record.panel.counters").unwrap();
     assert!(counters["label"].as_str().unwrap().contains("Recorded"), "{counters}");
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 6, "three files and three sidecars");
+    assert!(d.harness.state().ui.record.live.is_empty());
+    // a recording stopped from outside the panel clears the live line too
+    d.ok("engine.execute", json!({"command": "record.start", "params": {"mic": {}}}));
+    d.run_for(0.3);
+    assert!(!d.harness.state().ui.record.live.is_empty());
+    d.ok("engine.execute", json!({"command": "record.cancel", "params": {}}));
+    d.frames(2);
+    assert!(d.harness.state().ui.record.live.is_empty());
     // the panel can be closed again once stopped
     d.click("record.panel.close");
     assert!(!d.harness.state().ui.record.open);

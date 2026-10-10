@@ -255,6 +255,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         app.ui.record.live = status_line(app).unwrap_or_default();
         app.ui.record.open = true;
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    } else if !app.ui.record.live.is_empty() {
+        // stopped from elsewhere (`record.stop` over the control channel)
+        app.ui.record.live.clear();
     }
     if !app.ui.record.open {
         return;
