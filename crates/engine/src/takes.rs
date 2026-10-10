@@ -267,7 +267,8 @@ fn switch(q: &mut Sequence, ctx: &mut EditCtx, transcripts: &tx::Transcripts, it
     let (Some(at), Some(track)) = (at, track) else {
         return Err(EngineError::Other("the take's media is not in the sequence, so there is nowhere to put it back".into()));
     };
-    Ok(Some(tx::restore_media(q, item, take.range, at, track, ctx)?))
+    let seam = g.range().map(|r| r.duration).unwrap_or(take.range.duration);
+    Ok(Some(tx::restore_media_within(q, item, take.range, at, track, seam, ctx)?))
 }
 
 /// An undoable edit of the project *and* the active sequence with the edit-algebra context, for
@@ -512,7 +513,8 @@ fn restore(s: &mut Session, p: &Value) -> Result<Value> {
     let r = s.edit_sequence("Restore Take", |q, ctx, _| {
         // what is already live of this take goes first, so the whole take comes back in one piece
         extract_takes(q, ctx, item, &[&take]);
-        let r = tx::restore_media(q, item, take.range, at, track, ctx)?;
+        let seam = g.range().map(|r| r.duration).unwrap_or(take.range.duration);
+        let r = tx::restore_media_within(q, item, take.range, at, track, seam, ctx)?;
         crate::scenes::reapply_in(q, sc.as_ref());
         Ok(r)
     })?;

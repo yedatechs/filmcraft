@@ -277,3 +277,102 @@ fn hostile_parameters_are_errors_not_crashes() {
     s.execute("takes.detect", json!({"select": "none", "sensitivity": 7.0, "maxGapSeconds": -3.0})).unwrap();
     assert!(s.project.transcripts[&item].check().is_ok());
 }
+
+/// A screen recording (another media item, not linked) on V2 over the whole dialogue clip: every
+/// take switch and restore keeps it gapless and showing the matching moment.
+fn with_screen_track(s: &mut Session) -> ItemId {
+    let q = s.active_sequence().unwrap().clone();
+    let a = q.audio_tracks[0].items[0].clone();
+    let other = s
+        .project
+        .items
+        .values()
+        .find(|it| matches!(it.kind, filmcraft_project::ItemKind::Media(ref m) if it.id != a.item && m.duration() >= a.duration + Tick::from_seconds_f64(1.0)))
+        .map(|it| it.id)
+        .expect("a second media item long enough");
+    let seq_id = s.state.active_sequence.unwrap();
+    s.edit("screen track", |pr, _| {
+        let id = pr.alloc_id();
+        let q = pr.sequence_mut(seq_id).unwrap();
+        let mut n = a.clone();
+        n.id = ClipId(id);
+        n.item = other;
+        n.source_in = Tick::ZERO;
+        // the screen recording runs on past the dialogue clip, as a real one does
+        n.duration = a.duration + Tick::from_seconds_f64(1.0);
+        n.link = None;
+        n.effects.clear();
+        q.video_tracks[1].items.retain(|it| it.end() <= a.start || it.start >= n.end());
+        q.video_tracks[1].items.push(n);
+        q.video_tracks[1].items.sort_by_key(|it| it.start);
+        Ok(())
+    })
+    .unwrap();
+    other
+}
+
+/// (start, end, source_in) of the clips of `item` on V2, in order.
+fn v2_pieces(s: &Session, item: ItemId) -> Vec<(Tick, Tick, Tick)> {
+    let q = s.active_sequence().unwrap();
+    let mut v: Vec<_> = q.video_tracks[1].items.iter().filter(|it| it.item == item).map(|it| (it.start, it.end(), it.source_in)).collect();
+    v.sort();
+    v
+}
+
+fn assert_in_step(s: &Session, dialogue: ItemId, screen: ItemId, what: &str) {
+    let q = s.active_sequence().unwrap();
+    let a1: Vec<_> = q.audio_tracks[0].items.iter().filter(|it| it.item == dialogue).map(|it| (it.start, it.end(), it.source_in)).collect();
+    let v2 = v2_pieces(s, screen);
+    let (a_start, a_end) = (a1.iter().map(|x| x.0).min().unwrap(), a1.iter().map(|x| x.1).max().unwrap());
+    // no gap on V2 over the dialogue
+    let mut cursor = a_start;
+    for (st, en, _) in &v2 {
+        assert!(*st <= cursor, "{what}: gap on V2 before {} (covered up to {})", st.seconds(), cursor.seconds());
+        cursor = cursor.max(*en);
+    }
+    assert!(cursor >= a_end, "{what}: V2 ends at {} before the dialogue's {}", cursor.seconds(), a_end.seconds());
+    // and in step: at every dialogue piece start, the screen shows media offset by the same amount
+    // as when both were laid down (camera source_in − screen source_in, measured on the first pair)
+    let offset = {
+        let (st, _, sin) = a1.iter().min_by_key(|x| x.0).copied().unwrap();
+        let piece = v2.iter().min_by_key(|x| x.0).copied().unwrap();
+        sin - (piece.2 + (st - piece.0))
+    };
+    for (st, _, sin) in &a1 {
+        let piece = v2.iter().find(|(a, b, _)| a <= st && st < b).unwrap_or_else(|| panic!("{what}: no V2 piece at {}", st.seconds()));
+        let screen_media = piece.2 + (*st - piece.0);
+        assert_eq!(screen_media + offset, *sin, "{what}: screen out of step at {}", st.seconds());
+    }
+}
+
+#[test]
+fn take_switching_keeps_an_unlinked_screen_track_gapless_and_in_step() {
+    let (mut s, item) = session();
+    let screen = with_screen_track(&mut s);
+    assert_in_step(&s, item, screen, "before");
+    s.execute("takes.detect", json!({})).unwrap();
+    assert_in_step(&s, item, screen, "after detect (last take live)");
+    let g = groups(&mut s)[0]["id"].as_u64().unwrap();
+    for take in [0u64, 1, 2, 1, 0] {
+        s.execute("takes.select", json!({"group": g, "take": take})).unwrap();
+        assert_in_step(&s, item, screen, &format!("take {take} live"));
+    }
+    s.execute("takes.cross", json!({"group": g, "take": 0})).unwrap();
+    assert_in_step(&s, item, screen, "all crossed out");
+    s.execute("takes.restore", json!({"group": g, "take": 2})).unwrap();
+    assert_in_step(&s, item, screen, "restored take 2");
+    // the plain cut spans too
+    let cuts = s.execute("transcript.cuts", json!({})).unwrap()["cuts"].as_array().unwrap().len();
+    for ci in (0..cuts).rev() {
+        s.execute("transcript.restore", json!({"cut": ci})).unwrap();
+    }
+    assert_in_step(&s, item, screen, "everything restored");
+    // the screen clip's pieces play its media through again: each piece picks up within a frame
+    // of where the one before stopped (the take times are not frame-snapped, the edits were)
+    let pieces = v2_pieces(&s, screen);
+    let frame = s.sequence_rate().frame_duration();
+    for w in pieces.windows(2) {
+        let media_stop = w[0].2 + (w[0].1 - w[0].0);
+        assert!((w[1].2 - media_stop).0.abs() <= frame.0, "screen media jumps between pieces: {pieces:?}");
+    }
+}

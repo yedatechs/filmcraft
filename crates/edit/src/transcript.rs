@@ -390,17 +390,43 @@ pub fn live_ranges(seq: &Sequence, item: ItemId, media: TimeRange) -> Vec<TimeRa
 /// not exist or is locked, no clip of `item` ends at `at` on it, `media` is empty, shorter than a
 /// frame or outside the media.
 pub fn restore_media(seq: &mut Sequence, item: ItemId, media: TimeRange, at: Tick, track: usize, ctx: &mut EditCtx) -> crate::Result<TimeRange> {
-    restore(seq, item, media, at, track, None, ctx)
+    restore(seq, item, media, at, track, None, None, ctx)
+}
+
+/// [`restore_media`] of part of a larger cut: `seam` is the whole stretch of media missing at
+/// `at` (a take group's full range when one take goes back), so that clips of other media cut by
+/// the same edit (a screen recording in step with the dialogue) get their matching stretch back
+/// instead of a gap.
+pub fn restore_media_within(
+    seq: &mut Sequence,
+    item: ItemId,
+    media: TimeRange,
+    at: Tick,
+    track: usize,
+    seam: Tick,
+    ctx: &mut EditCtx,
+) -> crate::Result<TimeRange> {
+    restore(seq, item, media, at, track, None, Some(seam), ctx)
 }
 
 /// Restore a cut span ([`restore_media`] of its media at its anchor, after `span.before`). Fails when
 /// `span.before` is no longer on the span's track or no longer ends at the anchor (the span is out
 /// of date).
 pub fn restore_cut(seq: &mut Sequence, span: &CutSpan, ctx: &mut EditCtx) -> crate::Result<TimeRange> {
-    restore(seq, span.item, span.media, span.at, span.track, Some(span.before), ctx)
+    restore(seq, span.item, span.media, span.at, span.track, Some(span.before), Some(span.media.duration), ctx)
 }
 
-fn restore(seq: &mut Sequence, item: ItemId, media: TimeRange, at: Tick, track: usize, before: Option<ClipId>, ctx: &mut EditCtx) -> crate::Result<TimeRange> {
+#[allow(clippy::too_many_arguments)]
+fn restore(
+    seq: &mut Sequence,
+    item: ItemId,
+    media: TimeRange,
+    at: Tick,
+    track: usize,
+    before: Option<ClipId>,
+    seam: Option<Tick>,
+    ctx: &mut EditCtx,
+) -> crate::Result<TimeRange> {
     let audio = seq.audio_tracks.get(track).ok_or_else(|| EditError::Other(format!("no audio track A{}", track.saturating_add(1))))?;
     if media.is_empty() {
         return Err(EditError::Nothing);
@@ -442,29 +468,80 @@ fn restore(seq: &mut Sequence, item: ItemId, media: TimeRange, at: Tick, track: 
         return Err(EditError::Other("the sequence would be too long".into()));
     }
     let target = audio.id;
+    // how far into the cut the media goes back, measured from where the clip before it ends: 0
+    // when the cut is restored from its start, more when a later part of it comes back (a take
+    // chosen from the middle of its group)
+    let delta = Tick(media.start.0.saturating_sub(media_end(&template).0).max(0));
+    // the media jump another clip must show at `at` to count as cut by the same edit: the jump
+    // the dialogue's own track shows there (the same frame-snapped edit made both), else the
+    // seam the caller knows, else exactly what goes back (a genuine edit a frame off is left alone)
+    let forward_item = |it: &TrackItem| it.speed == 1.0 && !it.reverse && it.frame_hold.is_none();
+    let own_jump = audio
+        .items
+        .iter()
+        .find(|b| b.start == at && b.item == item && forward_item(b))
+        .map(|b| Tick(b.source_in.0.saturating_sub(media_end(&template).0)))
+        .filter(|j| j.0 >= delta.0.saturating_add(dur.0));
+    // measured on the dialogue track the seam is exact; without that, the other track's own
+    // right piece bounds it (a caller's hint such as a take group's range is not frame-snapped,
+    // so it is only used to refuse restores that would not fit)
+    let tol = ctx.min_duration.0.max(0);
+    let hint = seam.unwrap_or(Tick(delta.0.saturating_add(dur.0)));
+    let seam = own_jump;
     let mut work = seq.clone();
     let mut links = HashMap::new();
     let mut grown: Vec<ClipId> = Vec::new();
+    // pieces of other media (a screen recording, music, B-roll) to put back at `at` once the
+    // tracks have shifted: (track, piece)
+    let mut inserts: Vec<(filmcraft_project::TrackId, TrackItem)> = Vec::new();
     let mut audio_grew = false;
     for tr in work.all_tracks_mut() {
         if tr.locked {
             continue;
         }
-        // 1. grow the clip of this media that ends at `at` and continues into `media`, and any
-        //    other clip that Extract split at this cut: its right piece starts at `at` and
-        //    continues it after a media jump of exactly `dur` (music, B-roll on a ripple track)
+        // 1. grow the clip of this media that ends at `at` and continues into `media`, and put
+        //    back the same stretch of any other clip that Extract split at this cut: its right
+        //    piece starts at `at` and continues it after a media jump at least as long as what
+        //    goes back (a screen recording or music bed cut in step with the dialogue). Media
+        //    that continues the left piece grows it; media further into the cut (a take chosen
+        //    from the middle of its group) becomes a new piece after the shift.
         let forward = |it: &TrackItem| it.speed == 1.0 && !it.reverse && it.frame_hold.is_none();
         let resumes: Option<(ItemId, Tick)> = tr.items.iter().find(|b| b.start == at && forward(b)).map(|b| (b.item, b.source_in));
+        let nothing_after = !tr.items.iter().any(|b| b.start >= at);
         let mut grew_here: Vec<ClipId> = Vec::new();
+        let tr_id = tr.id;
         for it in &mut tr.items {
             if it.end() != at || !forward(it) {
                 continue;
             }
             let restored = it.item == item && media_end(it) == media.start;
-            let was_split = it.item != item && resumes == Some((it.item, Tick(media_end(it).0.saturating_add(dur.0))));
-            if restored || was_split {
+            // cut by the same edit: its right piece resumes after a media jump of exactly the
+            // seam, or nothing follows it on this track (the cut ran to the end of the clip) and
+            // its media goes on
+            let source_in = Tick(media_end(it).0.saturating_add(delta.0));
+            let room = (ctx.media_duration)(it.item).is_none_or(|d| source_in.0.saturating_add(dur.0) <= d.0);
+            let back = delta.0.saturating_add(dur.0);
+            let jump = resumes.filter(|(ri, _)| *ri == it.item).map(|(_, si)| si.0.saturating_sub(media_end(it).0));
+            let split_here = it.item != item
+                && back <= hint.0.saturating_add(tol)
+                && match (seam, jump) {
+                    (Some(s), Some(j)) => j == s.0 && back <= s.0,
+                    (None, Some(j)) => j.saturating_add(tol) >= back,
+                    (_, None) => room && nothing_after,
+                };
+            if restored || (split_here && delta == Tick::ZERO && room) {
                 it.duration = Tick(it.duration.0.saturating_add(dur.0));
                 grew_here.push(it.id);
+            } else if split_here && room {
+                let mut n = it.clone();
+                n.id = ClipId(ctx.alloc());
+                n.start = at;
+                n.duration = dur;
+                // in step with the dialogue at its start (its own restored piece starts at the
+                // word's time, not a frame boundary), so a sub-frame seam may stay with the piece
+                // after it
+                n.source_in = source_in;
+                inserts.push((tr_id, n));
             }
         }
         if tr.id == target && !grew_here.is_empty() {
@@ -492,6 +569,18 @@ fn restore(seq: &mut Sequence, item: ItemId, media: TimeRange, at: Tick, track: 
             join_continuation(tr, *id);
         }
         grown.extend(grew_here);
+    }
+    // 3b. the other media's pieces go into the gap the shift opened; a piece that reaches the
+    //     right piece joins it
+    for (tr_id, n) in inserts {
+        let Some(tr) = work.all_tracks_mut().find(|t| t.id == tr_id) else { continue };
+        if !crate::track_range_empty(tr, TimeRange::from_bounds(at, end)) {
+            continue;
+        }
+        let id = n.id;
+        let idx = tr.items.partition_point(|i| i.start <= at);
+        tr.items.insert(idx, n);
+        join_continuation(tr, id);
     }
     for ct in work.caption_tracks.iter_mut().filter(|c| !c.locked && c.sync_lock) {
         crate::captions::shift_from(ct, at, dur);

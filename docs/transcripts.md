@@ -108,6 +108,12 @@ media-time span beside the take groups (`Transcript::scenes`, schema v14), so it
 words when takes are switched, text is crossed out or restored, or pauses are removed: those
 edits re-apply the scenes in the same undo step. See [layouts.md](layouts.md#scenes-scenes).
 
+Cuts ripple every unlocked track, so a screen recording or music bed on its own track is cut in
+step with the dialogue; a restore (a crossed-out span clicked, a take switched) puts the matching
+stretch of those tracks back too, measured from the seam the same edit left on them, so switching
+takes never leaves a gap on the screen track. A clip that was edited by hand at that point (its
+media jumps by a different amount) is left alone.
+
 ## Speech recognition
 
 Recognition goes through the `Transcriber` trait (`crates/speech`). The built-in recogniser is
