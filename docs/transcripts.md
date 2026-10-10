@@ -84,7 +84,11 @@ said again within a few words ("and they don't even have a… and they don't eve
 window"; two words within six, three or more within ten) splits the utterance before both
 occurrences, and the false starts become crossed-out takes of the line they restart, the last one
 live. A repeat right after a joining word ("… and then I went …") continues the sentence and is not
-split; a stutter ("so so now", "the the") is read as one word and never splits. Lead-in and retake
+split; a stutter ("so so now", "the the") is read as one word and never splits. A repeat of only two
+words counts when the false start is at most three words long or the retake goes on to say one of
+the false start's other words again ("and they remove the fire | and they also remove the five hour");
+a two-word repeat followed by nothing in common ("for my dopamine and terrible | for my sleep") or by
+numbers ("twenty dollar, hundred dollar, two hundred dollar") is left alone. Lead-in and retake
 words at the start of an utterance (`yo`, `um`, `uh`, `alright`, `right`, `okay`, `again`, …) are
 ignored when comparing.
 

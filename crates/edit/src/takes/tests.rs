@@ -484,8 +484,26 @@ fn natural_repetition_is_not_a_restart() {
         assert!(restarts(&words(line), 2).is_empty(), "{line}");
         assert!(detect(&transcript(&[(0.0, line)]), &DetectParams::default()).is_empty(), "{line}");
     }
-    // Without the joining word the same three-word phrase reads as a restart.
+    // Two shared words with nothing of the false start said again: natural repetition, even
+    // without a joining word (the retake does not go on to repeat "use", "dopamine", "limits" …).
+    for line in [
+        "has just been a roller coaster for my dopamine and terrible for my sleep",
+        "the prices are going to go up dramatically we're going to eventually lose fable",
+        "like most of you guys complaining about usage limits complaining about prices but i think",
+        // a list of numbers after the shared phrase
+        "take advantage of the current twenty dollar hundred dollar two hundred dollar pricing models",
+    ] {
+        assert!(restarts(&words(line), 2).is_empty(), "{line}");
+        assert!(detect(&transcript(&[(0.0, line)]), &DetectParams::default()).is_empty(), "{line}");
+    }
+    // … but a retake that says one of the false start's words again is a restart, and so is a
+    // false start of at most three words; a changed contraction still counts ("we'll" / "we").
+    assert_eq!(restarts(&words("and they remove the fire and they also remove the five hour"), 2), vec![(0, 5)]);
+    // Three shared words count anywhere in the look-back (here without the joining word).
     assert_eq!(restarts(&words("we have three days to use it three days to decide"), 2), vec![(2, 7)]);
+    assert_eq!(restarts(&words("so now we'll get so now we have three days"), 2), vec![(0, 4)]);
+    assert_eq!(restarts(&words("and they also and they don't"), 2), vec![(0, 3)]);
+    assert_eq!(restarts(&words("hundred dollar two hundred dollar pricing models"), 2), Vec::<(usize, usize)>::new());
     // A deliberate repeat (counting) splits: accepted, the user can merge or ignore the group.
     assert_eq!(restarts(&words("one two three one two three"), 2), vec![(0, 3)]);
 }

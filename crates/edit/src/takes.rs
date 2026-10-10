@@ -39,6 +39,48 @@ const MAX_RESTARTS: usize = 64;
 /// Words after which a repeated phrase continues the sentence ("I went to the store and then I went
 /// to the bank", "three days to use it and three days to decide") instead of restarting it.
 const JOINERS: [&str; 14] = ["and", "then", "but", "or", "nor", "so", "because", "cause", "while", "when", "until", "if", "plus", "yet"];
+/// Words that do not count when a retake is checked for saying a false start's words again.
+const CONTINUATION_STOPS: [&str; 20] =
+    ["the", "a", "an", "and", "to", "of", "in", "is", "it", "that", "this", "so", "but", "or", "on", "at", "for", "with", "be", "was"];
+/// How many words of the retake (after the repeated phrase) are checked for a false start's words.
+const CONTINUATION_WORDS: usize = 6;
+/// Number words: a false start whose words after the repeated phrase are all numbers is a list
+/// ("twenty dollar, hundred dollar, two hundred dollar"), not a restart.
+const NUMBER_WORDS: [&str; 33] = [
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+    "thirty",
+    "forty",
+    "fifty",
+    "sixty",
+    "seventy",
+    "eighty",
+    "ninety",
+    "hundred",
+    "thousand",
+    "million",
+    "billion",
+    "trillion",
+];
 
 /// Parameters of [`detect`]. Every value is treated as hostile: out-of-range values are clamped.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -201,9 +243,40 @@ fn collapse_stutters(words: &[String]) -> (Vec<String>, Vec<usize>) {
 
 /// The start `i` of the nearest earlier occurrence (at or after `floor`, at most [`MAX_LOOKBACK`]
 /// words back) of a phrase of at least `m` words that `words` says again at `j`, if that repeat is a
-/// restart: two shared words only within [`SHORT_REPEAT_SPAN`] words, three or more anywhere in the
-/// look-back; the repeat must not follow a joining word ([`JOINERS`], "… and then I went …") and must
+/// restart: two shared words only within [`SHORT_REPEAT_SPAN`] words and when [`two_word_restart`]
+/// agrees, three or more anywhere in the look-back; the repeat must not follow a joining word ([`JOINERS`], "… and then I went …") and must
 /// not extend to the left (then it repeats from an earlier position, which was already examined).
+/// A word without its clitic ("we'll" → "we", "i've" → "i"), so a restart that changes the
+/// contraction still reads as saying the word again.
+fn stem(w: &str) -> &str {
+    w.split('\'').next().unwrap_or(w)
+}
+
+fn is_number(w: &str) -> bool {
+    NUMBER_WORDS.contains(&w) || (w.chars().any(|c| c.is_ascii_digit()) && w.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ','))
+}
+
+/// Whether a two-word repeat at `j` of the phrase at `i` is a restart rather than natural
+/// repetition: the false start `i..j` is at most three words ("and they also | and they don't"), or
+/// the retake goes on to say one of the false start's remaining words again within
+/// [`CONTINUATION_WORDS`] ("and they remove the fire | and they also remove the five hour", "so now
+/// we'll get | so now we have"); a false start whose remaining words are all numbers is a list
+/// ("twenty dollar, hundred dollar, two hundred dollar") and never a restart. "for my dopamine and
+/// terrible | for my sleep" and "complaining about usage limits | complaining about prices" share
+/// nothing after the phrase and are left alone.
+fn two_word_restart(words: &[String], i: usize, j: usize) -> bool {
+    let rest = words.get(i.saturating_add(2)..j).unwrap_or(&[]);
+    if !rest.is_empty() && rest.iter().all(|w| is_number(w)) {
+        return false;
+    }
+    if j.saturating_sub(i) <= 3 {
+        return true;
+    }
+    let from = j.saturating_add(2).min(words.len());
+    let cont = words.get(from..from.saturating_add(CONTINUATION_WORDS).min(words.len())).unwrap_or(&[]);
+    rest.iter().any(|w| !CONTINUATION_STOPS.contains(&stem(w)) && cont.iter().any(|c| stem(c) == stem(w)))
+}
+
 fn repeat_before(words: &[String], floor: usize, j: usize, m: usize) -> Option<usize> {
     let before = j.checked_sub(1).and_then(|p| words.get(p))?;
     if JOINERS.contains(&before.as_str()) {
@@ -213,7 +286,7 @@ fn repeat_before(words: &[String], floor: usize, j: usize, m: usize) -> Option<u
     (lo..j).rev().find(|&i| {
         let span = j.saturating_sub(i);
         let shared = (0..span).take_while(|&t| words.get(i.saturating_add(t)).is_some_and(|w| words.get(j.saturating_add(t)) == Some(w))).count();
-        if shared < m || (shared < 3 && span > SHORT_REPEAT_SPAN) {
+        if shared < m || (shared < 3 && (span > SHORT_REPEAT_SPAN || !two_word_restart(words, i, j))) {
             return false;
         }
         i == floor || i.checked_sub(1).and_then(|p| words.get(p)) != Some(before)
