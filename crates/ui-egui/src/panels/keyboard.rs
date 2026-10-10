@@ -208,6 +208,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         }
         "scenes.dialog" => crate::panels::scenes::open_dialog(app),
         "app.quit" => {
+            crate::crash::note("quit: app.quit (Cmd+Q / File ▸ Quit)");
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             Ok(Value::Null)
         }

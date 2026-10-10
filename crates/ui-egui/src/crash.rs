@@ -51,6 +51,13 @@ pub fn take_last() -> Option<String> {
     LAST.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
+/// Append one timestamped line to today's session log (`<data dir>/Logs/session-<day>.log`):
+/// app start, and every way the app is asked to quit (Cmd+Q / File ▸ Quit, the window's close
+/// button, the control channel), so an app that "closed by itself" leaves a trace. No backtrace.
+pub fn note(msg: &str) {
+    write_note(msg);
+}
+
 /// The crash log file for today, if logging to disk.
 pub fn log_path() -> Option<std::path::PathBuf> {
     let dir = LOG_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
@@ -72,8 +79,25 @@ fn write_log(summary: &str) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn write_note(msg: &str) {
+    use std::io::Write;
+    let Some(path) = log_path() else { return };
+    let path = path.with_file_name(path.file_name().and_then(|n| n.to_str()).unwrap_or("crash-0.log").replacen("crash-", "session-", 1));
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let secs = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{secs} pid {} {msg}", std::process::id());
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 fn write_log(_summary: &str) {}
+
+#[cfg(target_arch = "wasm32")]
+fn write_note(_msg: &str) {}
 
 #[cfg(test)]
 mod tests {

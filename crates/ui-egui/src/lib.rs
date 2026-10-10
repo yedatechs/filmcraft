@@ -1544,12 +1544,16 @@ impl eframe::App for FilmcraftApp {
     }
 
     fn on_exit(&mut self) {
+        crash::note("exit: on_exit (the window closed; the session shuts down)");
         // Flush the recovery journal and stop the auto-save worker; a session with nothing unsaved
         // removes its journal, one with unsaved changes keeps it for the next launch.
         self.session.shutdown();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            crash::note("quit: the window's close was requested (close button, Cmd+Q handled by the system, or the OS)");
+        }
         if !self.fonts_ready {
             ui.ctx().request_repaint();
             return;

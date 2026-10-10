@@ -219,6 +219,7 @@ opens the dialog on a page.
 | Audio | Automatch Time, Large Volume Adjustment, automation keyframe thinning (linear, minimum time) |
 | Audio Hardware | device class (cpal host), output device, I/O buffer size, sample rate, force document rate, Output Mapping (programme L/R → device channels) |
 | Auto Save | the auto-save ring and the crash-recovery journal |
+| Logs | `crash-<day>.log` (panics, with backtraces) and `session-<day>.log` (one line per app start and per quit request: Cmd+Q / File ▸ Quit, the window close button, the control channel, and the exit itself), so an app that closed by itself leaves a trace |
 | Color | stored only (display colour management, EDR monitoring, HDR graphics white) |
 | Graphics | new text layers: smart quotes, ligatures, default font |
 | Labels | the 16 label names and colours (timeline, Project panel, Edit ▸ Label), label defaults for imported movies / video / audio / stills and new sequences |
