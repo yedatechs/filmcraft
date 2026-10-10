@@ -163,7 +163,12 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("layout.menu.shape.square", "Square", ["Clip", "Layout", "Shape"], None),
     uic!("layout.menu.shape.free", "Free", ["Clip", "Layout", "Shape"], None),
     uic!("layout.menu.swap", "Swap With Clip Below", ["Clip", "Layout"], None),
-    uic!("layout.menu.redact", "Redact Area…", ["Clip", "Layout"], None),
+    uic!("layout.menu.redact.static.mosaic", "Static Mosaic…", ["Clip", "Layout", "Redact Area"], None),
+    uic!("layout.menu.redact.static.blur", "Static Blur…", ["Clip", "Layout", "Redact Area"], None),
+    uic!("layout.menu.redact.static.fill", "Static Fill…", ["Clip", "Layout", "Redact Area"], None),
+    uic!("layout.menu.redact.tracked.mosaic", "Tracked Mosaic…", ["Clip", "Layout", "Redact Area"], None),
+    uic!("layout.menu.redact.tracked.blur", "Tracked Blur…", ["Clip", "Layout", "Redact Area"], None),
+    uic!("layout.menu.redact.tracked.fill", "Tracked Fill…", ["Clip", "Layout", "Redact Area"], None),
 ];
 
 pub fn panel_command_id(p: PanelKind) -> String {

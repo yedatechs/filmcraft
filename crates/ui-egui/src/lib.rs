@@ -257,6 +257,13 @@ pub struct GpuState {
     pub max_texture: u32,
 }
 
+/// What the status bar calls a running job: "Exporting" for exports (`Export …`, `Quick Export …`,
+/// `Queue: …`), else the job's own label ("Rendering 2 preview segments", "Track Redaction 1
+/// (forward)", "Transcribing 1 clip").
+pub fn job_verb(label: &str) -> &str {
+    if ["Export ", "Quick Export ", "Queue: "].iter().any(|p| label.starts_with(p)) { "Exporting" } else { label }
+}
+
 /// Largest texture side a plan needs on the GPU (output and every layer).
 fn plan_side(plan: &filmcraft_render::plan::FramePlan) -> usize {
     use filmcraft_render::plan::FramePlan;
@@ -1307,21 +1314,18 @@ impl FilmcraftApp {
             self.watched_render = Some((job.id, from));
         }
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
-        let f = job.progress.fraction().clamp(0.0, 1.0);
-        let left = job.progress.eta().map(panels::left_text).unwrap_or_default();
+        // the same reading `jobs.list` reports (`Job::to_json`): one `Progress::eta` call per frame
+        let info = job.to_json();
+        let f = info["progress"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+        let left = panels::eta_suffix(&info);
         let cancel = egui::Rect::from_center_size(egui::pos2(sb.max.x - 14.0, sb.center().y), egui::vec2(14.0, 14.0));
         let bar = egui::Rect::from_min_size(egui::pos2(cancel.min.x - 128.0, sb.center().y - 3.0), egui::vec2(120.0, 6.0));
         let p = ui.painter();
         p.rect_filled(bar, 3.0, t.separator);
         p.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * f, bar.height())), 3.0, t.accent);
-        let verb = if job.label.starts_with("Rendering") { job.label.clone() } else { "Exporting".to_string() };
-        p.text(
-            egui::pos2(bar.min.x - 8.0, sb.center().y),
-            egui::Align2::RIGHT_CENTER,
-            format!("{verb}… {:.0}%{left}", f * 100.0),
-            Tokens::ui(11.0),
-            t.text_dim,
-        );
+        let text = format!("{}… {:.0}%{left}", job_verb(&job.label), f * 100.0);
+        let shown = p.text(egui::pos2(bar.min.x - 8.0, sb.center().y), egui::Align2::RIGHT_CENTER, &text, Tokens::ui(11.0), t.text_dim);
+        self.auto.add("status.job.text", shown, &text);
         let resp = ui.interact(cancel, egui::Id::new(("job-cancel", job.id)), egui::Sense::click());
         let c = if resp.hovered() { t.hot_text } else { t.text_dim };
         let k = 3.5;

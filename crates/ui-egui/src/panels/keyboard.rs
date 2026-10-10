@@ -129,7 +129,7 @@ pub const COMMANDS: &[UiCommand] = &[
     uic!("textPanel.toggleCut", "Cross Out / Restore Text", [], None),
     uic!("textPanel.showProgramTranscript", "Show Program Transcript", [], None),
     uic!("graphics.beginTextEditing", "Begin Text Editing for a Graphic Layer", [], Some("Cmd+Alt+'")),
-    // Clip ▸ Layout ▸ Redact Area… is `layout.menu.redact` (panels::layout), which calls this
+    // Clip ▸ Layout ▸ Redact Area ▸ … are `layout.menu.redact.*` (panels::layout), which call this
     uic!("redact.start", "Redact Area…", [], None),
     uic!("scenes.dialog", "Scenes…", ["Sequence"], None),
     uic!("help.filmcraftHelp", "FilmCraft Help…", ["Help"], Some("F1")),

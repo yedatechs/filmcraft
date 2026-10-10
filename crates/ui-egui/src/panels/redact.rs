@@ -1,10 +1,11 @@
-//! Tracked redaction: draw a box, get a tracked mosaic in the Program monitor and the clip menus. See
-//! `openspec/changes/clip-layouts/design.md` §5 and `docs/layouts.md`.
+//! Redaction: draw a box, get a static or tracked mosaic (blur, fill) in the Program monitor and
+//! the clip menus. See `openspec/changes/clip-layouts/design.md` §5 and `docs/layouts.md`.
 //!
-//! `redact.start {style?}` (Clip ▸ Layout ▸ Redact Area…) enters a draw mode on the Program
-//! monitor; the drag (automation id `program.redact.draw`) draws a rubber band, and the release
-//! maps it into the top-most video clip under the box (clip pixels) and runs `redact.add` with
-//! tracking. Esc cancels.
+//! `redact.start {style?, track?}` (Clip ▸ Layout ▸ Redact Area ▸ Static / Tracked Mosaic, Blur,
+//! Fill…) enters a draw mode on the Program monitor; the drag (automation id `program.redact.draw`)
+//! draws a rubber band, and the release maps it into the top-most video clip under the box (clip
+//! pixels) and runs `redact.add` with that style, tracking only when `track` (static by default:
+//! the box stays where it was drawn). Esc cancels.
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind};
 use filmcraft_geom::{Affine, Vec2};
@@ -14,10 +15,29 @@ use serde_json::{Value, json};
 
 use crate::FilmcraftApp;
 
-/// Status hint while the draw mode is on.
-pub const HINT: &str = "Drag a box over what to hide (Esc cancels)";
+/// Start of the status hint while the draw mode is on (see [`hint`]).
+pub const HINT: &str = "Drag a box over what to hide";
 
-/// `redact.start`: enter the draw mode (`style`: mosaic | blur | fill).
+/// Tooltip of the Redact Area submenu.
+pub const TIP: &str = "Static: the box stays where you draw it. Tracked: it follows what is under it (slow on long clips)";
+
+/// The Redact Area ▸ entries: (id suffix of `layout.menu.redact.*`, label, track, style).
+pub const MODES: [(&str, &str, bool, &str); 6] = [
+    ("static.mosaic", "Static Mosaic…", false, "mosaic"),
+    ("static.blur", "Static Blur…", false, "blur"),
+    ("static.fill", "Static Fill…", false, "fill"),
+    ("tracked.mosaic", "Tracked Mosaic…", true, "mosaic"),
+    ("tracked.blur", "Tracked Blur…", true, "blur"),
+    ("tracked.fill", "Tracked Fill…", true, "fill"),
+];
+
+/// The draw-mode status line: "Drag a box over what to hide · static mosaic (Esc cancels)".
+pub fn hint(style: &str, track: bool) -> String {
+    format!("{HINT} · {} {style} (Esc cancels)", if track { "tracked" } else { "static" })
+}
+
+/// `redact.start`: enter the draw mode (`style`: mosaic | blur | fill, default mosaic; `track`:
+/// follow the picture, default false).
 pub fn start(app: &mut FilmcraftApp, params: &Value) -> Result<Value, String> {
     let style = params.get("style").and_then(Value::as_str).map(str::to_ascii_lowercase);
     if let Some(s) = &style
@@ -25,20 +45,27 @@ pub fn start(app: &mut FilmcraftApp, params: &Value) -> Result<Value, String> {
     {
         return Err(format!("style `{s}`: mosaic, blur or fill"));
     }
+    let track = match params.get("track") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or("`track` is true or false")?,
+    };
     if app.session.active_sequence().is_none() {
         return Err("no sequence is open".into());
     }
     app.ui.mask_pen = None;
     app.ui.redact_draw = true;
+    app.ui.redact_track = track;
+    app.ui.status = hint(style.as_deref().unwrap_or("mosaic"), track);
+    let shown = style.clone().unwrap_or_else(|| "mosaic".into());
     app.ui.redact_style = style;
-    app.ui.status = HINT.into();
-    Ok(json!({"drawing": true}))
+    Ok(json!({"drawing": true, "style": shown, "track": track}))
 }
 
 fn stop(app: &mut FilmcraftApp) {
     app.ui.redact_draw = false;
     app.ui.redact_style = None;
-    if app.ui.status == HINT {
+    app.ui.redact_track = false;
+    if app.ui.status.starts_with(HINT) {
         app.ui.status.clear();
     }
 }
@@ -123,8 +150,9 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     let (x0, y0) = pts.iter().fold((f64::INFINITY, f64::INFINITY), |(x, y), p| (x.min(p.x), y.min(p.y)));
     let (x1, y1) = pts.iter().fold((f64::NEG_INFINITY, f64::NEG_INFINITY), |(x, y), p| (x.max(p.x), y.max(p.y)));
     let style = app.ui.redact_style.clone().unwrap_or_else(|| "mosaic".into());
+    let track = app.ui.redact_track;
     stop(app);
-    let params = json!({"clip": clip.0, "rect": [x0, y0, x1 - x0, y1 - y0], "style": style, "track": true});
+    let params = json!({"clip": clip.0, "rect": [x0, y0, x1 - x0, y1 - y0], "style": style, "track": track});
     let ctx = ui.ctx().clone();
     match crate::menus::invoke(app, &ctx, "redact.add", params) {
         Ok(v) => {
@@ -132,21 +160,10 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
             app.ui.status = match v["trackError"].as_str() {
                 Some(e) => format!("{name} added (tracking failed: {e})"),
                 None if v["jobs"].as_array().is_some_and(|j| !j.is_empty()) => format!("{name} added; tracking…"),
-                None => format!("{name} added"),
+                None if track => format!("{name} added"),
+                None => format!("{name} added (static)"),
             };
         }
         Err(e) => app.ui.status = e,
-    }
-}
-
-/// Entries for the timeline clip context menu (after the standard groups).
-pub fn clip_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
-    let r = ui.add_enabled(app.session.active_sequence().is_some(), egui::Button::new("Redact Area…"));
-    app.auto.add("timeline.clipMenu.redact.start", r.rect, "Redact Area…");
-    if r.clicked() {
-        if let Err(e) = start(app, &json!({})) {
-            app.ui.status = e;
-        }
-        ui.close();
     }
 }

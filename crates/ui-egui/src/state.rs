@@ -489,6 +489,9 @@ pub struct UiState {
     pub redact_draw: bool,
     #[serde(default)]
     pub redact_style: Option<String>,
+    /// Whether that box is tracked (`redact.add {track}`); false: a static box.
+    #[serde(default)]
+    pub redact_track: bool,
     /// Program monitor clip layouts: the first-selection hint, the cached `layout.inspect`, the
     /// previous click (cycling). Not saved.
     #[serde(skip)]
@@ -884,6 +887,7 @@ impl Default for UiState {
             mask_pen: None,
             redact_draw: false,
             redact_style: None,
+            redact_track: false,
             layout: Default::default(),
             save_preset: None,
             audio_fx_editors: Vec::new(),

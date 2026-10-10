@@ -9,14 +9,15 @@
 //!   moves freely), the handles scale it uniformly about the opposite corner or edge. A drag is one
 //!   undo step.
 //! - **Menus.** Right-click on the box, the timeline clip menu (Layout ▸) and Clip ▸ Layout share
-//!   one table of entries: Place ▸, Size ▸, Shape ▸, Swap With Clip Below, Redact Area…, with the
-//!   current place, size and shape checked.
+//!   one table of entries: Place ▸, Size ▸, Shape ▸, Swap With Clip Below, Redact Area ▸ (Static
+//!   / Tracked Mosaic, Blur, Fill…), with the current place, size and shape checked.
 //! - **Effect Controls.** One row of nine place buttons and four shape buttons under Motion.
 //!
 //! Automation ids: `program.layout.box`, `program.layout.handle.{nw|n|ne|e|se|s|sw|w}`,
 //! `layout.menu.{place|size|shape}` (the submenus), `layout.menu.place.{at}`,
 //! `layout.menu.size.{20|25|33|50}`, `layout.menu.shape.{circle|rounded|square|free}`,
-//! `layout.menu.swap`, `layout.menu.redact`, `effectControls.layout.place.{at}`,
+//! `layout.menu.swap`, `layout.menu.redact` (the submenu), `layout.menu.redact.{static|tracked}.{mosaic|blur|fill}`,
+//! `effectControls.layout.place.{at}`,
 //! `effectControls.layout.shape.{s}` (and `properties.layout.*` in the Properties panel).
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
@@ -159,8 +160,10 @@ pub fn checked(app: &FilmcraftApp, id: &str) -> Option<bool> {
 
 /// Whether a `layout.menu.*` entry can run now.
 pub fn enabled(app: &FilmcraftApp, id: &str) -> bool {
+    if id == "layout.menu.redact" || id.starts_with("layout.menu.redact.") {
+        return true;
+    }
     match id {
-        "layout.menu.redact" => true,
         "layout.menu.swap" => app.session.is_enabled("layout.swap"),
         _ => app.session.is_enabled("layout.place"),
     }
@@ -216,8 +219,13 @@ fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, Stri
     };
     let exec = |app: &mut FilmcraftApp, cmd: &str, p: Value| app.session.execute(cmd, p).map_err(|e| e.to_string());
     if rest == "redact" {
-        // Redact Area…: the Program picture becomes a draw surface (`panels::redact`)
+        // the old single entry: an alias of Static Mosaic… (`style` / `track` params still apply)
         return crate::panels::redact::start(app, params);
+    }
+    if let Some(mode) = rest.strip_prefix("redact.") {
+        // Redact Area ▸ …: the Program picture becomes a draw surface (`panels::redact`)
+        let (_, _, track, style) = crate::panels::redact::MODES.iter().find(|m| m.0 == mode).ok_or_else(|| format!("unknown redaction `{mode}`"))?;
+        return crate::panels::redact::start(app, &json!({"style": style, "track": track}));
     }
     if rest == "swap" {
         let p = match params.get("clips") {
@@ -295,7 +303,7 @@ fn menu_entry(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: &str, label: &str, 
     }
 }
 
-/// The Layout entries (Place ▸, Size ▸, Shape ▸, Swap With Clip Below, Redact Area…), shared by
+/// The Layout entries (Place ▸, Size ▸, Shape ▸, Swap With Clip Below, Redact Area ▸), shared by
 /// the monitor right-click menu and the timeline clip menu.
 pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     refresh(app);
@@ -323,7 +331,16 @@ pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     app.auto.add("layout.menu.shape", r.response.rect, "Shape");
     ui.separator();
     menu_entry(app, ui, "layout.menu.swap", "Swap With Clip Below", &mut run);
-    menu_entry(app, ui, "layout.menu.redact", "Redact Area…", &mut run);
+    let r = ui.menu_button("Redact Area", |ui| {
+        for (i, (mode, label, _, _)) in crate::panels::redact::MODES.iter().enumerate() {
+            if i == 3 {
+                ui.separator();
+            }
+            menu_entry(app, ui, &format!("layout.menu.redact.{mode}"), label, &mut run);
+        }
+    });
+    app.auto.add("layout.menu.redact", r.response.rect, "Redact Area");
+    r.response.on_hover_text(crate::panels::redact::TIP);
     if let Some(id) = run {
         let ctx = ui.ctx().clone();
         if let Err(e) = crate::menus::invoke(app, &ctx, &id, json!({})) {

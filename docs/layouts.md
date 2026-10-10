@@ -75,13 +75,19 @@ above, so it is one undo step.
 - **Layout menu.** Right-click the box, open the timeline clip menu's **Layout** submenu, or use
   **Clip ▸ Layout**. All three show the same entries: Place ▸ (Top Left … Bottom Right, Full),
   Size ▸ (20 / 25 / 33 / 50 %), Shape ▸ (Circle, Rounded, Square, Free), Swap With Clip Below,
-  Redact Area…. The current place, size and shape of the selected clip are checked. Place keeps
+  Redact Area ▸ (Static Mosaic…, Static Blur…, Static Fill…, Tracked Mosaic…, Tracked Blur…,
+  Tracked Fill…). The current place, size and shape of the selected clip are checked. Place keeps
   the size and margin of a clip that is already in a place (a full-frame clip gets 25 % and 3 %).
   Size keeps the clip's place (a full-frame clip goes to the centre; a box at no place grows or
   shrinks about its centre through `effects.setParam scale`). Swap With Clip Below swaps the
   selected clip with the first visible video clip on a lower track (`layout.swap {clips: [a, b]}`);
-  with nothing below, `layout.swap` picks the two top-most clips. Redact Area… only says it is not
-  available yet. The menu-bar entries are UI commands (`ui.menu.invoke {id: "layout.menu.place.topLeft"}`);
+  with nothing below, `layout.swap` picks the two top-most clips. Redact Area ▸ turns the Program
+  picture into a draw surface for one box ([draw mode](#draw-mode-program-monitor)): a **Static**
+  entry keeps the box where it is drawn (no tracking job; right for screen recordings, where
+  nothing moves), a **Tracked** entry makes it follow what is under it (forward, then backward
+  tracking jobs; slow on long clips). The submenu's tooltip says so, and the status line names the
+  choice ("Drag a box over what to hide · static mosaic (Esc cancels)"). The old id
+  `layout.menu.redact` still works as Static Mosaic…. The menu-bar entries are UI commands (`ui.menu.invoke {id: "layout.menu.place.topLeft"}`);
   they take an optional `clips` param in place of the selection.
 - **Effect Controls.** Under Motion (Effect Controls) and in the Transform section of the
   Properties panel, a **Layout** row has nine place buttons (a 3 × 3 dot grid; the clip's place is
@@ -93,8 +99,8 @@ above, so it is one undo step.
 | `program.picture` | the Program picture (click to select) |
 | `program.layout.box` | the selected clip's box (drag to move, right-click for the menu) |
 | `program.layout.handle.{nw\|n\|ne\|e\|se\|s\|sw\|w}` | scale handles |
-| `layout.menu.place`, `layout.menu.size`, `layout.menu.shape` | the submenus (right-click menu and timeline clip menu) |
-| `layout.menu.place.{at}`, `layout.menu.size.{20\|25\|33\|50}`, `layout.menu.shape.{circle\|rounded\|square\|free}`, `layout.menu.swap`, `layout.menu.redact` | menu entries; also the UI command ids of Clip ▸ Layout |
+| `layout.menu.place`, `layout.menu.size`, `layout.menu.shape`, `layout.menu.redact` | the submenus (right-click menu and timeline clip menu) |
+| `layout.menu.place.{at}`, `layout.menu.size.{20\|25\|33\|50}`, `layout.menu.shape.{circle\|rounded\|square\|free}`, `layout.menu.swap`, `layout.menu.redact.{static\|tracked}.{mosaic\|blur\|fill}` | menu entries; also the UI command ids of Clip ▸ Layout (`layout.menu.redact` as a command: an alias of `layout.menu.redact.static.mosaic`) |
 | `timeline.clipMenu.layout` | the Layout submenu of the timeline clip menu |
 | `effectControls.layout.place.{at}`, `effectControls.layout.shape.{s}` | the Effect Controls row (nine places, no Full) |
 | `properties.layout.place.{at}`, `properties.layout.shape.{s}` | the same row in the Properties panel |
@@ -183,7 +189,8 @@ animated transitions between scenes.
 
 ## Tracked redaction (`redact.*`)
 
-Draw a box over what to hide; a mosaic with a rectangle mask tracks it across the clip.
+Draw a box over what to hide; a mosaic with a rectangle mask stays there (static, the default of
+the menus) or tracks it across the clip (tracked).
 
 A redaction is an ordinary effect with one mask, so Effect Controls lists it, undo takes it back in
 one step, and save, render and export need nothing new:
@@ -212,13 +219,22 @@ shift under the running job).
 
 ### Draw mode (Program monitor)
 
-`redact.start {style?}` (Clip ▸ Layout ▸ Redact Area…; UI command) turns on the draw mode
-(`UiState.redact_draw`, style in `UiState.redact_style`) and shows "Drag a box over what to hide
-(Esc cancels)" in the status bar. The drag on the Program picture (automation id
+`redact.start {style?, track?}` (Clip ▸ Layout ▸ Redact Area ▸ …; UI command; `style` mosaic,
+blur or fill, default mosaic; `track` default **false**) turns on the draw mode
+(`UiState.redact_draw`, style in `UiState.redact_style`, tracking in `UiState.redact_track`) and
+shows "Drag a box over what to hide · static mosaic (Esc cancels)" (or `tracked blur`, …) in the
+status bar. The drag on the Program picture (automation id
 `program.redact.draw`) draws a rubber band; on release the box is mapped from the screen through
 the clip's Motion into source pixels of the top-most enabled video clip whose picture contains the
-box centre (else the top-most clip under the playhead) and `redact.add {clip, rect, style, track:
-true}` runs. One box per Redact Area…; a click without a drag keeps the mode; Esc cancels.
+box centre (else the top-most clip under the playhead) and `redact.add {clip, rect, style, track}`
+runs with the chosen `track`. A static box starts no job ("Redaction N added (static)"); a tracked
+one starts the forward job, which the status bar shows by its own label ("Track Redaction 1
+(forward)… 23% · 1:34:48 left", the time left `jobs.list` reports as `etaSeconds`; only export
+jobs say "Exporting"). One box per entry; a click without a drag keeps the mode; Esc cancels.
+
+Tracking already works on frames decoded at most 960 px wide (`masks.track`, `TRACK_MAX_WIDTH`;
+positions are scaled back to clip pixels), so on 4K footage its speed is bound by decoding the
+full-resolution frames.
 
 Follow-up (not in this change): a scroll-following tracker for text that scrolls vertically (the
 `position` tracker follows rigid motion, not a scrolling page whose content changes).
