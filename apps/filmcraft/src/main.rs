@@ -121,6 +121,11 @@ fn main() -> eframe::Result {
             }
             // voice-over recording reads the microphone through cpal
             session.voiceover.input = Some(Box::new(audio_in::CpalIn::new(&session.prefs.audio_hardware.device_class)));
+            // Window ▸ Record: the platform crate's screen / camera capture, or "not available"
+            // (never the synthetic test sources in the app)
+            if filmcraft_engine::record::registered_video_factory().is_none() {
+                session.record.factory = Some(std::sync::Arc::new(filmcraft_engine::record::UnavailableFactory));
+            }
             let project = files.iter().find(|f| f.ends_with(".fcproj")).cloned();
             if let Some(p) = project {
                 if let Err(e) = session.execute("file.open", json!({"path": p})) {

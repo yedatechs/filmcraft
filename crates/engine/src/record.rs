@@ -200,6 +200,9 @@ pub struct VideoDevices {
     pub displays: Vec<DisplayInfo>,
     pub windows: Vec<WindowInfo>,
     pub cameras: Vec<CameraInfo>,
+    /// Why a kind of device could not be listed (a missing permission): `record.devices` `error`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
 }
 
 /// A privacy permission's state.
@@ -311,6 +314,7 @@ impl VideoInputFactory for SyntheticFactory {
                 name: "Synthetic Camera".into(),
                 formats: vec![CameraFormat { width: cw, height: ch, fps: 30 }],
             }],
+            problems: Vec::new(),
         })
     }
     fn permissions(&self) -> Permissions {
@@ -909,7 +913,10 @@ fn is_recording(s: &Session) -> std::result::Result<(), String> {
 fn devices(s: &mut Session, _p: &Value) -> Result<Value> {
     let f = factory(s);
     let (dev, error) = match f.devices() {
-        Ok(d) => (d, None),
+        Ok(d) => {
+            let e = (!d.problems.is_empty()).then(|| d.problems.join("; "));
+            (d, e)
+        }
         Err(e) => (VideoDevices::default(), Some(e.message)),
     };
     let microphones = match &s.record.active {

@@ -11,10 +11,10 @@
 
 ## 3. macOS capture
 
-- [ ] 3.1 ADR 0002 bindings in `crates/platform/Cargo.toml`; `capture/mod.rs` (factory, permissions, clock mapping)
-- [ ] 3.2 `capture/screen.rs` (ScreenCaptureKit displays / windows, `SCStream` + output delegate, BGRA)
-- [ ] 3.3 `capture/camera.rs` (AVFoundation discovery, `AVCaptureSession` + video data output delegate, BGRA)
-- [ ] 3.4 `register()` installs the factory on macOS; permission-free unit tests
+- [x] 3.1 ADR 0002 bindings in `crates/platform/Cargo.toml`; `capture/mod.rs` (factory, permissions, clock mapping)
+- [x] 3.2 `capture/screen.rs` (ScreenCaptureKit displays / windows, `SCStream` + output delegate, BGRA)
+- [x] 3.3 `capture/camera.rs` (AVFoundation discovery, `AVCaptureSession` + video data output delegate, BGRA)
+- [x] 3.4 `register()` installs the factory on macOS; permission-free unit tests
 
 ## 4. UI
 

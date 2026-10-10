@@ -135,6 +135,29 @@ The sample entry's `hvcC` record is the one VideoToolbox wrote for the stream (r
 format description's sample description extension atoms, with the VPS / SPS / PPS), so profile,
 level and flags are the encoder's own. If it is missing the export stops with that reason.
 
+## Screen and camera capture (macOS)
+
+For recording (Window ▸ Record, `record.*`; [docs/recording.md](../../docs/recording.md),
+[ADR 0002](../../docs/adr/0002-platform-capture-ffi.md)), `register()` also installs
+`capture::MacCaptureFactory` as the engine's `record::VideoInputFactory`:
+
+- `capture::screen` (FFI): ScreenCaptureKit. Displays and on-screen windows from
+  `SCShareableContent` (listed only when Screen Recording is already allowed, so listing never
+  prompts); an `SCStream` per recording, BGRA at the display's pixel size (at most 3840 wide),
+  `minimumFrameInterval` 1 / fps, cursor shown; idle frames (no change) carry no picture and are
+  skipped.
+- `capture::camera` (FFI): AVFoundation. `devicesWithMediaType:` for the list (no permission
+  needed), an `AVCaptureSession` with an `AVCaptureVideoDataOutput` (BGRA, late frames discarded)
+  per recording; size from the quality through the session preset. No camera audio.
+- `capture` (safe): the factory, permission messages naming the System Settings pane, and the
+  mapping of sample presentation times (host clock) onto the recording clock, anchored at stream
+  start and never going backwards.
+
+Callbacks (stream output, sample-buffer delegate) run under `catch_unwind`; completion handlers
+only send on a channel that the caller waits on for at most 5 s. Other systems register nothing.
+`cargo test -p filmcraft-platform --lib live_screen -- --ignored --nocapture` records one second
+of the first display when the terminal has Screen Recording permission.
+
 ## Guarantees
 
 - **Never undecodable:** the factory declines (returns `None`, so the software decoder is used)

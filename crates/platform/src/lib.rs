@@ -20,8 +20,11 @@
 //! Pictures are the software decoder's: same planes (bit-exact on the parity fixtures), colour,
 //! pixel aspect, pts and presentation order, so the two are interchangeable.
 //!
+//! On macOS it also installs the screen and camera capture factory for recording
+//! (`filmcraft_engine::record`, [`capture`]: ScreenCaptureKit and AVFoundation).
+//!
 //! This is the one crate allowed to use `unsafe` (OS FFI), and only in its FFI modules
-//! (docs/adr/0001-platform-ffi.md).
+//! (docs/adr/0001-platform-ffi.md, docs/adr/0002-platform-capture-ffi.md).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -30,6 +33,7 @@
 mod annexb;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod biplanar;
+pub mod capture;
 #[cfg(target_os = "macos")]
 pub mod hardware_encode;
 pub mod hybrid;
@@ -65,6 +69,8 @@ pub fn register() -> Availability {
         filmcraft_export::register_encoder(hardware_encode::videotoolbox_encoder_factory);
         filmcraft_export::register_format_probe(filmcraft_export::Format::Hevc, hardware_encode::hevc_available);
         filmcraft_codecs::hw::set_hw_backend("VideoToolbox");
+        // Window ▸ Record: ScreenCaptureKit screens / windows and AVFoundation cameras
+        capture::register();
         Availability::Available("VideoToolbox")
     }
     #[cfg(target_os = "windows")]
