@@ -376,3 +376,26 @@ fn take_switching_keeps_an_unlinked_screen_track_gapless_and_in_step() {
         assert!((w[1].2 - media_stop).0.abs() <= frame.0, "screen media jumps between pieces: {pieces:?}");
     }
 }
+
+#[test]
+fn detect_finds_a_false_start_without_a_pause() {
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let item = s.active_sequence().unwrap().audio_tracks[0].items[0].item;
+    let mut t = Transcript { language: "en".into(), ..Default::default() };
+    // 0.05 s between the first "a" and the second "What": one utterance.
+    t.words.extend(line(&["What", "a", "what", "a", "time", "to", "be", "alive."], 1.2));
+    t.normalize();
+    s.transcriber = Some(Arc::new(FixedTranscriber { transcript: t, id: "fixed".into() }));
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    let r = s.execute("takes.detect", json!({})).unwrap();
+    assert_eq!(r["items"][0]["groups"], json!(1), "{r}");
+    let g = groups(&mut s);
+    assert_eq!(g.len(), 1, "{g:?}");
+    let takes = g[0]["takes"].as_array().unwrap();
+    assert_eq!(takes.len(), 2, "{g:?}");
+    assert_eq!(takes[0]["text"], json!("What a"));
+    assert_eq!(takes[1]["text"], json!("what a time to be alive."));
+    assert_eq!(g[0]["active"], json!(1));
+    assert_eq!(live_text(&mut s), "what a time to be alive.");
+}

@@ -39,7 +39,8 @@ pub struct DetectParams {
     /// How many following utterances each utterance is compared with.
     pub window: usize,
     /// Fewest content words (after retake cues) an utterance needs to be a take; also the
-    /// shortest false start recognised.
+    /// shortest false start recognised, including one that restarts within an utterance without a
+    /// pause (there at least 2, so a stutter like "the the" is not a false start).
     pub min_words: usize,
 }
 
@@ -162,7 +163,72 @@ struct Utt {
     cue: bool,
 }
 
-/// Group the utterances of `t` that repeat a line, in media order. Each utterance is compared with
+/// Where `words` (an utterance's content words) first restarts its own opening: the smallest
+/// `j >= min_words` (at most [`MAX_COMPARE_WORDS`]) such that `words[j..]` begins with all of
+/// `words[..j]`, so the part before `j` is a false start of what follows. `None` for openings
+/// shorter than `min_words`.
+fn restart(words: &[String], min_words: usize) -> Option<usize> {
+    let opening = words.get(..min_words)?;
+    let last = MAX_COMPARE_WORDS.min(words.len() / 2);
+    (min_words..=last).find(|&j| words.get(j..).is_some_and(|tail| tail.starts_with(opening) && words.get(..j).is_some_and(|head| tail.starts_with(head))))
+}
+
+/// The content-word positions where `words` restarts its opening without a pause ("what a what a
+/// time" splits before the second "what"), repeated on each remainder. Openings are at least two
+/// words (`min_words`, raised to 2) so a stutter like "the the" is not a restart. Strictly
+/// increasing.
+fn restarts(words: &[String], min_words: usize) -> Vec<usize> {
+    let m = min_words.max(2);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    // Each step moves `start` forward by at least `m`, so this ends within `words.len() / 2` steps.
+    while let Some(j) = words.get(start..).and_then(|rest| restart(rest, m)) {
+        start = start.saturating_add(j);
+        out.push(start);
+    }
+    out
+}
+
+/// The comparison units of one utterance (word indices `r` of `words`): normalised words with the
+/// leading retake cues stripped, split where the utterance restarts its own opening ([`restarts`]).
+/// Each part spans from its first word's start to its last word's end; the first part keeps the
+/// cue words and the cue flag.
+fn utterance_parts(words: &[Word], r: Range<usize>, min_words: usize) -> Vec<Utt> {
+    let mut norm: Vec<String> = Vec::new();
+    let mut index: Vec<usize> = Vec::new();
+    for (i, w) in words.get(r.clone()).unwrap_or(&[]).iter().enumerate() {
+        let n = normalize_word(&w.text);
+        if !n.is_empty() {
+            norm.push(n);
+            index.push(r.start.saturating_add(i));
+        }
+    }
+    let (content, cue) = strip_cues(&norm);
+    let skipped = norm.len().saturating_sub(content.len());
+    // (first word index, first content index) of each part, then the end.
+    let mut bounds: Vec<(usize, usize)> = vec![(r.start, 0)];
+    for c in restarts(content, min_words) {
+        if let Some(&w) = index.get(skipped.saturating_add(c)) {
+            bounds.push((w, c));
+        }
+    }
+    bounds.push((r.end, content.len()));
+    bounds
+        .windows(2)
+        .enumerate()
+        .filter_map(|(k, pair)| {
+            let (&(wa, ca), &(wb, cb)) = (pair.first()?, pair.get(1)?);
+            let ws = words.get(wa..wb)?;
+            let (first, last) = (ws.first()?, ws.last()?);
+            let part: Vec<String> = content.get(ca..cb)?.iter().take(MAX_COMPARE_WORDS).cloned().collect();
+            Some(Utt { range: TimeRange::from_bounds(first.start, last.end.max(first.start)), words: part, cue: cue && k == 0 })
+        })
+        .collect()
+}
+
+/// Group the utterances of `t` that repeat a line, in media order. An utterance that restarts its
+/// own opening without a pause ("what a what a time to be alive") is first split there, so the
+/// false start and the full line are compared like pause-separated takes. Each utterance is compared with
 /// the next `window` utterances that start within `max_gap` of its end; the first one similar
 /// enough (`similarity >= threshold`, the threshold lowered by 0.15 when the later utterance opens
 /// with a retake cue such as "okay", "again" or "one more") joins its group and the chain continues
@@ -172,17 +238,7 @@ pub fn detect(t: &Transcript, p: &DetectParams) -> Vec<TakeGroup> {
     let min_words = p.min_words.max(1);
     let window = p.window.min(MAX_WINDOW);
     let threshold = p.threshold();
-    let utts: Vec<Utt> = utterances(&t.words, p.pause)
-        .into_iter()
-        .filter_map(|r| {
-            let ws = t.words.get(r)?;
-            let (first, last) = (ws.first()?, ws.last()?);
-            let all: Vec<String> = ws.iter().map(|w| normalize_word(&w.text)).filter(|w| !w.is_empty()).collect();
-            let (content, cue) = strip_cues(&all);
-            let words: Vec<String> = content.iter().take(MAX_COMPARE_WORDS).cloned().collect();
-            Some(Utt { range: TimeRange::from_bounds(first.start, last.end.max(first.start)), words, cue })
-        })
-        .collect();
+    let utts: Vec<Utt> = utterances(&t.words, p.pause).into_iter().flat_map(|r| utterance_parts(&t.words, r, p.min_words)).collect();
     let eligible = |u: &Utt| u.words.len() >= min_words;
     let mut used = vec![false; utts.len()];
     let mut groups = Vec::new();

@@ -79,6 +79,10 @@ as "okay again" help) and stores the matches as **take groups** on the transcrip
 **live** when the sequence plays at least half of its media, and switching takes is an ordinary
 timeline edit (the live takes are extracted, the chosen take's media is put back at the first of
 their positions), so undo, redo and export need nothing new, and the other takes show crossed out.
+A false start needs no pause: an utterance that restarts its own opening ("what a… what a time to
+be alive", the first two or more words said again, the part before being an opening of what
+follows) is split there, so "what a" becomes a crossed-out take of the full line; a stutter
+("the the") or a phrase repeated mid-sentence is not split.
 
 | Command | What it does |
 |---|---|
