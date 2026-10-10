@@ -11,9 +11,12 @@
 //! - `fixtures [crate…]`: pre-generate the ffmpeg fixture matrix of the oracle tests (runs each
 //!   crate's ignored `generate_fixtures` test, i.e. the same generators the tests use) and print
 //!   what was made, reused or skipped.
+//! - `bundle [--release|--debug] [--open]`: macOS only, `<target>/<profile>/FilmCraft.app` with its
+//!   own Info.plist, icon and an ad-hoc signature (docs/contributing.md "macOS app bundle").
 //! - `ico <out.ico> <in.png>…`: pack PNGs into a Windows `.ico` (used by `packaging/icons.sh`).
 //! - `ci`: fmt check, clippy -D warnings, tests, layers, assets, wasm.
 
+mod bundle;
 mod ico;
 mod version;
 
@@ -484,12 +487,16 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             version::run(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
+        "bundle" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            bundle::run_bundle(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
+        }
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
         _ => Err(
-            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
+            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|bundle [--release|--debug] [--open]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
                 .into(),
         ),
     };

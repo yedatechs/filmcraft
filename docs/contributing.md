@@ -66,6 +66,30 @@ FilmCraft uses its bundled and system fonts. A `CRAFT_FONTS_DIR` that is not a c
 warning, or an error with `CRAFT_FONTS_REQUIRED=1` (release builds set both). Tests on these fonts'
 glyphs skip when it is empty; when you touch fonts, run the gates both with and without it.
 
+### macOS app bundle
+
+```sh
+cargo xtask bundle            # release build → target/release/FilmCraft.app (--debug: target/debug/)
+cargo xtask bundle --open     # …and open it
+open -a target/release/FilmCraft.app --args --control 9876 --data-dir /tmp/fc
+```
+
+`cargo xtask bundle [--release|--debug] [--open]` (macOS only; elsewhere it does nothing) builds
+`filmcraft` and assembles `<target>/<profile>/FilmCraft.app` (`CARGO_TARGET_DIR` is honoured):
+`Contents/MacOS/filmcraft`, `Contents/Resources/filmcraft.icns`, a generated `Info.plist`
+(`xtask/src/bundle.rs`: bundle id `ai.storyteller.filmcraft`, the workspace version, macOS 12.3+,
+camera and microphone usage descriptions, `.fcproj` and media document types) and `PkgInfo`. It
+copies nothing else (fonts and other assets are embedded) and signs the bundle ad hoc
+(`codesign --force --deep --sign -`). Options after `--args` reach FilmCraft as usual.
+
+**Permissions.** macOS attributes Camera, Microphone and Screen Recording to the app that started
+FilmCraft: from a terminal it asks for (and lists) the terminal, and a terminal that declares no
+camera usage description (such as the Claude desktop app's terminal pane) can never show the camera
+prompt. Started as `FilmCraft.app`, the permissions are FilmCraft's own. An ad-hoc signature
+changes with every build, so macOS asks for them again after a rebuild until a Developer ID signs
+the app (release builds, [releasing.md](releasing.md)). The bundle is for local use;
+`packaging/macos/package.sh` makes the release DMG.
+
 ## 3. Quality gates
 
 Every commit must pass all of these:

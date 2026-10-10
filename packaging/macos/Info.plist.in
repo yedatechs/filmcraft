@@ -44,6 +44,12 @@
   <false/>
   <key>NSHumanReadableCopyright</key>
   <string>Copyright © the FilmCraft authors. MIT OR Apache-2.0.</string>
+  <!-- Recording (docs/recording.md): without these, macOS ends the app when it asks for the
+       camera or microphone. Keep in sync with xtask/src/bundle.rs. -->
+  <key>NSCameraUsageDescription</key>
+  <string>FilmCraft records your camera when you press Record.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>FilmCraft records your microphone for voice-over and recordings.</string>
 
   <!-- Filmcraft's own format. -->
   <key>UTExportedTypeDeclarations</key>
