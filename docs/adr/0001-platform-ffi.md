@@ -1,7 +1,8 @@
 # ADR 0001: `unsafe` OS media FFI in `crates/platform`, and nowhere else
 
 - **Status:** accepted (2026-10-05, approved by the project owner; recorded in
-  [AGENTS.md](../../AGENTS.md) §0 item 3 and the craftrules never-crash standard)
+  [AGENTS.md](../../AGENTS.md) §0 item 3 and the craftrules never-crash standard); scope extended
+  to OS media capture (screen, camera) by [ADR 0002](0002-platform-capture-ffi.md)
 - **Issue:** #30 (hardware acceleration)
 
 ## Context
