@@ -3033,7 +3033,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec(
             "record.start",
             "Start Recording",
-            r#"{"screen":{"display":id,"area":[x,y,w,h]?}|{"window":id},"fps":n?,"resolution":"native|1440p|1080p|720p"?,"cursor":bool?,"systemAudio":bool?}?,"cameras":[{"device":id,"quality":"720p|1080p|4k|native"?,"width":n?,"height":n?,"fps":n?,"mirror":bool?,"rotate":0|90|180|270?}]?,"camera":{..}?,"mics":[{"device":str?}]?,"mic":{..}?,"name":str?,"dir":str?,"countdown":0..10?,"settings":RecordingSettings?}"#,
+            r#"{"screen":{"display":id,"area":[x,y,w,h]?}|{"window":id},"fps":n?,"resolution":"native|1440p|1080p|720p"?,"cursor":bool?,"systemAudio":bool?}?,"cameras":[{"device":id,"quality":"720p|1080p|4k|native"?,"width":n?,"height":n?,"fps":n?,"mirror":bool?,"rotate":"auto"|0|90|180|270?}]?,"camera":{..}?,"mics":[{"device":str?}]?,"mic":{..}?,"name":str?,"dir":str?,"countdown":0..10?,"settings":RecordingSettings?}"#,
             can_start,
             start,
             true,

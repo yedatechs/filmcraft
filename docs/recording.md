@@ -19,7 +19,7 @@ Window ▸ Record, or the red dot at the right end of the Program monitor's tran
 | Control | Does |
 |---|---|
 | Screen | Off, a display (name and pixel size), Area of <display>… (drag a part of it: see Border and areas), or a window (app — title); with an area: "Area 1280×720" and Edit… |
-| Camera rows | per camera: its live picture (see Preview), the camera (or Off), Quality 720p / 1080p / 4K / Native (the camera's best), `−` (remove the row), Mirror, Rotate 0° / 90° / 180° / 270°, Offset … ms (see Sync), Pop out |
+| Camera rows | per camera: its live picture (see Preview), the camera (or Off), Quality 720p / 1080p / 4K / Native (the camera's best), `−` (remove the row), Mirror, Rotate Auto / 0° / 90° / 180° / 270°, Offset … ms (see Sync), Pop out |
 | Microphone rows | per microphone: Off, Default Input (Settings ▸ Audio Hardware, or the Voice-Over source), or a device; `−` |
 | + Camera / + Microphone | add a row (at most four of each); a new camera row takes the next camera not chosen yet and the camera defaults of the settings |
 | Name | the recording's name (empty: `Recording <n>`) |
@@ -27,6 +27,7 @@ Window ▸ Record, or the red dot at the right end of the Program monitor's tran
 | Cancel | stops and deletes the files (or cancels the countdown) |
 | Refresh | lists the devices again (a camera plugged in, a window opened, a display woken) |
 | Settings ▸ | the recording settings below, the same values as Settings ▸ Recording |
+| – / + / × (title row) | – minimizes the panel to a strip: the title, Record / Stop with the elapsed time, the camera thumbnails at their recording size and `+` to restore it; × closes it (not while recording). The panel never minimizes by itself; the choice is kept (`ui.record.minimized`), also across recordings |
 
 While recording the panel stays open, shows frames and dropped frames per video source and the
 microphone level, and the status bar reads `Recording · 00:12 · screen 360 f / camera 358 f`.
@@ -57,7 +58,7 @@ field) and put back in range when the preferences are loaded.
 | Camera | Quality (`cameraQuality`) | 720p / 1080p / 4K / Native | 1080p | the default of new camera rows: the AVFoundation session preset |
 | Camera | Frame rate (`cameraFps`) | 24 / 30 / 60 | 30 | `activeVideoMin/MaxFrameDuration` when the camera's format can do it, else the camera's best (said in the sidecar) |
 | Camera | Mirror (`cameraMirror`) | on / off | off | the default of new camera rows (see Sync) |
-| Camera | Rotate (`cameraRotate`) | 0 / 90 / 180 / 270 | 0 | the default of new camera rows: turns the clip clockwise (see Rotate) |
+| Camera | Rotate (`cameraRotate`) | Auto / 0 / 90 / 180 / 270 | Auto | the default of new camera rows: `"auto"` follows the camera's own orientation, a number of degrees turns it clockwise; written into the file's track header (see Rotate) |
 | Encoding | Codec (`codec`) | H.264 / HEVC / ProRes 422 | H.264 | HEVC is offered only when the hardware encoder reports it (VideoToolbox) and falls back to H.264 otherwise; ProRes 422 is FilmCraft's own encoder: every frame a keyframe, large files, the friendliest to edit |
 | Encoding | Quality (`quality`) | Low / Medium / High / Max | High | the H.264 / HEVC bitrate (table below); ProRes ignores it |
 | Encoding | Keyframe every (`keyframeSeconds`) | 1 / 2 / 4 s | 2 s | 2 s scrubs best in an editor |
@@ -115,8 +116,11 @@ from its start to its first frame or audio block (a microphone typically 0.5–0
 0.2–0.9 s, more the first time).
 `source` is `screen`, `camera`, `mic` or `systemAudio`, `index` its number among the sources of that
 kind (Camera 2 has `2`). A screen's sidecar has `area` (`[x, y, w, h]` in display pixels) when
-only an area was recorded. A camera's sidecar also has `camera_offset_ms`, `rotate` (+
-`rotate_note`) and `mirror` (+
+only an area was recorded. A camera's sidecar also has `camera_offset_ms`, `rotate` (the file's turn, degrees clockwise; +
+`rotate_note`), `rotate_setting` (`"auto"` or the degrees chosen), `camera_rotation` (what the camera
+reported at the start, `null` when it reports nothing), with Auto and a camera that turned during
+the recording `rotation_changed_at_ns` (when it was first noticed, after the start),
+`rotation_changes` and `rotation_note`, and `mirror` (+
 `mirror_note`); audio sidecars have `sample_rate`, `requested_sample_rate`, `channels`, `format`
 (`s16` / `s24` / `f32`), `samples` (and `auto_gain` for microphones) instead of the picture fields.
 `notes` lists what could not be followed (HEVC not available, the 15 fps cap, a device's own sample
@@ -167,19 +171,42 @@ sequence, the clips, the bin entries and the items in one step; the files stay o
 
 ## Rotate
 
-A camera that is mounted on its side or upside down (some USB cameras come out turned) gets its
-row's Rotate: 0°, 90° (clockwise), 180° or 270° (`cameras: [{…, rotate}]`, default
-`cameraRotate`). Like Mirror, the file stays as the camera saw it: the clip's Motion turns it
-(Rotation) and scales it so the whole turned picture fits the sequence frame, never larger than
-the file (Scale; a 16:9 camera turned 90° next to a 16:9 screen is 56.25 %: a portrait picture
-with bars at the sides, nothing cropped). When the turned camera leads the sequence (no screen),
-the sequence itself is made upright (1080 × 1920 for a 1080p camera) and the clip fills it at
-100 %. Change or remove it later in Effect Controls ▸ Motion. The preview is turned the same way.
+A camera mounted on its side or upside down, or one that turns its picture itself (a gimbal webcam
+such as an Insta360 Link with auto-portrait, or one turned in the camera's own software), gets its
+row's Rotate: **Auto** (the default), 0°, 90° (clockwise), 180° or 270° (`cameras: [{…, rotate}]` =
+`"auto"` or the degrees, default `cameraRotate`).
+
+**The rotation is written into the file's track header, as iPhones do; nothing is added to the
+clip.** The pictures are encoded as the camera delivers them and the video track's `tkhd` matrix
+says how to show them (90°: `{0, 1, 0, −1, 0, 0, h, 0, 1}`, 180°: `{−1, 0, 0, 0, −1, 0, w, h, 1}`,
+270°: `{0, −1, 0, 1, 0, 0, 0, w, 1}`, 16.16 fixed point; the header's width and height stay the
+coded size). FilmCraft's importer, QuickTime and every other player show the file upright: a
+320 × 180 camera turned 90° imports as a 180 × 320 item, its thumbnail stands upright, and Place ▸
+Full and Scale to Frame treat it like any portrait clip. Placed next to a screen it is fitted by
+Settings ▸ Media ▸ Default Media Scaling like any clip of another size; when it leads (no screen)
+the sequence takes its upright size. Recordings made before this change keep the Motion effect
+they were given.
+
+**Auto** reads the orientation the camera reports when the recording starts (a turn made while
+it previewed counts, for example in the camera vendor's own software). On macOS 14+ that is an
+`AVCaptureDeviceRotationCoordinator` for the device (`videoRotationAngleForHorizonLevelCapture`,
+less the angle the data output's connection already applies, normally 0); before macOS 14 it is
+the connection's own angle (`videoOrientation` mapped to degrees). A camera that reports nothing
+is 0°. A fixed 0° / 90° / 180° / 270° wins over the camera's. The preview turns with the camera
+live while Auto is chosen.
+
+A file has one track header, so a camera that turns **during** a recording cannot turn the file
+mid-way: the file keeps the orientation of the start, the sidecar records the change
+(`rotation_changed_at_ns`, `rotation_changes`), `record.stop` lists it in `rotationChanged:
+[{source, atNs, rotate}]` and the panel says "the camera turned during the recording" after Stop.
+
+Auto does not touch Mirror: a selfie camera's mirror is a preference, so Mirror stays the row's
+own choice (a Horizontal Flip effect on the clip; the file stays as the camera saw it).
 
 ## Preview
 
 While the Record panel is open, each camera row shows its camera live in a 16:9 box about
-240 px wide (letterboxed; 120 px while recording, a glance rather than a monitor), at the camera's frame rate, mirrored and turned like its clip will be
+240 px wide (letterboxed; 120 px while recording, a glance rather than a monitor), at the camera's frame rate, mirrored like its clip and turned like its file will be (with Auto: as the camera reports now)
 ("is something in my teeth, is the angle bad"). Pop out opens it in a small preview window
 (320 pt wide, resizable, always on top, moved by its title bar; its close box puts it back in the
 panel) that keeps showing the camera during the recording even when the panel is closed. A
@@ -262,10 +289,10 @@ also says so when macOS lists no display because the display is asleep or the sc
 | Command | Params | Result |
 |---|---|---|
 | `record.devices` | – | `{displays: [{id, name, width, height}], windows: [{id, title, app}], cameras: [{id, name, formats: [{width, height, fps}]}], microphones: [name], factory, permissions: {screen, camera, microphone}, systemAudio, error?}` |
-| `record.start` | `screen?: {display: id, area?: [x, y, w, h]} \| {window: id}` (+ `fps?` 1–60, `resolution?`, `cursor?`, `systemAudio?`), `cameras?: [{device: id, quality?, width?, height?, fps?, mirror?, rotate?}]` (or `camera: {…}`), `mics?: [{device?: name}]` (or `mic: {…}`), `name?`, `dir?`, `countdown?` (0–10 s), `wait?` (default true), `settings?` (any of the settings fields, for this recording only) | once every source is live: `{recording, name, clockStartNs, dir, files: [{kind, key, path, sidecar}], warmupNs: {key: ns}, notes}`; with a countdown `{recording: false, countdown}`; with `wait: false` at once `{recording: false, starting: true, label}` (the outcome comes as a `started` / `startFailed` event of `record.status`) |
+| `record.start` | `screen?: {display: id, area?: [x, y, w, h]} \| {window: id}` (+ `fps?` 1–60, `resolution?`, `cursor?`, `systemAudio?`), `cameras?: [{device: id, quality?, width?, height?, fps?, mirror?, rotate?: "auto" \| 0 \| 90 \| 180 \| 270}]` (or `camera: {…}`), `mics?: [{device?: name}]` (or `mic: {…}`), `name?`, `dir?`, `countdown?` (0–10 s), `wait?` (default true), `settings?` (any of the settings fields, for this recording only) | once every source is live: `{recording, name, clockStartNs, dir, files: [{kind, key, path, sidecar}], warmupNs: {key: ns}, notes}`; with a countdown `{recording: false, countdown}`; with `wait: false` at once `{recording: false, starting: true, label}` (the outcome comes as a `started` / `startFailed` event of `record.status`) |
 | `record.preview` | `camera: {device, quality?, width?, height?, fps?} \| null`, or `cameras: [{…}]` (at most four); `{}` only reports | the listed cameras run live, the others stop: `{preview: [ids], cameras: [{device, width, height, fps, frames, recording, error}]}` |
 | `record.status` | – | `{recording, name?, elapsed, sources: [{kind, key, device, frames, dropped, bytes, level?}], stopAfterMinutes, notes, error?, preview: [camera ids]}`; during a countdown `{recording: false, countdown: {seconds, remaining}}`; while the sources start `{recording: false, starting: true, label: "Starting screen capture…"}`; also runs what is due (a finished start, the countdown's start, Stop after) and reports it as `event` |
-| `record.stop` | `discard?`, `cameraOffsetMs?` (−5000…5000), `cameraOffsetsMs?: [..]` | `{placed, name, sequence, opened, items: {screen?, camera?, camera2?, mic?, mic2?, systemAudio?}, clips: {key: {clip, start}}, offsets: {key: ticks}, cameras, mics, cameraOffsetsMs, files, errors, notes}`; during a countdown `{placed: false, cancelled: true}` |
+| `record.stop` | `discard?`, `cameraOffsetMs?` (−5000…5000), `cameraOffsetsMs?: [..]` | `{placed, name, sequence, opened, items: {screen?, camera?, camera2?, mic?, mic2?, systemAudio?}, clips: {key: {clip, start}}, offsets: {key: ticks}, cameras, mics, cameraOffsetsMs, files, errors, notes, rotationChanged: [{source, atNs, rotate}]}`; during a countdown `{placed: false, cancelled: true}` |
 | `record.cancel` | – | `{placed: false, discarded: true}` (`cancelled: true` for a countdown or a start whose sources are starting) |
 | `record.settings` | `{get: true}` or `{set: {field: value, …}}` (merged) | `{settings: {…}, hevcAvailable, systemAudioAvailable}` |
 
@@ -293,7 +320,7 @@ sync by pixel. A second microphone opens its own input (`AudioInput::spawn`).
 | `record.panel` | the panel window |
 | `record.panel.screen`, `.screen.<i>` | Screen picker and its entries (0 = Off) |
 | `record.panel.camera.<n>.device`, `.device.<i>` | camera row `n` (1-based): its picker (0 = Off) |
-| `record.panel.camera.<n>.quality` (+ `.<i>`), `.mirror`, `.rotate` (+ `.<i>`), `.offset`, `.remove` | its quality, Mirror, Rotate, offset, `−` |
+| `record.panel.camera.<n>.quality` (+ `.<i>`), `.mirror`, `.rotate` (+ `.<i>`: 0 Auto, 1 0°, 2 90°, 3 180°, 4 270°), `.offset`, `.remove` | its quality, Mirror, Rotate, offset, `−` |
 | `record.panel.camera.<n>.preview`, `.popout` | its live picture (label `1280×720 @ 30 fps · frame 42`, the turned size), Pop out / Pop in |
 | `record.preview.<n>` | the pop-out window's picture (headless sessions; natively it is its own window) |
 | `record.panel.screen.area.<display>`, `record.panel.screen.area`, `record.panel.screen.area.edit` | Area of <display>… (in the Screen list), "Area W×H" (or `drawing`), Edit… |
@@ -302,6 +329,7 @@ sync by pixel. A second microphone opens its own input (`AudioInput::spawn`).
 | `record.panel.camera.add`, `record.panel.mic.add` | + Camera, + Microphone |
 | `record.panel.name` | Name |
 | `record.panel.record`, `record.panel.cancel`, `record.panel.refresh`, `record.panel.close` | buttons |
+| `record.panel.minimize`, `record.panel.restore`, `record.panel.titleClose` | the title row's – (minimize), + (restore, while minimized) and × |
 | `record.panel.counters`, `record.panel.level`, `record.panel.error` | live counters (or the last result), mic level, error |
 | `record.panel.settings` | the Settings section header |
 | `record.panel.settings.<key>` (+ `.<i>` for choices), `record.panel.settings.outputFolder.choose` | its fields (`screenFps`, `screenResolution`, `showCursor`, `systemAudio`, `cameraQuality`, `cameraFps`, `cameraMirror`, `cameraRotate`, `codec`, `quality`, `keyframeSeconds`, `hardwareEncoder`, `sampleRate`, `channels`, `audioFormat`, `autoGain`, `countdownSeconds`, `stopAfterMinutes`, `openSequence`, `outputFolder`) |
@@ -312,7 +340,7 @@ UI command `window.record` opens the panel. `ui.set {"record": {...}}` merges in
 (`open`, `screen` = `""` / `display:<id>` / `window:<id>`, `screenArea` = `[x, y, w, h]` or
 `null`, `drawing`, `cameras: [{device, quality` = `720p` / `1080p` / `4k` / `native`, `mirror,
 rotate, offsetMs, popout}]`, `mics: [{device}]` (`""` / `default` / name), `name`,
-`settingsOpen`, `overlayDismissed`); `ui.inspect` shows it under `ui.record`, with `live` (the
+`settingsOpen`, `overlayDismissed`, `minimized`; a camera's `rotate` is `"auto"` or the degrees); `ui.inspect` shows it under `ui.record`, with `live` (the
 status line or the countdown), `last` (the last result) and `overlay` (the border as shown:
 `{state: idle | recording | drawing, target, rect: [x, y, w, h] pixels, frame: [x, y, w, h]
 desktop points}`, `null` when hidden).
