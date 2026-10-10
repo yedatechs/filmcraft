@@ -184,16 +184,47 @@ stream start) waits at most 5 s, then reports a timeout error.
 ## 10. UI (`crates/ui-egui/src/panels/record.rs`)
 
 Window ▸ Record opens a floating Record panel (and the Program monitor's ⏺ button, documented in
-`docs/recording.md`). Widgets and ids: `record.panel.screen` (+ `.screen.<i>`), `.camera`
-(+ `.camera.<i>`), `.quality`, `.mic` (+ `.mic.<i>`), `.name`, `.record` (Record / Stop), `.cancel`,
-`.offset`, `.counters`, `.level`, `.error`, `.close`. State is `UiState::record` (serde: open,
+`docs/recording.md`). Widgets and ids: `record.panel.screen` (+ `.screen.<i>`), camera rows
+`.camera.<n>.{device,quality,mirror,offset,remove}` and `.camera.add`, microphone rows
+`.mic.<n>.{device,remove}` and `.mic.add` (§11), `.name`, `.record` (Record / Stop), `.cancel`,
+`.counters`, `.level`, `.error`, `.close`, `.settings` (+ `.settings.<key>`). State is `UiState::record` (serde: open,
 screen / camera / mic choice, quality, name, offset), so `ui.set` drives it and `ui.inspect`
 shows it. No new keyboard shortcuts. While recording the status bar shows
 `Recording · 00:12 · screen 360 f / camera 358 f` and the panel cannot be closed.
 
-## 11. Follow-ups
+## 11. Several sources and settings (extension)
 
-Click log into `events` (F14), auto zoom from clicks, area selection, system audio
-(ScreenCaptureKit audio), camera audio, recovery of a file without `moov` after a crash, pause /
+- **Sources.** A recording has at most one screen, up to four cameras and up to four microphones
+  (`Src { kind, n }`; keys `camera2`, `mic2`…, files `… - Camera 2.mov`). The first microphone uses
+  the session's voice-over input (handed back at stop); the others open their own
+  (`AudioInput::spawn`; the desktop cpal input and the synthetic one implement it). Placement:
+  screen, then cameras in order on the video tracks; microphones in order, then system audio, on
+  the audio tracks. Each camera has its own offset; Mirror adds the existing `horizontal_flip`
+  effect first on the clip (no pixel flip in the file).
+- **Settings** (`record_settings.rs`): `RecordingSettings` in `Preferences::recording`, a Settings
+  category `recording` drawn by the generic Settings page, `record.settings {get|set}` (merge,
+  refusal naming the field), `record.start {settings}` for one recording. Plan: settings → defaults
+  of the screen request (`fps`, `max_height`, `show_cursor`, system audio), camera requests
+  (quality → size, fps, mirror), the encoding (`CaptureEncoding`) and the audio options.
+- **Encoding** (`filmcraft_export::recorder`): `MovRecorder::create_with` takes the codec (H.264,
+  HEVC through the hardware encoder only, ProRes 422 through FilmCraft's encoder), the quality
+  (`capture_kbps_for`: 6 / 12 / 20 / 40 Mbit/s at 1080p30 × `(px/1080p)^0.87` × `fps/30`), the
+  keyframe interval and hardware on / off. A refused HEVC falls back to H.264 with a sidecar note.
+- **Audio files**: one WAV writer for 16 / 24-bit PCM and 32-bit float, mono or stereo, header
+  rewritten at the end (so the system audio file can take the rate the system delivers). Auto gain
+  is applied between the read and the write; the level meter reads the input before it.
+- **System audio**: `VideoInput::capture_audio(rate, channels, sink)` before `start` (default: not
+  supported), `VideoInputFactory::system_audio()`. ScreenCaptureKit: `capturesAudio`, 48 kHz,
+  `excludesCurrentProcessAudio`, a second stream output of type Audio on the same queue, float
+  buffers copied out of the block buffer, times mapped with their own `HostClockMap`. A bounded
+  queue feeds a writer thread that fills gaps with silence.
+- **Countdown and Stop after**: `record.start {countdown}` checks everything, stores a
+  `Countdown` and returns; `record::tick` (the UI each frame, `record.status` headless) starts it
+  when due and stops a recording past its Stop after limit, keeping what it did in
+  `Recorder::last_event`. Both use `Recorder::now_ms`, which tests replace (`test_clock_ms`).
+
+## 12. Follow-ups
+
+Click log into `events` (F14), auto zoom from clicks, area selection, camera audio, recovery of a file without `moov` after a crash, pause /
 resume, Windows (Windows.Graphics.Capture, Media Foundation) and Linux (PipeWire portal) inputs,
 re-applying a camera offset after stop.

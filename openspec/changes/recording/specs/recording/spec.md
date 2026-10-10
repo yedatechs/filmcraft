@@ -35,3 +35,30 @@ On macOS, a Screen Recording, Camera or Microphone permission that is denied or 
 
 ### Requirement: Record panel
 Window ▸ Record SHALL open a Record panel with Screen, Camera (+ quality: 720p / 1080p / 4K / native) and Microphone pickers, a Name field, a Record button that becomes Stop with an elapsed timer, per-source frame / dropped counters and the microphone level, Cancel, and an "Offset camera by … ms" field applied at stop. Every widget SHALL have an automation id under `record.panel.*`, the panel's state SHALL be in `UiState` (serde) and, while recording, the status bar SHALL show `Recording · mm:ss · screen N f / camera M f`.
+
+### Requirement: Several cameras and microphones, in any mix
+`record.start` SHALL take `cameras: [...]` and `mics: [...]` (with `camera` / `mic` as one-element aliases), up to four of each, together with an optional screen, in any combination with at least one source, and SHALL refuse the same camera or microphone twice. Each camera and microphone SHALL be its own file and sidecar (`<Name> - Camera 2.mov`, `<Name> - Mic 2.wav`) on the one clock. `record.stop` SHALL place the screen on V1, the cameras on the next video tracks in order and the microphones on A1, A2… in order, each camera moved by its own offset (`cameraOffsetsMs`; the scalar `cameraOffsetMs` applies to every camera without one); a camera recorded with `mirror` SHALL get a Horizontal Flip effect on its clip.
+
+#### Scenario: Two cameras and two microphones
+- **WHEN** a screen, two synthetic cameras that start 100 ms and 400 ms late and two microphones are recorded and stopped with `cameraOffsetsMs: [0, 100]`
+- **THEN** the sequence has the screen on V1, the cameras on V2 and V3 (the second 100 ms later than its first sample), the microphones on A1 and A2, and five files with sidecars
+
+#### Scenario: The same device twice
+- **WHEN** `record.start` names one camera (or microphone) twice
+- **THEN** it is refused with an error saying the device is chosen twice, and nothing is recorded
+
+### Requirement: Recording settings
+The preferences SHALL hold the recording settings (screen frame rate 15/24/30/60, resolution Native/1440p/1080p/720p, show cursor, system audio; camera quality and frame rate and mirror for new camera rows; codec H.264/HEVC/ProRes 422, quality Low/Medium/High/Max, keyframe interval 1/2/4 s, hardware encoder; sample rate 44.1/48/96 kHz, mono/stereo, 16/24/32-bit float WAV, auto gain; countdown 0/3/5/10 s, stop after 0–180 minutes, open the sequence after Stop, output folder), with defaults and every value put back in range on load. `record.settings {get}` SHALL report them and `record.settings {set}` SHALL merge a change, refusing an invalid value with the field's name. `record.start` SHALL use them as defaults, its own parameters winning. Settings ▸ Recording (`settings.recording.*`) and the Record panel's Settings section (`record.panel.settings.*`) SHALL show and change the same values. HEVC SHALL be offered only when the hardware encoder reports it and SHALL fall back to H.264 (said in the sidecar) otherwise; the H.264 / HEVC bitrate SHALL follow the quality table in `docs/recording.md`.
+
+#### Scenario: The settings are the defaults of a recording
+- **WHEN** the settings say 15 fps, 720p, no cursor, ProRes, 44.1 kHz stereo 16-bit with auto gain and `record.start` gives the screen `fps: 10` and `settings: {audioFormat: "s24"}`
+- **THEN** the screen file is ProRes 422 at 960 × 720 (from 1440 × 1080) and 10 fps, and the microphone file is 44.1 kHz stereo 24-bit, its sidecar marking the auto gain
+
+### Requirement: Countdown
+`record.start {countdown: n}` (0–10 s) SHALL check the sources and parameters at once and start the recording `n` seconds later (reported by `record.status` as `countdown.remaining`), on a clock tests can replace; `record.cancel` / `record.stop` during the countdown SHALL cancel it without recording. The Record panel SHALL count down by the Countdown setting, showing `Recording in 3…` on its button and in the status bar, and Esc SHALL cancel it.
+
+### Requirement: Stop after
+With Stop after set to `m` minutes, a recording SHALL stop by itself after `m` minutes and build its sequence as `record.stop` does, opening it only when Open the sequence after Stop is on.
+
+### Requirement: System audio
+With System audio on and a screen source, the sound the system plays SHALL be recorded (ScreenCaptureKit `capturesAudio` on macOS 13+, FilmCraft's own sound excluded) to `<Name> - System Audio.wav` on the recording clock, gaps filled with silence, and placed on the next free audio track. Where it cannot be captured the recording SHALL go on without it and say so in its `notes`, and the panel SHALL show the control disabled with "(not available yet)".

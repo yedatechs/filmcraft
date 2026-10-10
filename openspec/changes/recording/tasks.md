@@ -22,7 +22,17 @@
 - [x] 4.2 `tests/record_ui.rs` with synthetic inputs (record, stop → sequence; cancel → no files)
 - [x] 4.3 `docs/recording.md`, linked from the docs
 
-## 5. Acceptance
+## 5. Several sources and settings
 
-- [ ] 5.1 Smoke test on a Mac: `record.devices` lists the displays and the FaceTime camera; a 3 s screen-only recording
-- [ ] 5.2 Owner: screen + FaceTime camera + mic for a minute, transcribe, circle the face bottom right
+- [x] 5.1 `cameras` / `mics` lists (aliases `camera` / `mic`), up to four each, refused twice; a file and sidecar each; V1 screen, V2… cameras, A1… mics; `cameraOffsetsMs`; Mirror as a Horizontal Flip effect; `AudioInput::spawn` for a second microphone; camera and microphone rows in the panel
+- [x] 5.2 `RecordingSettings` in the preferences (`recording.*`), `record.settings {get|set}`, Settings ▸ Recording, the panel's Settings section; `record.start {settings}` and its defaults
+- [x] 5.3 `MovRecorder::create_with` (H.264 / HEVC / ProRes 422, quality tiers, keyframe interval, hardware on / off); HEVC falls back to H.264
+- [x] 5.4 Screen resolution (`max_height`; ScreenCaptureKit `width` / `height`, else in software), Show cursor, camera frame rate (`activeVideoMinFrameDuration`), WAV 16 / 24 / 32-bit float mono / stereo at the chosen rate, auto gain
+- [x] 5.5 System audio (ScreenCaptureKit audio output → `… - System Audio.wav`), synthetic tone headless
+- [x] 5.6 Countdown (`record.start {countdown}`, `record::tick`, a replaceable clock), Stop after, Open the sequence after Stop, Output folder
+- [x] 5.7 Tests (engine `record_tests`, export `recorder`, `record_ui`), `docs/recording.md` § Settings
+
+## 6. Acceptance
+
+- [ ] 6.1 Smoke test on a Mac: `record.devices` lists the displays and the FaceTime camera; a 3 s screen-only recording
+- [ ] 6.2 Owner: screen + FaceTime camera + mic for a minute, transcribe, circle the face bottom right

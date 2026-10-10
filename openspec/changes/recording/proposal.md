@@ -28,9 +28,14 @@ a sequence, already in sync, ready for transcription and layouts (`openspec/chan
    an elapsed timer, live per-source counters and the microphone level, Cancel, and the camera
    offset field. A status-bar line while recording.
 
+5. **Several sources and settings** (extension): up to four cameras and four microphones in any mix
+   with the screen, each its own file and track; persistent recording settings (frame rate,
+   resolution, cursor, system audio, codec, quality, keyframes, audio format, auto gain, countdown,
+   stop after, output folder) shared by Settings ▸ Recording, the panel and `record.settings`.
+
 Out of scope (later): click tracking and auto zoom (F14; the sidecar has an `events` list ready for
-a click log), area selection, system-audio capture, camera audio, Windows / Linux capture, pause /
-resume.
+a click log), area selection, camera audio, Windows / Linux capture, pause / resume, a
+teleprompter.
 
 ## Impact
 
