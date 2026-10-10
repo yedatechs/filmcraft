@@ -272,10 +272,12 @@ and the ProRes encoder's rate target: `ceil(w/16) × ceil(h/16)` macroblocks × 
 HQ's nominal 220 Mbit/s at 1080p29.97 spread over 8160 macroblocks) ÷ 8 bytes per frame, plus
 64 KB per file. 3840×2160 is 3.645 MB a frame, 109 MB/s at 30 fps (875 Mbit/s), so 14 minutes is
 about 92 GB; 1920×1080 is 918 KB a frame. Real files are usually smaller (static content
-compresses well below the target), so the estimate errs high. The render is refused when the
-estimate exceeds the free space minus a 4 GB reserve, with an error toast such as "Rendering 4
-segments needs about 11 GB; 7.9 GB free (FilmCraft keeps 4 GB free). Free space or render a
-shorter In/Out range." While rendering, free space is checked before every segment and every 10 s
+compresses well below the target), so the estimate errs high. The render is refused up front only
+when a quarter of the estimate exceeds the free space minus a 4 GB reserve (still content such as a
+screen recording comes out at a fraction of the nominal size; the live check below is the real
+guard), with an error toast such as "Rendering 4 segments needs at least 11 GB (up to 44 GB);
+7.9 GB free (FilmCraft keeps 4 GB free). Free space or render a shorter In/Out range." The start
+toast gives the same upper bound ("up to 11 GB"). While rendering, free space is checked before every segment and every 10 s
 inside one; under 2 GB the job stops ("Rendering stopped: only 1.5 GB free on the disk…", shown as
 a toast), deleting its `.part` file. The web build has no disk to check and skips the guard.
 

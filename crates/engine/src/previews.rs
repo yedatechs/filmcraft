@@ -722,16 +722,25 @@ fn plural(n: usize) -> &'static str {
 /// The toast shown when a preview render starts.
 pub fn start_toast(segments: usize, bytes: u64, seconds: f64) -> String {
     let min = (seconds / 60.0).round().max(1.0);
-    format!("Rendering {segments} preview segment{} (about {}, ~{min:.0} min). Cancel: × in the status bar.", plural(segments), format_bytes(bytes))
+    format!("Rendering {segments} preview segment{} (up to {}, ~{min:.0} min). Cancel: × in the status bar.", plural(segments), format_bytes(bytes))
 }
 
-/// Why a render of `segments` needing `bytes` may not start with `free` bytes available (None = it may).
+/// ProRes is variable-rate: still content (a screen recording) comes out far under the nominal
+/// size (an owner's 14-minute 4K screen recording was 11 GB against a 92 GB estimate), so a render
+/// is refused up front only when even this fraction of the estimate would not fit; the low-space
+/// stop while rendering ([`STOP_BELOW_BYTES`]) is the real guard.
+pub const SURE_FRACTION: u64 = 4;
+
+/// Why a render of `segments` estimated at `bytes` (nominal) may not start with `free` bytes
+/// available (None = it may): refused when a quarter of the estimate ([`SURE_FRACTION`]) exceeds
+/// the free space minus the reserve.
 pub fn refuse_reason(segments: usize, bytes: u64, free: Option<u64>) -> Option<String> {
     let free = free?;
-    (bytes > free.saturating_sub(RESERVE_BYTES)).then(|| {
+    (bytes / SURE_FRACTION > free.saturating_sub(RESERVE_BYTES)).then(|| {
         format!(
-            "Rendering {segments} segment{} needs about {}; {} free (FilmCraft keeps {} free). Free space or render a shorter In/Out range.",
+            "Rendering {segments} segment{} needs at least {} (up to {}); {} free (FilmCraft keeps {} free). Free space or render a shorter In/Out range.",
             plural(segments),
+            format_bytes(bytes / SURE_FRACTION),
             format_bytes(bytes),
             format_bytes(free),
             format_bytes(RESERVE_BYTES)

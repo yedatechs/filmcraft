@@ -377,14 +377,16 @@ fn preview_size_estimate_uses_the_prores_rate_target() {
 #[test]
 fn preview_toast_and_refusal_texts() {
     use crate::previews::{format_bytes, refuse_reason, start_toast};
-    assert_eq!(start_toast(4, 11_000_000_000, 57.4 * 60.0), "Rendering 4 preview segments (about 11 GB, ~57 min). Cancel: × in the status bar.");
-    assert_eq!(start_toast(1, 350_000_000, 5.0), "Rendering 1 preview segment (about 350 MB, ~1 min). Cancel: × in the status bar.");
+    assert_eq!(start_toast(4, 11_000_000_000, 57.4 * 60.0), "Rendering 4 preview segments (up to 11 GB, ~57 min). Cancel: × in the status bar.");
+    assert_eq!(start_toast(1, 350_000_000, 5.0), "Rendering 1 preview segment (up to 350 MB, ~1 min). Cancel: × in the status bar.");
     assert_eq!(
-        refuse_reason(4, 11_000_000_000, Some(7_900_000_000)).unwrap(),
-        "Rendering 4 segments needs about 11 GB; 7.9 GB free (FilmCraft keeps 4 GB free). Free space or render a shorter In/Out range."
+        refuse_reason(4, 44_000_000_000, Some(7_900_000_000)).unwrap(),
+        "Rendering 4 segments needs at least 11 GB (up to 44 GB); 7.9 GB free (FilmCraft keeps 4 GB free). Free space or render a shorter In/Out range."
     );
-    assert!(refuse_reason(4, 11_000_000_000, Some(15_100_000_000)).is_none());
-    assert!(refuse_reason(4, 11_000_000_000, Some(14_900_000_000)).is_some(), "the 4 GB reserve counts");
+    // a quarter of the nominal estimate has to fit (ProRes on still content comes out far smaller)
+    assert!(refuse_reason(4, 11_000_000_000, Some(7_900_000_000)).is_none(), "11 GB nominal may well be 3 GB real");
+    assert!(refuse_reason(4, 44_000_000_000, Some(15_100_000_000)).is_none());
+    assert!(refuse_reason(4, 44_000_000_000, Some(14_900_000_000)).is_some(), "the 4 GB reserve counts");
     assert!(refuse_reason(4, u64::MAX, None).is_none(), "unknown free space (web) never refuses");
     assert_eq!(format_bytes(0), "under 1 MB");
 }
@@ -400,13 +402,13 @@ fn render_says_what_it_will_write_and_refuses_to_fill_the_disk() {
     assert_eq!(v["estimatedBytes"], 4 * 3 * 900 / 8 * 24 + 65_536);
     let toasts: Vec<String> =
         s.drain_events().into_iter().filter_map(|e| if let crate::Event::Toast { message, .. } = e { Some(message) } else { None }).collect();
-    assert!(toasts.iter().any(|t| t.starts_with("Rendering 1 preview segment (about ")), "{toasts:?}");
+    assert!(toasts.iter().any(|t| t.starts_with("Rendering 1 preview segment (up to ")), "{toasts:?}");
     s.execute("sequence.deleteRenderFiles", json!({})).unwrap();
     // 3 GB free: under the 4 GB reserve, nothing starts
     s.previews.set_space_probe(Some(Arc::new(|_: &std::path::Path| Some(3_000_000_000))));
     let jobs = s.jobs.len();
     let e = s.execute("sequence.renderEffectsInToOut", json!({"wait": true})).unwrap_err().to_string();
-    assert!(e.contains("needs about") && e.contains("3 GB free"), "{e}");
+    assert!(e.contains("needs at least") && e.contains("3 GB free"), "{e}");
     assert_eq!(s.jobs.len(), jobs, "no job was started");
     assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Toast { error: true, message } if message.contains("Free space"))));
     // the disk fills up while rendering: the job stops and leaves no partial file
