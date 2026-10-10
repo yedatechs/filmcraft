@@ -34,5 +34,5 @@
 
 ## 6. Acceptance
 
-- [ ] 6.1 Smoke test on a Mac: `record.devices` lists the displays and the FaceTime camera; a 3 s screen-only recording
+- [x] 6.1 Smoke test on a Mac: `record.devices` lists the display and two cameras; 5 s screen + mic with the defaults (VideoToolbox H.264), 3 s screen at 60 fps / 720p / no cursor / HEVC, 3 s screen + system audio (no camera recorded: Camera permission undetermined)
 - [ ] 6.2 Owner: screen + FaceTime camera + mic for a minute, transcribe, circle the face bottom right

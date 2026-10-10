@@ -107,13 +107,19 @@ pub fn videotoolbox_encoder_factory(
         Ok(c) => c,
         Err(why) => {
             log::info!("hardware {name} encoding declined: {why}");
+            filmcraft_export::note_hw_encode_declined();
             return None;
         }
     };
     match VtEncoder::new(config) {
-        Ok(vt) => Some(Ok(Box::new(HardwareEncoder { vt, y: Vec::new(), u: Vec::new(), v: Vec::new(), decoded: 0 }))),
+        Ok(vt) => {
+            // counted like NVENC's: `perf.stats`, and how the recorder tells the hardware took it
+            filmcraft_export::note_hw_encode_session();
+            Some(Ok(Box::new(HardwareEncoder { vt, y: Vec::new(), u: Vec::new(), v: Vec::new(), decoded: 0 })))
+        }
         Err(why) => {
             log::info!("hardware {name} encoding declined: {why}");
+            filmcraft_export::note_hw_encode_declined();
             None
         }
     }
