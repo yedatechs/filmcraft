@@ -246,11 +246,12 @@ pub(crate) fn reapply_in(q: &mut Sequence, c: Option<&Ctx>) {
             let at = Place::parse(&sl.place).unwrap_or(Place::Full);
             let shape = Shape::parse(&sl.shape, sl.radius).unwrap_or(Shape::Free);
             let pose = pose_of(it, mt, false);
-            let (pos, scale) = lay::place(frame, src, shape, at, lay::clamp_size(sl.size), lay::clamp_margin(sl.margin), &pose);
+            // scene-owned clips are never panned (a scene slot has no pan)
+            let (pos, scale) = lay::place(frame, src, shape, lay::NO_PAN, at, lay::clamp_size(sl.size), lay::clamp_margin(sl.margin), &pose);
             plan.position.insert(mt, ParamValue::Vec2(Vec2::new(pos.0, pos.1)));
             plan.scale.insert(mt, ParamValue::Float(scale.clamp(0.0, lay::MAX_SCALE)));
             plan.opacity.insert(mt, ParamValue::Float(if sl.hidden { 0.0 } else { 100.0 }));
-            plan.path.insert(mt, lay::shape_path(src, shape));
+            plan.path.insert(mt, lay::shape_path(src, shape, lay::NO_PAN));
         }
         if !plan.position.is_empty() {
             plans.push((it.id, plan));
@@ -284,7 +285,7 @@ pub(crate) fn reapply_in(q: &mut Sequence, c: Option<&Ctx>) {
             let _ = set_layout_mask(it, None, None, "scenes.apply");
             continue;
         };
-        let full = lay::shape_path(src, Shape::Rounded { radius_pct: 0.0 }).unwrap_or_else(|| first.clone());
+        let full = lay::shape_path(src, Shape::Rounded { radius_pct: 0.0 }, lay::NO_PAN).unwrap_or_else(|| first.clone());
         let keys: BTreeMap<Tick, ParamValue> = plan.path.iter().map(|(t, p)| (*t, ParamValue::Path(p.clone().unwrap_or_else(|| full.clone())))).collect();
         if set_layout_mask(it, Some(first), None, "scenes.apply").is_err() {
             continue;

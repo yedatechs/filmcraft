@@ -206,3 +206,72 @@ fn program_monitor_layouts() {
     assert_eq!(d.ids("program.redact.draw"), vec!["program.redact.draw".to_string()]);
     assert!(d.ok("ui.inspect", json!({})).to_string().contains("Drag a box"));
 }
+
+#[test]
+fn program_monitor_pan() {
+    let mut d = Driver::demo();
+    d.exec("playhead.set", json!({"seconds": 7.0}));
+    d.ok("ui.set", json!({"tool": "selection"}));
+    d.frames(4);
+    let seq = d.exec("sequence.inspect", json!({}));
+    let frame = (seq["settings"]["width"].as_f64().unwrap_or(1920.0), seq["settings"]["height"].as_f64().unwrap_or(1080.0));
+    // select the V2 overlay and make it a circle
+    d.ok("ui.click", json!({"id": "program.picture", "fx": 1540.0 / frame.0, "fy": 820.0 / frame.1}));
+    d.frames(3);
+    let top = d.selection()[0];
+    d.exec("layout.shape", json!({"clips": [top], "shape": "circle"}));
+    d.frames(3);
+    let i0 = d.inspect();
+    assert_eq!(i0["pan"], json!([0.0, 0.0]), "{i0}");
+    let box0: Vec<f64> = i0["box"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let same_box = |v: &Value| v["box"].as_array().unwrap().iter().zip(&box0).all(|(a, b)| (a.as_f64().unwrap() - b).abs() < 1.0);
+
+    // Alt-drag inside the box 30 px right: the picture slides right, so the shape shows more of
+    // the left of the source (a negative pan); the box stays put
+    let b = d.rect("program.layout.box");
+    let (cx, cy) = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0);
+    d.ok("ui.drag", json!({"from": {"x": cx, "y": cy}, "to": {"x": cx + 30.0, "y": cy}, "modifiers": {"alt": true}}));
+    d.frames(4);
+    let i1 = d.inspect();
+    assert!(i1["pan"][0].as_f64().unwrap() < -10.0, "{i1}");
+    assert!(i1["pan"][1].as_f64().unwrap().abs() < 1e-6, "a 16:9 circle has no room to pan vertically: {i1}");
+    assert!(same_box(&i1), "{i1} vs {i0}");
+    assert_eq!(i1["shape"], json!("circle"));
+    assert!(d.ok("ui.inspect", json!({})).to_string().contains("Pan: "), "status bar shows the pan");
+    d.exec("edit.undo", json!({}));
+    d.frames(2);
+    assert_eq!(d.inspect()["pan"], json!([0.0, 0.0]), "the drag is one undo step");
+
+    // Clip ▸ Layout ▸ Pan ▸ Centre on Left Third (a 1920-wide source: the centre at x = 640)
+    let items = d.ok("ui.menu.list", json!({}));
+    let left = items.as_array().unwrap().iter().find(|it| it["id"] == json!("layout.menu.pan.left")).cloned().unwrap();
+    assert_eq!(left["path"], json!(["Clip", "Layout", "Pan"]));
+    assert_eq!(left["enabled"], json!(true), "{left}");
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.pan.left"}));
+    let i2 = d.inspect();
+    assert_eq!(i2["pan"], json!([-320.0, 0.0]), "{i2}");
+    assert!(same_box(&i2), "{i2}");
+
+    // the right-click menu has the same entries
+    d.ok("ui.click", json!({"id": "program.layout.box", "button": "right"}));
+    d.frames(3);
+    d.click("layout.menu.pan");
+    let ids = d.ids("layout.menu.pan.");
+    for p in ["left", "center", "right"] {
+        assert!(ids.contains(&format!("layout.menu.pan.{p}")), "{ids:?}");
+    }
+    d.click("layout.menu.pan.right");
+    assert_eq!(d.inspect()["pan"], json!([320.0, 0.0]));
+    d.exec("edit.undo", json!({}));
+    d.frames(2);
+    assert_eq!(d.inspect()["pan"], json!([-320.0, 0.0]), "undo restores the previous pan");
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.pan.center"}));
+    assert_eq!(d.inspect()["pan"], json!([0.0, 0.0]));
+
+    // a free clip cannot pan: the entries are disabled
+    d.exec("layout.shape", json!({"clips": [top], "shape": "free"}));
+    d.frames(2);
+    let items = d.ok("ui.menu.list", json!({}));
+    let left = items.as_array().unwrap().iter().find(|it| it["id"] == json!("layout.menu.pan.left")).cloned().unwrap();
+    assert_eq!(left["enabled"], json!(false), "{left}");
+}

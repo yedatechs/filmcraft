@@ -6,16 +6,18 @@
 //!   second click on the same spot (within 4 px) cycles to the next clip under the pointer.
 //! - **Box and handles.** The selected video clip's visible box (`layout.inspect` → `box`) with 8
 //!   handles: drag inside moves it (snapping to the frame edges and centre and the guides; ⌘/Ctrl
-//!   moves freely), the handles scale it uniformly about the opposite corner or edge. A drag is one
-//!   undo step.
+//!   moves freely), the handles scale it uniformly about the opposite corner or edge; Alt/Option-drag
+//!   inside pans the picture inside a circle or square (`layout.pan`; the box stays put). A drag is
+//!   one undo step.
 //! - **Menus.** Right-click on the box, the timeline clip menu (Layout ▸) and Clip ▸ Layout share
-//!   one table of entries: Place ▸, Size ▸, Shape ▸, Swap With Clip Below, Redact Area ▸ (Static
-//!   / Tracked Mosaic, Blur, Fill…), with the current place, size and shape checked.
+//!   one table of entries: Place ▸, Size ▸, Shape ▸, Pan ▸, Swap With Clip Below, Redact Area ▸
+//!   (Static / Tracked Mosaic, Blur, Fill…), with the current place, size and shape checked.
 //! - **Effect Controls.** One row of nine place buttons and four shape buttons under Motion.
 //!
 //! Automation ids: `program.layout.box`, `program.layout.handle.{nw|n|ne|e|se|s|sw|w}`,
 //! `layout.menu.{place|size|shape}` (the submenus), `layout.menu.place.{at}`,
 //! `layout.menu.size.{20|25|33|50}`, `layout.menu.shape.{circle|rounded|square|free}`,
+//! `layout.menu.pan` (the submenu), `layout.menu.pan.{left|center|right}`,
 //! `layout.menu.swap`, `layout.menu.redact` (the submenu), `layout.menu.redact.{static|tracked}.{mosaic|blur|fill}`,
 //! `effectControls.layout.place.{at}`,
 //! `effectControls.layout.shape.{s}` (and `properties.layout.*` in the Properties panel).
@@ -45,8 +47,11 @@ pub const PLACES: [(&str, &str); 10] = [
 pub const SIZES: [(u32, &str); 4] = [(20, "20%"), (25, "25%"), (33, "33%"), (50, "50%")];
 /// Shapes of `layout.shape`.
 pub const SHAPES: [(&str, &str); 4] = [("circle", "Circle"), ("rounded", "Rounded"), ("square", "Square"), ("free", "Free")];
+/// Entries of the Pan submenu: where the shape's centre goes, as a fraction of the source width.
+pub const PANS: [(&str, &str, f64); 3] =
+    [("left", "Centre on Left Third", 1.0 / 3.0), ("center", "Centre", 0.5), ("right", "Centre on Right Third", 2.0 / 3.0)];
 
-const HINT: &str = "Drag to move, corners to scale, right-click for layouts";
+const HINT: &str = "Drag to move, corners to scale, Alt-drag to pan inside a shape, right-click for layouts";
 /// Handles in automation-id order, with their position on the box (0, ½, 1 of width and height).
 const HANDLES: [(&str, f32, f32); 8] =
     [("nw", 0.0, 0.0), ("n", 0.5, 0.0), ("ne", 1.0, 0.0), ("e", 1.0, 0.5), ("se", 1.0, 1.0), ("s", 0.5, 1.0), ("sw", 0.0, 1.0), ("w", 0.0, 0.5)];
@@ -81,6 +86,8 @@ pub struct Info {
     pub shape: String,
     /// The visible box in frame pixels `[x, y, w, h]`.
     pub bx: [f64; 4],
+    /// The shape's pan inside the source (source pixels).
+    pub pan: [f64; 2],
 }
 
 impl Info {
@@ -95,6 +102,11 @@ impl Info {
             margin: c.get("margin").and_then(Value::as_f64),
             shape: c.get("shape").and_then(Value::as_str).unwrap_or("custom").to_string(),
             bx: [n(0)?, n(1)?, n(2)?, n(3)?],
+            pan: {
+                let p = c.get("pan").and_then(Value::as_array);
+                let k = |i: usize| p.and_then(|p| p.get(i)).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0);
+                [k(0), k(1)]
+            },
         })
     }
 }
@@ -165,6 +177,10 @@ pub fn enabled(app: &FilmcraftApp, id: &str) -> bool {
     }
     match id {
         "layout.menu.swap" => app.session.is_enabled("layout.swap"),
+        // a pan needs a circle or square to move inside the source
+        id if id.starts_with("layout.menu.pan.") => {
+            app.session.is_enabled("layout.pan") && info(app).is_some_and(|i| i.shape == "circle" || i.shape == "square")
+        }
         _ => app.session.is_enabled("layout.place"),
     }
 }
@@ -280,6 +296,24 @@ fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, Stri
         }
         return exec(app, "layout.shape", with_clips(json!({"shape": s})));
     }
+    if let Some(which) = rest.strip_prefix("pan.") {
+        let Some(&(_, _, frac)) = PANS.iter().find(|x| x.0 == which) else { return Err(format!("unknown pan `{which}`")) };
+        let clips: Vec<ClipId> = match params.get("clips").and_then(Value::as_array) {
+            Some(a) => a.iter().filter_map(Value::as_u64).map(ClipId).collect(),
+            None => target(app).into_iter().collect(),
+        };
+        if clips.is_empty() {
+            return Err("select a video clip with a circle or square shape".into());
+        }
+        let mut last = Value::Null;
+        for c in clips {
+            // the shape centred on that fraction of the source width: pan = (frac − ½) × width
+            let w = app.session.active_sequence().and_then(|q| q.find_item(c)).and_then(|(_, it)| app.session.project.source_size(it.item)).map_or(0, |s| s.0);
+            let dx = (frac - 0.5) * f64::from(w);
+            last = exec(app, "layout.pan", json!({"clips": [c.0], "dx": dx}))?;
+        }
+        return Ok(last);
+    }
     Err(format!("unknown layout command `layout.menu.{rest}`"))
 }
 
@@ -303,7 +337,7 @@ fn menu_entry(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: &str, label: &str, 
     }
 }
 
-/// The Layout entries (Place ▸, Size ▸, Shape ▸, Swap With Clip Below, Redact Area ▸), shared by
+/// The Layout entries (Place ▸, Size ▸, Shape ▸, Pan ▸, Swap With Clip Below, Redact Area ▸), shared by
 /// the monitor right-click menu and the timeline clip menu.
 pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     refresh(app);
@@ -329,6 +363,12 @@ pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
         }
     });
     app.auto.add("layout.menu.shape", r.response.rect, "Shape");
+    let r = ui.menu_button("Pan", |ui| {
+        for (p, label, _) in PANS {
+            menu_entry(app, ui, &format!("layout.menu.pan.{p}"), label, &mut run);
+        }
+    });
+    app.auto.add("layout.menu.pan", r.response.rect, "Pan");
     ui.separator();
     menu_entry(app, ui, "layout.menu.swap", "Swap With Clip Below", &mut run);
     let r = ui.menu_button("Redact Area", |ui| {
@@ -457,6 +497,8 @@ struct Drag {
     scale_width: f64,
     uniform: bool,
     begun: bool,
+    /// An Alt-drag inside the box: pan the picture inside the shape, starting from this pan.
+    pan: Option<[f64; 2]>,
 }
 
 fn in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
@@ -490,6 +532,19 @@ fn motion_of(app: &FilmcraftApp, clip: ClipId, frame: (u32, u32)) -> Option<([f6
     let sc = m.f64_at("scale", mt);
     let sw = if m.param("scale_width").is_some() { m.f64_at("scale_width", mt) } else { sc };
     Some((pos, sc, sw, uniform))
+}
+
+/// The pan an Alt-drag gives: the pointer moved the picture by `moved` screen points (`k` screen
+/// points per frame pixel), so the pan moves the opposite way in source pixels, through the
+/// clip's rotation, scale and Scale to Frame.
+fn pan_target(app: &FilmcraftApp, clip: ClipId, frame: (u32, u32), pan0: [f64; 2], moved: egui::Vec2, k: (f32, f32)) -> Option<[f64; 2]> {
+    let q = app.session.active_sequence()?;
+    let (_, it) = q.find_item(clip)?;
+    let src = app.session.project.source_size(it.item)?;
+    let pose = filmcraft_engine::layout::pose_of(it, media_time(it, app.session.playhead()), true);
+    let d = (f64::from(moved.x) / f64::from(k.0.max(1e-6)), f64::from(moved.y) / f64::from(k.1.max(1e-6)));
+    let (sx, sy) = filmcraft_edit::layout::source_delta(frame, src, &pose, d);
+    Some([pan0[0] - sx, pan0[1] - sy])
 }
 
 /// Where the drag puts the clip: (position, scale, scale width) for the pointer at `cur`.
@@ -543,6 +598,19 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
         .filter(|i| app.session.active_sequence().and_then(|q| q.find_item(i.clip)).is_some_and(|(_, it)| it.enabled && it.start <= ph && ph < it.end()));
     let drag_id = egui::Id::new("layout-drag");
     let mut drag: Option<Drag> = ui.data(|d| d.get_temp(drag_id));
+    // whether Alt/Option was held when the button went down (a drag starts a few frames later;
+    // the press event carries the modifiers even when the key state is not reported separately)
+    let press_alt_id = egui::Id::new("layout-press-alt");
+    let pressed_alt = ui.input(|inp| {
+        inp.events.iter().find_map(|e| match e {
+            egui::Event::PointerButton { pressed: true, button: egui::PointerButton::Primary, modifiers, .. } => Some(modifiers.alt),
+            _ => None,
+        })
+    });
+    if let Some(a) = pressed_alt {
+        ui.data_mut(|d| d.insert_temp(press_alt_id, a));
+    }
+    let press_alt = ui.data(|d| d.get_temp::<bool>(press_alt_id)).unwrap_or(false);
     let mut actions: Vec<(String, Value)> = Vec::new();
     let mut box_resp: Option<egui::Response> = None;
     let painter = ui.painter().with_clip_rect(pic.expand(8.0));
@@ -586,7 +654,14 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
             && let Some((position, scale, scale_width, uniform)) = motion_of(app, i.clip, frame)
         {
             let start = ui.input(|inp| inp.pointer.press_origin()).or(sr.interact_pointer_pos()).unwrap_or(r.center());
-            drag = Some(Drag { clip: i.clip, handle: *handle, start, screen: r, bx: i.bx, position, scale, scale_width, uniform, begun: false });
+            // Alt/Option-drag inside the box pans the picture inside a circle or square
+            let alt = handle.is_none() && (press_alt || ui.input(|inp| inp.modifiers.alt));
+            let pan = if alt && (i.shape == "circle" || i.shape == "square") { Some(i.pan) } else { None };
+            if alt && pan.is_none() {
+                app.ui.status = "Alt-drag pans inside a circle or square: give the clip a shape first (Layout ▸ Shape)".into();
+            } else {
+                drag = Some(Drag { clip: i.clip, handle: *handle, start, screen: r, bx: i.bx, position, scale, scale_width, uniform, begun: false, pan });
+            }
         }
         let dragging = starts.iter().any(|(_, sr)| sr.dragged());
         let stopped = starts.iter().any(|(_, sr)| sr.drag_stopped());
@@ -596,11 +671,20 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
         {
             let free = ui.input(|inp| inp.modifiers.command);
             let (off, lines) = match d.handle {
-                None if !free => crate::panels::monitor_view::snap_move(app, pic, frame, d.screen, cur - d.start),
+                None if !free && d.pan.is_none() => crate::panels::monitor_view::snap_move(app, pic, frame, d.screen, cur - d.start),
                 _ => (cur - d.start, Vec::new()),
             };
             crate::panels::monitor_view::draw_snap_lines(&painter, pic, &lines);
-            if (cur - d.start).length() > 0.5 {
+            if let Some(pan0) = d.pan {
+                if (cur - d.start).length() > 0.5
+                    && let Some([dx, dy]) = pan_target(app, d.clip, frame, pan0, cur - d.start, k)
+                {
+                    let begin = !d.begun;
+                    d.begun = true;
+                    // one merged undo step for the whole drag (`layout.pan`)
+                    actions.push(("layout.pan".into(), json!({"clips": [d.clip.0], "dx": dx, "dy": dy, "merge": true, "begin": begin})));
+                }
+            } else if (cur - d.start).length() > 0.5 {
                 let (p, s, sw) = drag_target(d, cur, k, off);
                 let begin = !d.begun;
                 d.begun = true;
@@ -624,10 +708,10 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
         }
     }
     let released = ui.input(|i| !i.pointer.any_down());
-    if drag.is_some() {
+    if let Some(d) = &drag {
         refresh(app);
         if let Some(i) = info(app) {
-            app.ui.status = format!("Layout: {}", place_label(&i.at));
+            app.ui.status = if d.pan.is_some() { format!("Pan: {:.0}, {:.0} px", i.pan[0], i.pan[1]) } else { format!("Layout: {}", place_label(&i.at)) };
         }
     }
     ui.data_mut(|d| match drag {
@@ -700,6 +784,7 @@ mod tests {
             scale_width: 50.0,
             uniform: true,
             begun: false,
+            pan: None,
         }
     }
 
@@ -730,7 +815,7 @@ mod tests {
 
     #[test]
     fn place_keeps_size_and_margin_of_a_placed_clip_only() {
-        let mut i = Info { clip: ClipId(1), at: "bottomRight".into(), size: 33.0, margin: Some(5.0), shape: "free".into(), bx: [0.0; 4] };
+        let mut i = Info { clip: ClipId(1), at: "bottomRight".into(), size: 33.0, margin: Some(5.0), shape: "free".into(), bx: [0.0; 4], pan: [0.0; 2] };
         assert_eq!(place_params(Some(&i), "topLeft"), json!({"at": "topLeft", "size": 33.0, "margin": 5.0}));
         assert_eq!(place_params(Some(&i), "full"), json!({"at": "full"}));
         i.at = "full".into();

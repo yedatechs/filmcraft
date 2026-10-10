@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use crate::Session;
 use crate::layout::LAYOUT_MASK;
 use filmcraft_project::{ClipId, ItemKind, ParamValue};
+use filmcraft_time::Tick;
 
 const FW: f64 = 1920.0;
 const FH: f64 = 1080.0;
@@ -165,6 +166,18 @@ fn circle_then_place_stays_round_and_placed() {
     assert!((r["size"].as_f64().unwrap() - 20.0).abs() < 0.5, "free keeps the width: {r}");
 }
 
+/// Which video track (0 = V1) holds the clip.
+fn track_of(s: &Session, c: ClipId) -> usize {
+    let q = s.active_sequence().unwrap();
+    q.video_tracks.iter().position(|t| t.items.iter().any(|i| i.id == c)).unwrap()
+}
+
+/// (start, end) in seconds of every item on a video track.
+fn spans(s: &Session, track: usize) -> Vec<(f64, f64, filmcraft_project::ItemId)> {
+    let q = s.active_sequence().unwrap();
+    q.video_tracks[track].items.iter().map(|i| (i.start.seconds(), i.end().seconds(), i.item)).collect()
+}
+
 #[test]
 fn swap_twice_restores_both_clips() {
     let (mut s, v1, v2) = session();
@@ -172,16 +185,27 @@ fn swap_twice_restores_both_clips() {
     s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
     let (m1, m2) = (motion(&s, v1), motion(&s, v2));
     let (k1, k2) = (layout_masks(&s, v1), layout_masks(&s, v2));
+    let audio_before = serde_json::to_value(&s.active_sequence().unwrap().audio_tracks).unwrap();
     let r = s.execute("layout.swap", json!({})).unwrap();
-    assert_eq!(r["clips"], json!([v2.0, v1.0]), "top-most first");
+    // the overlay (top-most first) starts with the overlap and keeps its id; the V1 shot is cut
+    // at 6 s and its piece inside the overlap is a new clip
+    let (pa, pb) = (ClipId(r["clips"][0].as_u64().unwrap()), ClipId(r["clips"][1].as_u64().unwrap()));
+    assert_eq!(pa, v2, "{r}");
+    assert_ne!(pb, v1, "{r}");
+    assert_eq!(r["moved"], json!([[1, 0], [0, 1]]), "{r}");
     assert_eq!(s.history.undo.last().unwrap().0, "Swap Layouts");
-    // the V1 clip is now the bottom-right circle, the overlay fills the frame
-    let a = inspect(&mut s, v1);
-    assert_eq!((a["at"].clone(), a["shape"].clone()), (json!("bottomRight"), json!("circle")), "{a}");
+    // the V1 piece is now the bottom-right circle on V2, the overlay fills the frame on V1
+    let a = inspect(&mut s, pb);
+    assert_eq!((a["at"].clone(), a["shape"].clone(), a["track"].clone()), (json!("bottomRight"), json!("circle"), json!(1)), "{a}");
     let b = inspect(&mut s, v2);
-    assert_eq!((b["at"].clone(), b["shape"].clone()), (json!("full"), json!("free")), "{b}");
-    s.execute("layout.swap", json!({"clips": [v1.0, v2.0]})).unwrap();
-    for (c, (pos, scale), masks) in [(v1, m1, k1), (v2, m2, k2)] {
+    assert_eq!((b["at"].clone(), b["shape"].clone(), b["track"].clone()), (json!("full"), json!("free"), json!(0)), "{b}");
+    // the audio is untouched
+    assert_eq!(serde_json::to_value(&s.active_sequence().unwrap().audio_tracks).unwrap(), audio_before);
+    // swapping again (at the playhead) restores the layouts and the tracks
+    let r2 = s.execute("layout.swap", json!({})).unwrap();
+    assert_eq!(r2["clips"], json!([pb.0, v2.0]), "{r2}");
+    assert_eq!((track_of(&s, pb), track_of(&s, v2)), (0, 1));
+    for (c, (pos, scale), masks) in [(pb, m1, k1), (v2, m2, k2)] {
         let (p, sc) = motion(&s, c);
         let (a, b) = (vec2(&p), vec2(&pos));
         assert!((a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6, "{c:?} position {a:?} vs {b:?}");
@@ -194,6 +218,134 @@ fn swap_twice_restores_both_clips() {
             assert!(px.components().iter().zip(py.components()).all(|(a, b)| (a - b).abs() < 1e-6));
         }
     }
+    // explicit clips work the same way
+    s.execute("layout.swap", json!({"clips": [pb.0, v2.0]})).unwrap();
+    assert_eq!((track_of(&s, pb), track_of(&s, v2)), (1, 0));
+}
+
+#[test]
+fn swap_exchanges_tracks_over_the_overlap() {
+    let (mut s, v1, v2) = session();
+    s.execute("layout.place", json!({"clips": [v2.0], "at": "bottomRight"})).unwrap();
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
+    let before = s.project.clone();
+    let (shot, overlay) = {
+        let q = s.active_sequence().unwrap();
+        (q.find_item(v1).unwrap().1.clone(), q.find_item(v2).unwrap().1.clone())
+    };
+    let r = s.execute("layout.swap", json!({})).unwrap();
+    let (rs, re) = (Tick(r["range"][0].as_i64().unwrap()).seconds(), Tick(r["range"][1].as_i64().unwrap()).seconds());
+    assert!((rs - overlay.start.seconds()).abs() < 1e-9 && (re - shot.end().seconds()).abs() < 1e-9, "{r}");
+    let pb = ClipId(r["clips"][1].as_u64().unwrap());
+    // V1: the shot up to the overlap (keeps its id and its full-frame layout), then the overlay
+    // piece, then the next shot; V2: the shot's piece, then the rest of the overlay
+    let v1_spans = spans(&s, 0);
+    let k = v1_spans.iter().position(|x| x.2 == shot.item).unwrap();
+    assert_eq!(v1_spans[k], (shot.start.seconds(), rs, shot.item));
+    assert_eq!(v1_spans[k + 1], (rs, re, overlay.item));
+    assert_eq!(spans(&s, 1), vec![(rs, re, shot.item), (re, overlay.end().seconds(), overlay.item)]);
+    assert_eq!(inspect(&mut s, v1)["at"], json!("full"), "the piece before the overlap is not changed");
+    assert_eq!(track_of(&s, v1), 0);
+    // the pieces keep their media: same source in at the same time
+    let q = s.active_sequence().unwrap();
+    let (_, piece) = q.find_item(pb).unwrap();
+    assert_eq!(piece.source_time_at(piece.start), shot.source_time_at(piece.start));
+    // the rest of the overlay (on V2, after the shot ended) keeps its circle bottom right
+    let rest = q.video_tracks[1].items[1].id;
+    let i = inspect(&mut s, rest);
+    assert_eq!((i["at"].clone(), i["shape"].clone()), (json!("bottomRight"), json!("circle")), "{i}");
+    // one undo restores everything
+    assert_eq!(s.undo().as_deref(), Some("Swap Layouts"));
+    assert_eq!(serde_json::to_value(&*s.project).unwrap(), serde_json::to_value(&*before).unwrap());
+}
+
+#[test]
+fn swap_refuses_clips_on_one_track_or_apart_in_time() {
+    let (mut s, v1, v2) = session();
+    let q = s.active_sequence().unwrap();
+    let first = q.video_tracks[0].items[0].id;
+    let e = s.execute("layout.swap", json!({"clips": [v1.0, first.0]})).unwrap_err();
+    assert!(e.to_string().contains("same track"), "{e}");
+    let e = s.execute("layout.swap", json!({"clips": [first.0, v2.0]})).unwrap_err();
+    assert!(e.to_string().contains("overlap"), "{e}");
+    // a locked track
+    s.execute("timeline.setTrack", json!({"track": "V1", "locked": true})).unwrap();
+    assert!(s.execute("layout.swap", json!({})).unwrap_err().to_string().contains("locked"));
+}
+
+/// The overlay becomes a "camera": its own media item (Bars and Tone) with linked audio on A3 (A2 holds the music) and a
+/// transcript, like a face camera over a screen recording.
+fn camera_session() -> (Session, ClipId, ClipId, filmcraft_project::ItemId) {
+    let (mut s, v1, v2) = session();
+    let cam = *s.project.items.iter().find(|(_, i)| i.name == "Bars and Tone").unwrap().0;
+    let seq = s.state.active_sequence.unwrap();
+    s.edit("test: camera", |p, _| {
+        let q = p.sequence(seq).unwrap();
+        let rate = q.settings.frame_rate;
+        let ov = q.find_item(v2).unwrap().1.clone();
+        let mut a =
+            p.make_track_item(cam, filmcraft_project::TrackKind::Audio, ov.start, filmcraft_time::TimeRange::new(Tick::ZERO, ov.duration), rate).unwrap();
+        let link = p.alloc_id();
+        a.link = Some(link);
+        let q = p.sequence_mut(seq).unwrap();
+        let (_, v) = q.find_item_mut(v2).unwrap();
+        v.item = cam;
+        v.source_in = Tick::ZERO;
+        v.link = Some(link);
+        q.audio_tracks[2].items.push(a);
+        Ok(())
+    })
+    .unwrap();
+    let sec = |x: f64| Tick((x * filmcraft_time::TICKS_PER_SECOND as f64).round() as i64);
+    // six words 0.2 s long every 0.25 s from media 1.0 s (timeline 7.0–8.45 s)
+    let words: Vec<filmcraft_project::Word> = ["one", "two", "three", "four", "five", "six"]
+        .iter()
+        .enumerate()
+        .map(|(i, w)| filmcraft_project::Word::new(*w, sec(1.0 + i as f64 * 0.25), sec(1.0 + i as f64 * 0.25 + 0.2)))
+        .collect();
+    let t = filmcraft_project::Transcript { language: "en".into(), words, ..Default::default() };
+    s.execute("transcript.set", json!({"item": cam.0, "transcript": serde_json::to_value(&t).unwrap()})).unwrap();
+    (s, v1, v2, cam)
+}
+
+fn live_text(s: &mut Session) -> String {
+    let r = s.execute("transcript.inspect", json!({})).unwrap();
+    r["words"].as_array().unwrap().iter().map(|w| w["text"].as_str().unwrap().to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// What a video track shows at `t`: (media item, media time).
+fn shown(s: &Session, track: usize, t: Tick) -> Option<(filmcraft_project::ItemId, i64)> {
+    let q = s.active_sequence().unwrap();
+    q.video_tracks[track].item_at(t).map(|i| (i.item, i.source_time_at(t).0))
+}
+
+#[test]
+fn extract_after_swap_cuts_both_tracks_alike() {
+    let (mut s, _v1, v2, cam) = camera_session();
+    s.execute("layout.place", json!({"clips": [v2.0], "at": "bottomRight"})).unwrap();
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
+    assert_eq!(live_text(&mut s), "one two three four five six");
+    let r = s.execute("layout.swap", json!({})).unwrap();
+    assert_eq!(track_of(&s, v2), 0, "the camera piece is on V1 now: {r}");
+    assert_eq!(live_text(&mut s), "one two three four five six", "the audio carries the words, untouched by the swap");
+    let fd = s.sequence_rate().frame_duration();
+    let samples: Vec<Tick> = (0..200).map(|k| Tick(6 * filmcraft_time::TICKS_PER_SECOND) + Tick(fd.0 * k / 4)).collect();
+    let before: Vec<_> = samples.iter().map(|t| (shown(&s, 0, *t), shown(&s, 1, *t))).collect();
+    // extract "three four" (inside the swapped span)
+    let cut = s.execute("transcript.extract", json!({"from": 2, "to": 3})).unwrap();
+    let (cs, ce) = (Tick(cut["start"].as_i64().unwrap()), Tick(cut["end"].as_i64().unwrap()));
+    assert!(cs.seconds() > 7.0 && ce.seconds() < 9.5, "{cut}");
+    assert_eq!(live_text(&mut s), "one two five six");
+    // both video tracks lost the same range: after the cut each shows what it showed `len` later
+    let len = ce - cs;
+    for (k, t) in samples.iter().enumerate() {
+        let src = if *t < cs { *t } else { *t + len };
+        let Some(j) = samples.iter().position(|x| *x == src) else { continue };
+        assert_eq!((shown(&s, 0, *t), shown(&s, 1, *t)), before[j], "at sample {k} ({:.3} s)", t.seconds());
+    }
+    // the camera is still on V1 around the cut, the screen on V2
+    assert_eq!(shown(&s, 0, cs).map(|x| x.0), Some(cam));
+    assert_ne!(shown(&s, 1, cs).map(|x| x.0), Some(cam));
 }
 
 #[test]
@@ -324,4 +476,62 @@ fn set_moves_and_scales_as_one_merged_step() {
     assert!(s.execute("layout.set", json!({"clips": [a.0], "position": ["x", 2.0]})).is_err());
     s.execute("layout.set", json!({"clips": [a.0], "scale": 1e300})).unwrap();
     assert!(float(&motion(&s, a).1) <= filmcraft_edit::layout::MAX_SCALE);
+}
+
+#[test]
+fn pan_moves_the_picture_not_the_box() {
+    let (mut s, v1, v2) = session();
+    // only a circle or square can pan
+    assert!(s.execute("layout.pan", json!({"clips": [v2.0], "dx": -100})).unwrap_err().to_string().contains("circle or square"));
+    s.execute("layout.place", json!({"clips": [v2.0], "at": "bottomRight", "size": 33})).unwrap();
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
+    let r0 = inspect(&mut s, v2);
+    assert_eq!(r0["pan"], json!([0.0, 0.0]));
+    let b0 = bx(&r0);
+    let (p0, _) = motion(&s, v2);
+    let before = s.history.undo.len();
+    // a drag: merged calls, one undo step
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": -100, "dy": 0, "merge": true, "begin": true})).unwrap();
+    let r = s.execute("layout.pan", json!({"clips": [v2.0], "dx": -320, "merge": true})).unwrap();
+    assert_eq!(r["pan"], json!([[-320.0, 0.0]]), "{r}");
+    assert_eq!(s.history.undo.len(), before + 1);
+    assert_eq!(s.history.undo.last().unwrap().0, "Pan Clip");
+    let r1 = inspect(&mut s, v2);
+    assert_eq!((r1["pan"].clone(), r1["shape"].clone(), r1["at"].clone()), (json!([-320.0, 0.0]), json!("circle"), json!("bottomRight")), "{r1}");
+    let b1 = bx(&r1);
+    assert!(b0.iter().zip(b1).all(|(a, b)| (a - b).abs() < 1e-6), "{b0:?} {b1:?}");
+    // the picture moved right by the pan at the clip's scale
+    let (p1, sc) = motion(&s, v2);
+    assert!((vec2(&p1).0 - vec2(&p0).0 - 320.0 * float(&sc) / 100.0).abs() < 1e-6, "{p1:?} {p0:?}");
+    // clamped to the source (1920 × 1080: ±420 sideways, none vertically); NaN / junk → 0
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": -1e9, "dy": 1e9})).unwrap();
+    assert_eq!(inspect(&mut s, v2)["pan"], json!([-420.0, 0.0]));
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": "left"})).unwrap();
+    assert_eq!(inspect(&mut s, v2)["pan"], json!([0.0, 0.0]));
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": 200})).unwrap();
+    assert!(s.execute("layout.pan", json!({"clips": [v2.0]})).is_err(), "nothing to set");
+    // place, shape keep the pan; the box is still where the place puts it
+    s.execute("layout.place", json!({"clips": [v2.0], "at": "topLeft", "size": 25})).unwrap();
+    let r = inspect(&mut s, v2);
+    assert_eq!((r["pan"].clone(), r["at"].clone()), (json!([200.0, 0.0]), json!("topLeft")), "{r}");
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "square"})).unwrap();
+    let r = inspect(&mut s, v2);
+    assert_eq!((r["pan"].clone(), r["at"].clone(), r["shape"].clone()), (json!([200.0, 0.0]), json!("topLeft"), json!("square")), "{r}");
+    // rounded cannot pan: the pan goes back to 0
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "rounded"})).unwrap();
+    assert_eq!(inspect(&mut s, v2)["pan"], json!([0.0, 0.0]));
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": -300})).unwrap();
+    // swap carries the pan to the other clip
+    let r = s.execute("layout.swap", json!({})).unwrap();
+    let pb = ClipId(r["clips"][1].as_u64().unwrap());
+    let i = inspect(&mut s, pb);
+    assert_eq!((i["pan"].clone(), i["shape"].clone()), (json!([-300.0, 0.0]), json!("circle")), "{i}");
+    assert_eq!(inspect(&mut s, v2)["pan"], json!([0.0, 0.0]));
+    // undo goes back step by step
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(inspect(&mut s, v2)["pan"], json!([-300.0, 0.0]));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(inspect(&mut s, v2)["pan"], json!([0.0, 0.0]));
+    let _ = v1;
 }

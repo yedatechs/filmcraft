@@ -15,16 +15,17 @@ Controls shows exactly what changed and undo takes it back in one step.
 All commands take `clips: [id]?` (default: the selected video clips) and act at the playhead. A
 graphic clip, an audio clip or a clip that is not in the active sequence is an error. Numbers are
 clamped (`size` 1–100, `margin` 0–45, `radius` 0–50; a value that is not a number takes the
-default). The three edits are one undo step each and are journaled; `inspect` and `pick` change
+default). The edits are one undo step each and are journaled; `inspect` and `pick` change
 nothing. None of them has a menu path or shortcut of its own: the UI adds its Layout entries.
 
 | Command | Params (defaults) | Effect | Undo label |
 |---|---|---|---|
 | `layout.place` | `at`: `topLeft` `topRight` `bottomLeft` `bottomRight` `top` `bottom` `left` `right` `center` `full`; `size` = 25 (% of the frame width); `margin` = 3 (% of the frame width) | Sets Motion `position` and uniform `scale` (`uniform_scale` on) so the clip's visible box has width `size` and sits `margin` from the edges of its place. `full` fits the whole source in the frame, centred, whatever the shape. | Place Clip |
 | `layout.shape` | `shape`: `circle` `rounded` `square` `free`; `radius` = 12 (% of the shorter side, `rounded` only) | Replaces the `Layout shape` mask (`free` removes it; other masks stay), then re-places the clip: the box keeps its width and the edges its place touches (a bottom-right box stays bottom right with the same margin; a custom box keeps its centre; a full clip stays full). | Shape Clip |
-| `layout.swap` | `clips: [a, b]?` (default: the two top-most enabled, non-graphic video clips whose span covers the playhead) | The two clips exchange place and shape: each gets the other's box (re-fitted to its own source the way `layout.shape` re-places) and layout mask. Swapping twice restores both. | Swap Layouts |
-| `layout.set` | `clips?`, `position: [x, y]?`, `scale?`, `scaleWidth?`, `merge?`, `begin?` | Motion position / scale of the clips at the playhead (keyframes when animated). `merge` folds consecutive calls into one undo step and `begin` starts a new one: the Program monitor's move and scale drags use it, so a drag is one undo step even though it changes several parameters. |
-| `layout.inspect` | `clips?`, `time?` | `{clips: [{clip, at, size, margin, shape, radius, box: [x, y, w, h], track}]}`: `at` is the place the box is at (within 1 % of the frame width) or `"custom"`, `margin` the margin it implies (`null` for `center`, `full`, `custom`), `shape` `"custom"` for a hand-edited layout mask, `radius` `null` unless rounded. | – |
+| `layout.swap` | `clips: [a, b]?` (default: the two top-most enabled, non-graphic video clips whose span covers the playhead) | The two clips exchange place, shape and pan (each gets the other's box, re-fitted to its own source the way `layout.shape` re-places, and layout mask; the pan is clamped to the new source) **and their tracks over the time they overlap**, so the clip that was on top is now underneath (otherwise a full-frame clip on V2 would still cover the circle on V1). A clip that extends beyond the overlap is first split at its bounds on its own track only, like a razor on that track (linked audio is not split; a right-hand piece gets a link group of its own). The pieces inside the overlap keep their start, duration and source in, get the other clip's layout and move to the other clip's track; the pieces outside keep their track and layout. A transition of a moving piece alone (a fade) goes with it, one shared with a clip that stays is removed; audio tracks are untouched. Refused when the clips are on the same track, do not overlap in time, or a track is locked. → `{clips: [a', b'], moved: [[fromTrack, toTrack], …], range: [start, end]}` (`a'`, `b'` the pieces inside the overlap, tracks counted from 0 = V1 like `inspect`'s `track`); a selected clip stays selected as its piece. Swapping twice restores both layouts and tracks; the edit points of the splits remain. | Swap Layouts |
+| `layout.pan` | `clips?`, `dx?`, `dy?` (source pixels), `merge?`, `begin?` | Sets the pan of the clips' circle or square: the shape moves by `(dx, dy)` inside the source (a missing component keeps its value, one that is not a finite number counts as 0), clamped so it stays inside the source (a 3840 × 2160 circle pans ±840 px sideways and not at all vertically). The visible box stays where it is: Motion `position` moves by the opposite of the pan, rotated and scaled like the picture, so the picture slides under the shape. Refused for a clip without a circle or square shape. `merge` / `begin` as in `layout.set` (the Alt-drag is one undo step). → `{clips, pan: [[dx, dy]…]}` | Pan Clip |
+| `layout.set` | `clips?`, `position: [x, y]?`, `scale?`, `scaleWidth?`, `merge?`, `begin?` | Motion position / scale of the clips at the playhead (keyframes when animated). `merge` folds consecutive calls into one undo step and `begin` starts a new one: the Program monitor's move and scale drags use it, so a drag is one undo step even though it changes several parameters. | Transform Clip |
+| `layout.inspect` | `clips?`, `time?` | `{clips: [{clip, at, size, margin, shape, radius, pan: [dx, dy], box: [x, y, w, h], track}]}`: `at` is the place the box is at (within 1 % of the frame width) or `"custom"`, `margin` the margin it implies (`null` for `center`, `full`, `custom`), `shape` `"custom"` for a hand-edited layout mask, `radius` `null` unless rounded, `pan` the shape's pan inside the source (`[0, 0]` for free, rounded and custom). | – |
 | `layout.pick` | `x`, `y` (frame pixels), `time?` | `{clips: [id…]}`: the enabled video clips (enabled tracks, graphics left out) whose span covers the time and whose visible box contains the point, top track first. | – |
 
 ### How a layout maps to Motion and the mask
@@ -39,11 +40,20 @@ nothing. None of them has a menu path or shortcut of its own: the UI adds its La
   corner vertices), `rounded` an eight-vertex Bézier rounded rectangle of the whole source. A new
   layout mask has no feather; one that exists keeps its feather, opacity, expansion and mode. The
   shape is read back from the mask path, so a mask edited by hand shows as `custom`.
+- The **pan** moves a circle or square inside the source (the face on the left third of a camera
+  frame): the mask path is the canonical shape translated by `(dx, dy)` source pixels, clamped so
+  the shape's bounds stay inside the source. It lives in the mask path (nothing new is saved) and
+  is read back from it: a path that is a translated circle or square within 0.5 px gives its shape
+  and pan, anything else is `custom`. The visible box is the box of the panned shape, so
+  `layout.place`, `layout.shape` (which keep the pan) and `layout.swap` (which carries it to the
+  other clip) put the box where they always do whatever the pan. Clips arranged by a scene are
+  never panned (a scene slot has no pan; `scenes.*` writes pan 0).
 - Placing writes `position`, `scale` and `uniform_scale` the way `effects.setParam` does: when a
   parameter is animated a keyframe is added or replaced at the playhead, otherwise its static value
   changes. Anchor, rotation and Scale to Frame are kept and taken into account. Motion is enabled.
 - The geometry is pure and unit-tested in `filmcraft_edit::layout` (`place`, `place_box`, `refit`,
-  `visible_box`, `shape_bounds`, `shape_path`, `shape_of_path`, `nearest_place`, `infer_place`).
+  `visible_box`, `shape_bounds`, `shape_path`, `shape_of_path`, `clamp_pan`, `pan_position`,
+  `source_delta`, `nearest_place`, `infer_place`).
 
 ### How the UI uses `inspect` and `pick`
 
@@ -62,7 +72,8 @@ above, so it is one undo step.
   top-most clip becomes the selection (`state.selection`, the timeline highlights it). A click
   within 4 px of the previous one selects the next clip of the same stack, wrapping around. A
   click where no clip is leaves the selection alone. The first selection made this way in a
-  session shows "Drag to move, corners to scale, right-click for layouts" in the status bar.
+  session shows "Drag to move, corners to scale, Alt-drag to pan inside a shape, right-click for
+  layouts" in the status bar.
 - **Box and handles.** The selected clip, when it is an enabled, non-graphic video clip whose
   span covers the playhead, shows its visible box (`layout.inspect` → `box`) in the accent colour
   with 8 square handles. Dragging inside the box moves the clip (Motion `position`), snapping its
@@ -70,13 +81,19 @@ above, so it is one undo step.
   on (hold ⌘/Ctrl to move freely). A corner handle scales uniformly about the opposite corner, an
   edge handle about the middle of the opposite edge (Motion `scale`, and `position` so the fixed
   point stays; `scale_width` too when Uniform Scale is off). The status bar names the place the
-  box is at (`layout.inspect` → `at`) while dragging. A whole drag is one undo step. The overlay
+  box is at (`layout.inspect` → `at`) while dragging. **Alt/Option-drag inside the box pans the
+  picture** inside a circle or square: the box stays put and the picture slides under it with the
+  pointer (`layout.pan` with `merge`; the status bar shows "Pan: dx, dy px"; a clip without a
+  circle or square says so in the status bar). Clips arranged by a scene refuse moves, scales and
+  pans alike. A whole drag is one undo step. The overlay
   is hidden while playing, while a mask is selected for editing and while the pen draws a mask.
 - **Layout menu.** Right-click the box, open the timeline clip menu's **Layout** submenu, or use
   **Clip ▸ Layout**. All three show the same entries: Place ▸ (Top Left … Bottom Right, Full),
-  Size ▸ (20 / 25 / 33 / 50 %), Shape ▸ (Circle, Rounded, Square, Free), Swap With Clip Below,
-  Redact Area ▸ (Static Mosaic…, Static Blur…, Static Fill…, Tracked Mosaic…, Tracked Blur…,
-  Tracked Fill…). The current place, size and shape of the selected clip are checked. Place keeps
+  Size ▸ (20 / 25 / 33 / 50 %), Shape ▸ (Circle, Rounded, Square, Free), Pan ▸ (Centre on Left
+  Third, Centre, Centre on Right Third), Swap With Clip Below, Redact Area ▸ (Static Mosaic…,
+  Static Blur…, Static Fill…, Tracked Mosaic…, Tracked Blur…, Tracked Fill…). The current place,
+  size and shape of the selected clip are checked. Pan ▸ centres the shape on x = ⅓, ½ or ⅔ of
+  the source width, keeping the vertical pan (`layout.pan {dx}`; enabled for a circle or square). Place keeps
   the size and margin of a clip that is already in a place (a full-frame clip gets 25 % and 3 %).
   Size keeps the clip's place (a full-frame clip goes to the centre; a box at no place grows or
   shrinks about its centre through `effects.setParam scale`). Swap With Clip Below swaps the
@@ -99,8 +116,8 @@ above, so it is one undo step.
 | `program.picture` | the Program picture (click to select) |
 | `program.layout.box` | the selected clip's box (drag to move, right-click for the menu) |
 | `program.layout.handle.{nw\|n\|ne\|e\|se\|s\|sw\|w}` | scale handles |
-| `layout.menu.place`, `layout.menu.size`, `layout.menu.shape`, `layout.menu.redact` | the submenus (right-click menu and timeline clip menu) |
-| `layout.menu.place.{at}`, `layout.menu.size.{20\|25\|33\|50}`, `layout.menu.shape.{circle\|rounded\|square\|free}`, `layout.menu.swap`, `layout.menu.redact.{static\|tracked}.{mosaic\|blur\|fill}` | menu entries; also the UI command ids of Clip ▸ Layout (`layout.menu.redact` as a command: an alias of `layout.menu.redact.static.mosaic`) |
+| `layout.menu.place`, `layout.menu.size`, `layout.menu.shape`, `layout.menu.pan`, `layout.menu.redact` | the submenus (right-click menu and timeline clip menu) |
+| `layout.menu.place.{at}`, `layout.menu.size.{20\|25\|33\|50}`, `layout.menu.shape.{circle\|rounded\|square\|free}`, `layout.menu.pan.{left\|center\|right}`, `layout.menu.swap`, `layout.menu.redact.{static\|tracked}.{mosaic\|blur\|fill}` | menu entries; also the UI command ids of Clip ▸ Layout (`layout.menu.redact` as a command: an alias of `layout.menu.redact.static.mosaic`) |
 | `timeline.clipMenu.layout` | the Layout submenu of the timeline clip menu |
 | `effectControls.layout.place.{at}`, `effectControls.layout.shape.{s}` | the Effect Controls row (nine places, no Full) |
 | `properties.layout.place.{at}`, `properties.layout.shape.{s}` | the same row in the Properties panel |
