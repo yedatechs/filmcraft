@@ -1287,7 +1287,14 @@ impl FilmcraftApp {
                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             }
         }
-        let hint = if !self.ui.status.is_empty() { self.ui.status.clone() } else { self.hint_text() };
+        // while recording (Window ▸ Record) the status bar shows the elapsed time and frame counts
+        let hint = if let Some(rec) = panels::record::status_line(self) {
+            rec
+        } else if !self.ui.status.is_empty() {
+            self.ui.status.clone()
+        } else {
+            self.hint_text()
+        };
         ui.painter().text(egui::pos2(sb.min.x + 10.0, sb.center().y), egui::Align2::LEFT_CENTER, hint, Tokens::ui(11.0), t.text_dim);
         let resp = ui.interact(sb, egui::Id::new("status-bar"), egui::Sense::click());
         if resp.clicked() {

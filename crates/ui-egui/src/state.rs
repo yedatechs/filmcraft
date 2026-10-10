@@ -423,6 +423,9 @@ pub struct UiState {
     /// Text panel ▸ Transcript: the Remove Pauses dialog is open.
     #[serde(default)]
     pub transcript_pause_dialog: bool,
+    /// Window ▸ Record: the Record panel (sources, name, offset, last result).
+    #[serde(default)]
+    pub record: crate::panels::record::RecordUi,
     /// Text panel ▸ Transcript: the Scenes… dialog is open (`panels::scenes`).
     #[serde(default)]
     pub transcript_scenes_dialog: bool,
@@ -865,6 +868,7 @@ impl Default for UiState {
             transcript_pause_min: pause_min(),
             transcript_pause_keep: pause_keep(),
             transcript_pause_dialog: false,
+            record: Default::default(),
             transcript_scenes_dialog: false,
             transcript_scenes_sel: 0,
             transcript_takes_redo_only: false,

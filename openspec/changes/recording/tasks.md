@@ -18,9 +18,9 @@
 
 ## 4. UI
 
-- [ ] 4.1 Record panel (`panels/record.rs`), Window ▸ Record, `UiState::record`, status-bar line
-- [ ] 4.2 `tests/record_ui.rs` with synthetic inputs (record, stop → sequence; cancel → no files)
-- [ ] 4.3 `docs/recording.md`, linked from the docs
+- [x] 4.1 Record panel (`panels/record.rs`), Window ▸ Record, `UiState::record`, status-bar line
+- [x] 4.2 `tests/record_ui.rs` with synthetic inputs (record, stop → sequence; cancel → no files)
+- [x] 4.3 `docs/recording.md`, linked from the docs
 
 ## 5. Acceptance
 

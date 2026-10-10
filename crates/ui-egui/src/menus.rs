@@ -101,6 +101,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("window.workspace.saveChanges", "Save Changes to this Workspace", ["Window", "Workspaces"], None),
     uic!("window.workspace.saveAs", "Save as New Workspace…", ["Window", "Workspaces"], None),
     uic!("window.workspace.edit", "Edit Workspaces…", ["Window", "Workspaces"], None),
+    uic!("window.record", "Record", ["Window"], None),
     uic!("tool.selection", "Selection Tool", [], Some("V")),
     uic!("tool.trackSelectForward", "Track Select Forward Tool", [], Some("A")),
     uic!("tool.trackSelectBackward", "Track Select Backward Tool", [], Some("Shift+A")),
@@ -255,6 +256,9 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: Val
         return r;
     }
     if let Some(r) = crate::panels::voiceover::route(app, ctx, id, &params) {
+        return r;
+    }
+    if let Some(r) = crate::panels::record::route(app, id) {
         return r;
     }
     if let Some(r) = crate::panels::clip_dialogs::route(app, id, &params) {

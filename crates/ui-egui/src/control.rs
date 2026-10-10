@@ -227,6 +227,23 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                     return err(format!("`{k}`: {e}"));
                 }
             }
+            // Window ▸ Record panel (`panels::record::RecordUi`), merged; opening it lists the devices
+            if let Some(patch) = p.get("record").filter(|v| v.is_object()) {
+                let was_open = app.ui.record.open;
+                let devices = app.ui.record.devices.take();
+                let mut cur = serde_json::to_value(&app.ui.record).unwrap_or_default();
+                merge(&mut cur, patch);
+                match serde_json::from_value::<crate::panels::record::RecordUi>(cur) {
+                    Ok(v) => app.ui.record = crate::panels::record::RecordUi { devices, ..v },
+                    Err(e) => {
+                        app.ui.record.devices = devices;
+                        return err(format!("`record`: {e}"));
+                    }
+                }
+                if app.ui.record.open && !was_open {
+                    crate::panels::record::open(app);
+                }
+            }
             // Essential Graphics ▸ Browse and the template / font dialogs (`panels::graphics_templates`), merged
             if let Some(patch) = p.get("gfxTemplates") {
                 let mut cur = serde_json::to_value(&app.ui.gfx_templates).unwrap_or_default();
