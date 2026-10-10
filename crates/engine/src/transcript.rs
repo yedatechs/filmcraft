@@ -269,6 +269,9 @@ fn generate(s: &mut Session, p: &Value) -> Result<Value> {
     if running(s).is_some() {
         return Err(EngineError::Other("a transcription is already running (cancel it in the status bar, or wait)".into()));
     }
+    // a background run that finished since the last tick is stored before another starts, so a
+    // second Transcribe never loses the first one's words
+    poll(s);
     let t = transcriber(s, p)?;
     // Settings ▸ Media Analysis & Transcription: language (or auto-detect) and speaker labelling
     let ma = &s.prefs.media_analysis;

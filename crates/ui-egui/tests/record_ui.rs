@@ -415,7 +415,7 @@ fn a_camera_row_shows_a_live_preview_and_pops_out() {
     assert!(l.contains("320×180"), "{l}");
     // recording keeps the preview (and the window) going, through the same capture
     d.click("record.panel.record");
-    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
     let l = d.element("record.preview.1").unwrap()["label"].as_str().unwrap().to_string();
     let n = frame_no(&l);
     d.run_for(0.8);
@@ -464,7 +464,7 @@ fn the_border_frames_the_screen_follows_the_recording_and_an_area_can_be_drawn()
     assert_eq!(e["label"], "idle display:synthetic:display 0,0 1280×720");
     // recording turns it red
     d.click("record.panel.record");
-    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
     d.frames(2);
     assert_eq!(overlay(&mut d)["state"], "recording");
     assert!(d.element("record.overlay").unwrap()["label"].as_str().unwrap().starts_with("recording "));
@@ -498,7 +498,7 @@ fn the_border_frames_the_screen_follows_the_recording_and_an_area_can_be_drawn()
     assert!(d.element("record.panel.screen.area.edit").is_some());
     // record.start receives the area: the file is 640 × 360
     d.click("record.panel.record");
-    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
     d.run_for(0.4);
     d.click("record.panel.record");
     let q = d.harness.state().session.active_sequence().unwrap();
@@ -536,7 +536,7 @@ fn rotate_turns_the_camera_preview_and_lands_on_the_clip() {
     // the preview stands upright like the clip will
     wait_label(&mut d, "record.panel.camera.1.preview", |l| l.starts_with("180×320"));
     d.click("record.panel.record");
-    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
     d.run_for(0.6);
     d.click("record.panel.record");
     let s = &d.harness.state().session;

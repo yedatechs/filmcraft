@@ -610,7 +610,9 @@ impl VideoInput for ScreenInput {
                 .find(|d| d.displayID().to_string() == *id)
                 .ok_or_else(|| CaptureError::new(CaptureErrorKind::NoDevice, format!("no display `{id}`")))?;
             let (filter, n) = display_filter(&content, &d);
-            run_with_completion("updating what the screen recording leaves out", |b| r.stream.updateContentFilter_completionHandler(&filter, Some(b)))?;
+            run_with_completion("updating what the screen recording leaves out", OS_TIMEOUT, |b| {
+                r.stream.updateContentFilter_completionHandler(&filter, Some(b))
+            })?;
             log::info!("display recording: now {n} FilmCraft border / preview window(s) left out");
         }
         Ok(())
