@@ -482,7 +482,7 @@ fn set_moves_and_scales_as_one_merged_step() {
 fn pan_moves_the_picture_not_the_box() {
     let (mut s, v1, v2) = session();
     // only a circle or square can pan
-    assert!(s.execute("layout.pan", json!({"clips": [v2.0], "dx": -100})).unwrap_err().to_string().contains("circle or square"));
+    assert!(s.execute("layout.pan", json!({"clips": [v2.0], "dx": -100})).unwrap_err().to_string().contains("circle, square or rounded"));
     s.execute("layout.place", json!({"clips": [v2.0], "at": "bottomRight", "size": 33})).unwrap();
     s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
     let r0 = inspect(&mut s, v2);
@@ -534,4 +534,111 @@ fn pan_moves_the_picture_not_the_box() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(inspect(&mut s, v2)["pan"], json!([0.0, 0.0]));
     let _ = v1;
+}
+
+fn zoom_of(v: &Value) -> f64 {
+    v["zoom"].as_f64().unwrap()
+}
+
+fn same_box(a: [f64; 4], b: [f64; 4]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.01)
+}
+
+#[test]
+fn zoom_grows_the_picture_not_the_box() {
+    let (mut s, _, v2) = session();
+    // only a circle, square or rounded shape can zoom
+    let e = s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 1.5})).unwrap_err();
+    assert!(e.to_string().contains("circle, square or rounded"), "{e}");
+    s.execute("layout.place", json!({"clips": [v2.0], "at": "bottomRight", "size": 33})).unwrap();
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
+    assert!(s.execute("layout.zoom", json!({"clips": [v2.0]})).is_err(), "nothing to set");
+    assert!(s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 2, "by": 2})).is_err(), "one of the two");
+    let r0 = inspect(&mut s, v2);
+    assert_eq!(zoom_of(&r0), 1.0, "{r0}");
+    let b0 = bx(&r0);
+    let (_, sc0) = motion(&s, v2);
+    let before = s.history.undo.len();
+    // absolute: the box stays, the scale grows by the zoom
+    let r = s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 1.5})).unwrap();
+    assert_eq!(r["zoom"], json!([1.5]), "{r}");
+    assert_eq!(s.history.undo.len(), before + 1);
+    assert_eq!(s.history.undo.last().unwrap().0, "Zoom Clip");
+    let r1 = inspect(&mut s, v2);
+    assert_eq!((zoom_of(&r1), r1["shape"].clone(), r1["at"].clone()), (1.5, json!("circle"), json!("bottomRight")), "{r1}");
+    assert!(same_box(b0, bx(&r1)), "{b0:?} {r1}");
+    let (_, sc1) = motion(&s, v2);
+    assert!((float(&sc1) - float(&sc0) * 1.5).abs() < 1e-6, "{sc1:?} {sc0:?}");
+    // relative
+    s.execute("layout.zoom", json!({"clips": [v2.0], "by": 2})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 3.0);
+    s.execute("layout.zoom", json!({"clips": [v2.0], "by": 0.5})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.5);
+    assert!(same_box(b0, bx(&inspect(&mut s, v2))));
+    // scroll notches: merged into one undo step; `begin` starts the next
+    let n = s.history.undo.len();
+    s.execute("layout.zoom", json!({"clips": [v2.0], "by": 1.05, "merge": true, "begin": true})).unwrap();
+    for _ in 0..4 {
+        s.execute("layout.zoom", json!({"clips": [v2.0], "by": 1.05, "merge": true})).unwrap();
+    }
+    assert_eq!(s.history.undo.len(), n + 1, "one undo step for the notches");
+    let z = zoom_of(&inspect(&mut s, v2));
+    assert!((z - 1.5 * 1.05f64.powi(5)).abs() < 1e-3, "{z}");
+    assert!(same_box(b0, bx(&inspect(&mut s, v2))));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.5, "undo takes the notches back together");
+    // clamping: 1–8; junk counts as 1 (`zoom`) or no change (`by`)
+    s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 100})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 8.0);
+    s.execute("layout.zoom", json!({"clips": [v2.0], "by": "lots"})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 8.0);
+    s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": -3})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.0);
+    s.execute("layout.zoom", json!({"clips": [v2.0], "by": 1e300})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 8.0);
+    s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": "big"})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.0);
+    assert!(same_box(b0, bx(&inspect(&mut s, v2))));
+    // the pan has more room in a zoomed shape (1920 × 1080 at zoom 2: ±690 × ±270) and keeps the zoom
+    s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 2})).unwrap();
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": -1e9, "dy": 1e9})).unwrap();
+    let r = inspect(&mut s, v2);
+    assert_eq!((r["pan"].clone(), zoom_of(&r)), (json!([-690.0, 270.0]), 2.0), "{r}");
+    assert!(same_box(b0, bx(&r)), "{r}");
+    // zooming out again clamps the pan to the larger shape
+    s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 1})).unwrap();
+    let r = inspect(&mut s, v2);
+    assert_eq!((r["pan"].clone(), zoom_of(&r)), (json!([-420.0, 0.0]), 1.0), "{r}");
+    assert!(same_box(b0, bx(&r)), "{r}");
+    // place and shape keep the zoom
+    s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 2})).unwrap();
+    s.execute("layout.place", json!({"clips": [v2.0], "at": "topLeft", "size": 25})).unwrap();
+    let r = inspect(&mut s, v2);
+    assert_eq!((zoom_of(&r), r["at"].clone()), (2.0, json!("topLeft")), "{r}");
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "square"})).unwrap();
+    let r = inspect(&mut s, v2);
+    assert_eq!((zoom_of(&r), r["at"].clone(), r["shape"].clone()), (2.0, json!("topLeft"), json!("square")), "{r}");
+    // a zoomed rounded rectangle can pan (960 × 540 inside 1920 × 1080: ±480 × ±270)
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "rounded"})).unwrap();
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": -1e9, "dy": 0})).unwrap();
+    let r = inspect(&mut s, v2);
+    assert_eq!((zoom_of(&r), r["pan"].clone(), r["shape"].clone(), r["at"].clone()), (2.0, json!([-480.0, 0.0]), json!("rounded"), json!("topLeft")), "{r}");
+    // free has no zoom
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "free"})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.0);
+    // swap carries pan and zoom to the other clip
+    s.execute("layout.shape", json!({"clips": [v2.0], "shape": "circle"})).unwrap();
+    s.execute("layout.zoom", json!({"clips": [v2.0], "zoom": 1.25})).unwrap();
+    s.execute("layout.pan", json!({"clips": [v2.0], "dx": -200})).unwrap();
+    let r = s.execute("layout.swap", json!({})).unwrap();
+    let pb = ClipId(r["clips"][1].as_u64().unwrap());
+    let i = inspect(&mut s, pb);
+    assert_eq!((i["pan"].clone(), zoom_of(&i), i["shape"].clone()), (json!([-200.0, 0.0]), 1.25, json!("circle")), "{i}");
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.0);
+    // undo goes back step by step
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.25);
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.0);
 }

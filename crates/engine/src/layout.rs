@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use filmcraft_edit::layout::{self as lay, NO_PAN, Pan, Place, Pose, Shape};
+use filmcraft_edit::layout::{self as lay, Crop, Place, Pose, Shape};
 use filmcraft_geom::Vec2;
 use filmcraft_project::{ClipId, EffectInstance, ItemKind, Mask, MaskPath, Param, ParamValue, Project, Sequence, TrackItem, TrackKind};
 use filmcraft_time::{Tick, TimeRange};
@@ -43,6 +43,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec("layout.shape", "Shape Clip", r#"{"clips":[id]?,"shape":"circle"|"rounded"|"square"|"free","radius":0..50=12}"#, has_layout_clips, shape, true),
         spec("layout.swap", "Swap Layouts", r#"{"clips":[id,id]?}"#, has_seq, swap, true),
         spec("layout.pan", "Pan Clip", r#"{"clips":[id]?,"dx":px?,"dy":px?,"merge":bool?,"begin":bool?}"#, has_layout_clips, pan, true),
+        spec("layout.zoom", "Zoom Clip", r#"{"clips":[id]?,"zoom":1..8?,"by":factor?,"merge":bool?,"begin":bool?}"#, has_layout_clips, zoom, true),
         spec(
             "layout.set",
             "Transform Clip",
@@ -145,12 +146,12 @@ fn layout_mask_path(it: &TrackItem, mt: Tick) -> Option<MaskPath> {
     }
 }
 
-/// The clip's layout shape and pan: `Some((Free, 0))` without a layout mask, `None` for a mask
-/// edited by hand.
-fn shape_of(it: &TrackItem, src: (u32, u32), mt: Tick) -> Option<(Shape, Pan)> {
+/// The clip's layout shape and crop (pan and zoom): `Some((Free, none))` without a layout mask,
+/// `None` for a mask edited by hand.
+fn shape_of(it: &TrackItem, src: (u32, u32), mt: Tick) -> Option<(Shape, Crop)> {
     match layout_mask_path(it, mt) {
-        None => Some((Shape::Free, NO_PAN)),
-        Some(p) => lay::shape_of_path(src, &p),
+        None => Some((Shape::Free, Crop::NONE)),
+        Some(p) => lay::shape_of_path(src, &p).map(|(sh, pan, zoom)| (sh, Crop::new(pan, zoom))),
     }
 }
 
@@ -162,8 +163,8 @@ struct Clip {
     pose: Pose,
     /// `None`: a hand-edited layout mask (treated as the whole source for the box).
     shape: Option<Shape>,
-    /// The shape's pan inside the source (0 for free, rounded or custom).
-    pan: Pan,
+    /// The shape's pan and zoom inside the source (none for free or custom).
+    crop: Crop,
     track: usize,
 }
 
@@ -172,7 +173,7 @@ impl Clip {
         self.shape.unwrap_or(Shape::Free)
     }
     fn visible_box(&self, frame: (u32, u32)) -> [f64; 4] {
-        lay::visible_box(frame, self.src, self.geometry_shape(), self.pan, &self.pose)
+        lay::visible_box(frame, self.src, self.geometry_shape(), self.crop, &self.pose)
     }
 }
 
@@ -182,7 +183,7 @@ fn read_clip(project: &Project, q: &Sequence, c: ClipId, t: Tick, as_rendered: b
     let mt = media_time(it, t);
     let track = q.video_tracks.iter().position(|tr| tr.id == tid).unwrap_or(0);
     let sp = shape_of(it, src, mt);
-    Ok(Clip { id: c, src, mt, pose: pose_of(it, mt, as_rendered), shape: sp.map(|x| x.0), pan: sp.map_or(NO_PAN, |x| x.1), track })
+    Ok(Clip { id: c, src, mt, pose: pose_of(it, mt, as_rendered), shape: sp.map(|x| x.0), crop: sp.map_or(Crop::NONE, |x| x.1), track })
 }
 
 // ------------------------------------------------------------------ writing
@@ -262,7 +263,7 @@ fn place(s: &mut Session, p: &Value) -> Result<Value> {
     let mut plan = Vec::new();
     for c in &clips {
         let cl = read_clip(&s.project, q, *c, t, false, CMD)?;
-        let (pos, scale) = lay::place(frame, cl.src, cl.geometry_shape(), cl.pan, at, size, margin, &cl.pose);
+        let (pos, scale) = lay::place(frame, cl.src, cl.geometry_shape(), cl.crop, at, size, margin, &cl.pose);
         plan.push((cl.id, cl.mt, pos, scale));
     }
     edit_clips(s, "Place Clip", CMD, |id, it| match plan.iter().find(|x| x.0 == id) {
@@ -334,10 +335,10 @@ fn shape(s: &mut Session, p: &Value) -> Result<Value> {
     for c in &clips {
         let cl = read_clip(&s.project, q, *c, t, false, CMD)?;
         // the visible box keeps its width and the edges its place touches (its centre if custom);
-        // the pan is kept (clamped to the new shape)
-        let pan = lay::clamp_pan(cl.src, new_shape, cl.pan);
-        let (pos, scale) = lay::refit(frame, cl.src, new_shape, pan, cl.visible_box(frame), &cl.pose);
-        plan.push((cl.id, cl.mt, pos, scale, lay::shape_path(cl.src, new_shape, pan)));
+        // the pan and zoom are kept (clamped to the new shape)
+        let crop = lay::clamp_crop(cl.src, new_shape, cl.crop);
+        let (pos, scale) = lay::refit(frame, cl.src, new_shape, crop, cl.visible_box(frame), &cl.pose);
+        plan.push((cl.id, cl.mt, pos, scale, lay::shape_path(cl.src, new_shape, crop)));
     }
     edit_clips(s, "Shape Clip", CMD, |id, it| match plan.iter().find(|x| x.0 == id) {
         Some((_, mt, pos, scale, path)) => {
@@ -360,7 +361,7 @@ fn clips_at(project: &Project, q: &Sequence, t: Tick) -> Vec<ClipId> {
         .collect()
 }
 
-/// `layout.swap`: the two clips exchange place, shape and pan, and over the time they overlap
+/// `layout.swap`: the two clips exchange place, shape, pan and zoom, and over the time they overlap
 /// they also exchange tracks, so the clip that was on top is now under the other (otherwise the
 /// full-frame clip would still cover the small one). Each clip is split on its own (video) track
 /// at the bounds of the overlap first, like a razor on that track alone: the pieces outside the
@@ -403,13 +404,13 @@ fn swap(s: &mut Session, p: &Value) -> Result<Value> {
     let cb = read_clip(&s.project, q, b, te, false, CMD)?;
     let mask_of = |c: ClipId| q.find_item(c).and_then(|(_, it)| it.effect("opacity")).and_then(|o| o.masks.iter().find(|m| m.name == LAYOUT_MASK).cloned());
     let (ma, mb) = (mask_of(a), mask_of(b));
-    // where `to` goes: `from`'s box, shape and pan, in `to`'s source pixels
+    // where `to` goes: `from`'s box, shape, pan and zoom, in `to`'s source pixels
     let target = |to: &Clip, from: &Clip, from_mask: Option<Mask>| {
-        let pan = lay::clamp_pan(to.src, from.geometry_shape(), from.pan);
-        let (pos, scale) = lay::refit(frame, to.src, from.geometry_shape(), pan, from.visible_box(frame), &to.pose);
+        let crop = lay::clamp_crop(to.src, from.geometry_shape(), from.crop);
+        let (pos, scale) = lay::refit(frame, to.src, from.geometry_shape(), crop, from.visible_box(frame), &to.pose);
         let path = match (from.shape, from_mask.as_ref()) {
             (_, None) => None,
-            (Some(sh), Some(_)) => lay::shape_path(to.src, sh, pan),
+            (Some(sh), Some(_)) => lay::shape_path(to.src, sh, crop),
             // a hand-edited mask: scaled from one source to the other
             (None, Some(m)) => match m.path.value_at(from.mt) {
                 ParamValue::Path(path) => Some(path.transformed(&filmcraft_geom::Affine::scale(
@@ -474,8 +475,8 @@ fn swap(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
-/// `layout.pan`: set the pan of the clips' circle or square inside their source (source pixels,
-/// clamped so the shape stays inside the source; a missing `dx` / `dy` keeps that component, a
+/// `layout.pan`: set the pan of the clips' circle, square or rounded shape inside their source
+/// (source pixels, clamped so the shape stays inside the source; a missing `dx` / `dy` keeps that component, a
 /// value that is not a finite number counts as 0). The visible box stays where it is: the Motion
 /// position moves by the opposite of the pan (rotated and scaled), so the picture slides under
 /// the shape. `merge` / `begin` as in `layout.set` (an Alt-drag in the Program monitor is one
@@ -494,13 +495,11 @@ fn pan(s: &mut Session, p: &Value) -> Result<Value> {
     let mut plan = Vec::new();
     for c in &clips {
         let cl = read_clip(&s.project, q, *c, t, false, CMD)?;
-        let Some(shape) = cl.shape.filter(|sh| matches!(sh, Shape::Circle | Shape::Square)) else {
-            return Err(bad(CMD, format!("clip {} has no circle or square layout shape to pan inside (use layout.shape first)", c.0)));
-        };
-        let want = (dx.unwrap_or(cl.pan.0), dy.unwrap_or(cl.pan.1));
-        let new = lay::clamp_pan(cl.src, shape, want);
-        let pos = lay::pan_position(frame, cl.src, shape, &cl.pose, cl.pan, new);
-        plan.push((cl.id, cl.mt, pos, lay::shape_path(cl.src, shape, new), new));
+        let shape = croppable(&cl, CMD, "pan")?;
+        let want = (dx.unwrap_or(cl.crop.pan.0), dy.unwrap_or(cl.crop.pan.1));
+        let new = lay::clamp_crop(cl.src, shape, Crop::new(want, cl.crop.zoom));
+        let pos = lay::pan_position(frame, cl.src, shape, &cl.pose, cl.crop, new.pan);
+        plan.push((cl.id, cl.mt, pos, lay::shape_path(cl.src, shape, new), new.pan));
     }
     let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("layout.pan:{}", clips.iter().map(|c| c.0.to_string()).collect::<Vec<_>>().join(",")));
     if bool_p(p, "begin").unwrap_or(false) {
@@ -517,6 +516,68 @@ fn pan(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({"clips": clips.iter().map(|c| c.0).collect::<Vec<_>>(), "pan": plan.iter().map(|x| [x.4.0, x.4.1]).collect::<Vec<_>>()}))
+}
+
+/// The clip's shape when it is one the picture can pan or zoom inside (circle, square, rounded).
+fn croppable(cl: &Clip, cmd: &str, what: &str) -> Result<Shape> {
+    cl.shape
+        .filter(|sh| !matches!(sh, Shape::Free))
+        .ok_or_else(|| bad(cmd, format!("clip {} has no circle, square or rounded layout shape to {what} inside (use layout.shape first)", cl.id.0)))
+}
+
+/// `layout.zoom`: zoom the picture inside the clips' circle, square or rounded shape. `zoom` sets
+/// the factor (1 = the shape at its full extent in the source), `by` multiplies the current one;
+/// the result is clamped to 1–8 (a value that is not a positive finite number counts as 1, or as
+/// no change for `by`). The shape's extent in the source is divided by the zoom and the visible
+/// box stays where it is: Motion `scale` grows by as much and `position` keeps the shape's centre
+/// (the pan is clamped to the smaller shape's room). `merge` / `begin` as in `layout.set` (Option
+/// + scroll and the Option-corner drag in the Program monitor are one undo step).
+fn zoom(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "layout.zoom";
+    let num = |k: &str| p.get(k).filter(|v| !v.is_null()).map(|v| v.as_f64().filter(|x| x.is_finite() && *x > 0.0));
+    let (abs, by) = (num("zoom"), num("by"));
+    // (absolute zoom, factor on the current one)
+    let (set, mul) = match (abs, by) {
+        (Some(_), Some(_)) => return Err(bad(CMD, "give `zoom` or `by`, not both")),
+        (Some(z), None) => (Some(z.unwrap_or(1.0)), 1.0),
+        (None, Some(k)) => (None, k.unwrap_or(1.0)),
+        (None, None) => return Err(bad(CMD, "give `zoom` (1–8) or `by` (a factor)")),
+    };
+    let clips = target_clips(s, p, CMD)?;
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let frame = frame_of(q);
+    let t = s.playhead();
+    let mut plan = Vec::new();
+    for c in &clips {
+        let cl = read_clip(&s.project, q, *c, t, false, CMD)?;
+        let shape = croppable(&cl, CMD, "zoom")?;
+        let want = Crop::new(cl.crop.pan, lay::clamp_zoom(set.unwrap_or(cl.crop.zoom * mul)));
+        let (pos, scale, new) = lay::crop_motion(frame, cl.src, shape, &cl.pose, cl.crop, want);
+        plan.push((cl.id, cl.mt, pos, scale, lay::shape_path(cl.src, shape, new), new));
+    }
+    let merge = bool_p(p, "merge").unwrap_or(false).then(|| format!("layout.zoom:{}", clips.iter().map(|c| c.0.to_string()).collect::<Vec<_>>().join(",")));
+    if bool_p(p, "begin").unwrap_or(false) {
+        s.history.merge_key = None;
+    }
+    s.edit_sequence_as("Zoom Clip", merge.as_deref(), |q, _, _| {
+        for (c, mt, pos, scale, path, _) in &plan {
+            let (_, it) = q.find_item_mut(*c).ok_or_else(|| bad(CMD, "the clip is gone"))?;
+            set_layout_mask(it, path.clone(), None, CMD)?;
+            let m = it.effect_mut("motion").ok_or_else(|| bad(CMD, "the clip has no Motion effect"))?;
+            m.enabled = true;
+            let uniform = m.param("uniform_scale").and_then(|u| u.value.as_bool()).unwrap_or(true);
+            param_mut(m, "position").ok_or_else(|| bad(CMD, "Motion has no position"))?.set_at(*mt, ParamValue::Vec2(Vec2::new(pos.0, pos.1)));
+            param_mut(m, "scale").ok_or_else(|| bad(CMD, "Motion has no scale"))?.set_at(*mt, ParamValue::Float(scale.1.clamp(0.0, lay::MAX_SCALE)));
+            if !uniform {
+                param_mut(m, "scale_width")
+                    .ok_or_else(|| bad(CMD, "Motion has no scale width"))?
+                    .set_at(*mt, ParamValue::Float(scale.0.clamp(0.0, lay::MAX_SCALE)));
+            }
+        }
+        Ok(())
+    })?;
+    let r = |v: f64| (v * 1000.0).round() / 1000.0;
+    Ok(json!({"clips": clips.iter().map(|c| c.0).collect::<Vec<_>>(), "zoom": plan.iter().map(|x| r(x.5.zoom)).collect::<Vec<_>>()}))
 }
 
 fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
@@ -542,7 +603,8 @@ fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
             "margin": margin.map(r),
             "shape": cl.shape.map(|sh| sh.name()).unwrap_or("custom"),
             "radius": cl.shape.and_then(|sh| sh.radius()),
-            "pan": [r(cl.pan.0), r(cl.pan.1)],
+            "pan": [r(cl.crop.pan.0), r(cl.crop.pan.1)],
+            "zoom": r(cl.crop.zoom),
             "box": b.map(r),
             "track": cl.track,
         }));

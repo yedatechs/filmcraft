@@ -1,6 +1,7 @@
 //! Headless UI test of clip layouts in the Program monitor: click the picture to select the top
 //! clip (a second click cycles), the box and its handles, the right-click Layout menu, a drag of
-//! the box (one undo step), the Effect Controls shape buttons and Clip ▸ Layout.
+//! the box (one undo step), the Effect Controls shape buttons and Clip ▸ Layout; Alt-drag pans and
+//! Alt-scroll / Alt-corner drag zoom the picture inside a shape.
 //!
 //! Set `FILMCRAFT_UI_SNAPSHOT_DIR=<dir>` to also render the window offscreen with wgpu and write
 //! `layout-*.png` there; without it no GPU is needed.
@@ -21,12 +22,17 @@ struct Driver {
 
 impl Driver {
     fn demo() -> Self {
+        Self::demo_with_step(0.25)
+    }
+
+    /// The demo with `dt` seconds of input time per frame (the harness default is ¼ s).
+    fn demo_with_step(dt: f32) -> Self {
         let mut session = Session::default();
         session.execute("file.openDemoProject", json!({})).expect("demo project");
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
         let snapshots = std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
-        let mut b = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000);
+        let mut b = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).with_step_dt(dt);
         if snapshots.is_some() {
             b = b.wgpu();
         }
@@ -274,4 +280,100 @@ fn program_monitor_pan() {
     let items = d.ok("ui.menu.list", json!({}));
     let left = items.as_array().unwrap().iter().find(|it| it["id"] == json!("layout.menu.pan.left")).cloned().unwrap();
     assert_eq!(left["enabled"], json!(false), "{left}");
+}
+
+#[test]
+fn program_monitor_zoom() {
+    // 60 frames a second, so scroll notches a few frames apart are within the 400 ms merge window
+    let mut d = Driver::demo_with_step(1.0 / 60.0);
+    d.exec("playhead.set", json!({"seconds": 7.0}));
+    d.ok("ui.set", json!({"tool": "selection"}));
+    d.frames(4);
+    let seq = d.exec("sequence.inspect", json!({}));
+    let frame = (seq["settings"]["width"].as_f64().unwrap_or(1920.0), seq["settings"]["height"].as_f64().unwrap_or(1080.0));
+    // select the V2 overlay and make it a circle
+    d.ok("ui.click", json!({"id": "program.picture", "fx": 1540.0 / frame.0, "fy": 820.0 / frame.1}));
+    d.frames(3);
+    let top = d.selection()[0];
+    d.exec("layout.shape", json!({"clips": [top], "shape": "circle"}));
+    d.frames(3);
+    let i0 = d.inspect();
+    assert_eq!(i0["zoom"], json!(1.0), "{i0}");
+    let box0: Vec<f64> = i0["box"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    let same_box = |v: &Value| v["box"].as_array().unwrap().iter().zip(&box0).all(|(a, b)| (a.as_f64().unwrap() - b).abs() < 1.0);
+    let zoom = |v: &Value| v["zoom"].as_f64().unwrap();
+
+    // Option + scroll over the box: three notches up zoom in, the box stays put
+    for _ in 0..3 {
+        d.ok("ui.scroll", json!({"id": "program.layout.box", "dy": 40.0, "modifiers": {"alt": true}}));
+        d.frames(2);
+    }
+    let i1 = d.inspect();
+    assert!((zoom(&i1) - 1.05f64.powi(3)).abs() < 0.01, "{i1}");
+    assert!(same_box(&i1), "{i1} vs {i0}");
+    assert_eq!(i1["shape"], json!("circle"));
+    assert!(d.ok("ui.inspect", json!({})).to_string().contains("Zoom: 116 %"), "status bar shows the zoom");
+    // a notch down zooms out
+    d.ok("ui.scroll", json!({"id": "program.layout.box", "dy": -40.0, "modifiers": {"alt": true}}));
+    d.frames(2);
+    assert!((zoom(&d.inspect()) - 1.05f64.powi(2)).abs() < 0.01);
+    // without Option the wheel does not zoom
+    d.ok("ui.scroll", json!({"id": "program.layout.box", "dy": 40.0}));
+    d.frames(2);
+    assert!((zoom(&d.inspect()) - 1.05f64.powi(2)).abs() < 0.01);
+    d.exec("edit.undo", json!({}));
+    d.frames(2);
+    assert_eq!(d.inspect()["zoom"], json!(1.0), "notches in quick succession are one undo step");
+
+    // Clip ▸ Layout ▸ Zoom ▸ 150 %: set and checked; Pan ▸ Centre is checked too
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.zoom.150"}));
+    d.frames(2);
+    let i2 = d.inspect();
+    assert_eq!(i2["zoom"], json!(1.5), "{i2}");
+    assert!(same_box(&i2), "{i2}");
+    let items = d.ok("ui.menu.list", json!({}));
+    let find = |id: &str| items.as_array().unwrap().iter().find(|it| it["id"] == json!(id)).cloned().unwrap_or_else(|| panic!("no {id}"));
+    let z150 = find("layout.menu.zoom.150");
+    assert_eq!(
+        (z150["path"].clone(), z150["checked"].clone(), z150["enabled"].clone()),
+        (json!(["Clip", "Layout", "Zoom"]), json!(true), json!(true)),
+        "{z150}"
+    );
+    assert_eq!(find("layout.menu.zoom.100")["checked"], json!(false));
+    assert_eq!(find("layout.menu.pan.center")["checked"], json!(true));
+    assert_eq!(find("layout.menu.pan.left")["checked"], json!(false));
+
+    // the right-click menu has the same entries; Zoom In multiplies by 1.25
+    d.ok("ui.click", json!({"id": "program.layout.box", "button": "right"}));
+    d.frames(3);
+    d.click("layout.menu.zoom");
+    let ids = d.ids("layout.menu.zoom.");
+    for z in ["100", "125", "150", "200", "in", "out"] {
+        assert!(ids.contains(&format!("layout.menu.zoom.{z}")), "{ids:?}");
+    }
+    d.click("layout.menu.zoom.in");
+    assert_eq!(d.inspect()["zoom"], json!(1.875));
+    d.exec("edit.undo", json!({}));
+    d.frames(2);
+    assert_eq!(d.inspect()["zoom"], json!(1.5));
+
+    // Option-drag of the SE handle outward zooms in without moving the box; one undo step
+    let se = d.rect("program.layout.handle.se");
+    let (hx, hy) = (se[0] + se[2] / 2.0, se[1] + se[3] / 2.0);
+    d.ok("ui.drag", json!({"from": {"x": hx, "y": hy}, "to": {"x": hx + 30.0, "y": hy + 30.0}, "modifiers": {"alt": true}}));
+    d.frames(4);
+    let i3 = d.inspect();
+    assert!(zoom(&i3) > 1.6, "{i3}");
+    assert!(same_box(&i3), "{i3} vs {i0}");
+    assert!(d.ok("ui.inspect", json!({})).to_string().contains("Zoom: "), "status bar shows the zoom");
+    d.exec("edit.undo", json!({}));
+    d.frames(2);
+    assert_eq!(d.inspect()["zoom"], json!(1.5), "the drag is one undo step");
+
+    // a free clip cannot zoom: the entries are disabled
+    d.exec("layout.shape", json!({"clips": [top], "shape": "free"}));
+    d.frames(2);
+    let items = d.ok("ui.menu.list", json!({}));
+    let z = items.as_array().unwrap().iter().find(|it| it["id"] == json!("layout.menu.zoom.in")).cloned().unwrap();
+    assert_eq!(z["enabled"], json!(false), "{z}");
 }

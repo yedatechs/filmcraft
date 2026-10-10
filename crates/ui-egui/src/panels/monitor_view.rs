@@ -349,7 +349,8 @@ pub fn pan_input(app: &mut FilmcraftApp, ui: &mut egui::Ui, w: Which, area: Rect
         return;
     }
     let mut d = Vec2::ZERO;
-    if ui.rect_contains_pointer(area) {
+    // Alt/Option + scroll zooms the picture inside a clip's shape (`panels::layout`), not the view
+    if ui.rect_contains_pointer(area) && !ui.input(|i| i.modifiers.alt) {
         d += ui.input(|i| i.smooth_scroll_delta);
     }
     if app.ui.tool == Tool::Hand {

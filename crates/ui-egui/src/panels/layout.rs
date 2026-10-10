@@ -7,17 +7,21 @@
 //! - **Box and handles.** The selected video clip's visible box (`layout.inspect` → `box`) with 8
 //!   handles: drag inside moves it (snapping to the frame edges and centre and the guides; ⌘/Ctrl
 //!   moves freely), the handles scale it uniformly about the opposite corner or edge; Alt/Option-drag
-//!   inside pans the picture inside a circle or square (`layout.pan`; the box stays put). A drag is
-//!   one undo step.
+//!   inside pans the picture inside a circle, square or rounded shape (`layout.pan`; the box stays
+//!   put). Alt/Option + scroll over the box, or Alt/Option-drag of a corner handle, zooms the
+//!   picture inside the shape (`layout.zoom`; the box stays put). A drag (and a run of scroll
+//!   notches less than 400 ms apart) is one undo step.
 //! - **Menus.** Right-click on the box, the timeline clip menu (Layout ▸) and Clip ▸ Layout share
-//!   one table of entries: Place ▸, Size ▸, Shape ▸, Pan ▸, Swap With Clip Below, Redact Area ▸
-//!   (Static / Tracked Mosaic, Blur, Fill…), with the current place, size and shape checked.
+//!   one table of entries: Place ▸, Size ▸, Shape ▸, Pan ▸, Zoom ▸, Swap With Clip Below, Redact
+//!   Area ▸ (Static / Tracked Mosaic, Blur, Fill…), with the current place, size, shape, pan and
+//!   zoom checked.
 //! - **Effect Controls.** One row of nine place buttons and four shape buttons under Motion.
 //!
 //! Automation ids: `program.layout.box`, `program.layout.handle.{nw|n|ne|e|se|s|sw|w}`,
 //! `layout.menu.{place|size|shape}` (the submenus), `layout.menu.place.{at}`,
 //! `layout.menu.size.{20|25|33|50}`, `layout.menu.shape.{circle|rounded|square|free}`,
 //! `layout.menu.pan` (the submenu), `layout.menu.pan.{left|center|right}`,
+//! `layout.menu.zoom` (the submenu), `layout.menu.zoom.{100|125|150|200|in|out}`,
 //! `layout.menu.swap`, `layout.menu.redact` (the submenu), `layout.menu.redact.{static|tracked}.{mosaic|blur|fill}`,
 //! `effectControls.layout.place.{at}`,
 //! `effectControls.layout.shape.{s}` (and `properties.layout.*` in the Properties panel).
@@ -50,8 +54,25 @@ pub const SHAPES: [(&str, &str); 4] = [("circle", "Circle"), ("rounded", "Rounde
 /// Entries of the Pan submenu: where the shape's centre goes, as a fraction of the source width.
 pub const PANS: [(&str, &str, f64); 3] =
     [("left", "Centre on Left Third", 1.0 / 3.0), ("center", "Centre", 0.5), ("right", "Centre on Right Third", 2.0 / 3.0)];
+/// Entries of the Zoom submenu: an absolute zoom (`Some`) or Zoom In / Out (× / ÷ [`MENU_ZOOM_STEP`]).
+pub const ZOOMS: [(&str, &str, Option<f64>); 6] = [
+    ("100", "100 %", Some(1.0)),
+    ("125", "125 %", Some(1.25)),
+    ("150", "150 %", Some(1.5)),
+    ("200", "200 %", Some(2.0)),
+    ("in", "Zoom In", None),
+    ("out", "Zoom Out", None),
+];
+/// Factor of Zoom In / Zoom Out.
+pub const MENU_ZOOM_STEP: f64 = 1.25;
+/// Factor of one scroll-wheel notch with Alt/Option over the box.
+pub const WHEEL_ZOOM_STEP: f64 = 1.05;
+/// Scroll points that count as one notch (a line of the wheel).
+const WHEEL_NOTCH_POINTS: f64 = 40.0;
+/// Scroll notches closer together than this (seconds) are one undo step.
+const WHEEL_MERGE_SECONDS: f64 = 0.4;
 
-const HINT: &str = "Drag to move, corners to scale, Alt-drag to pan inside a shape, right-click for layouts";
+const HINT: &str = "Drag to move, corners to scale, Alt-drag to pan and Alt-scroll to zoom inside a shape, right-click for layouts";
 /// Handles in automation-id order, with their position on the box (0, ½, 1 of width and height).
 const HANDLES: [(&str, f32, f32); 8] =
     [("nw", 0.0, 0.0), ("n", 0.5, 0.0), ("ne", 1.0, 0.0), ("e", 1.0, 0.5), ("se", 1.0, 1.0), ("s", 0.5, 1.0), ("sw", 0.0, 1.0), ("w", 0.0, 0.5)];
@@ -66,6 +87,8 @@ pub struct LayoutUi {
     cache: Option<Cache>,
     /// The previous monitor click: where, the clips under it (top first), which one is selected.
     last_click: Option<(Pos2, Vec<u64>, usize)>,
+    /// The last Alt-scroll zoom: when (`egui` input time) and on which clip, to merge notches.
+    last_zoom: Option<(f64, ClipId)>,
 }
 
 type CacheKey = (u64, Vec<ClipId>, Tick, Option<ItemId>);
@@ -88,6 +111,8 @@ pub struct Info {
     pub bx: [f64; 4],
     /// The shape's pan inside the source (source pixels).
     pub pan: [f64; 2],
+    /// The zoom of the picture inside the shape (1 = none).
+    pub zoom: f64,
 }
 
 impl Info {
@@ -107,8 +132,26 @@ impl Info {
                 let k = |i: usize| p.and_then(|p| p.get(i)).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0);
                 [k(0), k(1)]
             },
+            zoom: c.get("zoom").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(1.0),
         })
     }
+}
+
+impl Info {
+    /// Whether the picture can pan and zoom inside the shape (circle, square, rounded).
+    pub fn croppable(&self) -> bool {
+        croppable(&self.shape)
+    }
+}
+
+/// Whether a `layout.inspect` shape name can pan and zoom (circle, square, rounded).
+fn croppable(shape: &str) -> bool {
+    matches!(shape, "circle" | "square" | "rounded")
+}
+
+/// Width of a clip's source (pixels), 0 when unknown.
+fn source_width(app: &FilmcraftApp, c: ClipId) -> u32 {
+    app.session.active_sequence().and_then(|q| q.find_item(c)).and_then(|(_, it)| app.session.project.source_size(it.item)).map_or(0, |s| s.0)
 }
 
 /// Display name of a place id (`custom` for a box at no place).
@@ -167,6 +210,18 @@ pub fn checked(app: &FilmcraftApp, id: &str) -> Option<bool> {
     if let Some(s) = rest.strip_prefix("shape.") {
         return Some(i.is_some_and(|i| i.shape == s));
     }
+    if let Some(which) = rest.strip_prefix("pan.") {
+        // the entry whose x-centre the shape is at, within 1 % of the source width
+        let frac = PANS.iter().find(|x| x.0 == which)?.2;
+        return Some(i.filter(|i| i.croppable()).is_some_and(|i| {
+            let w = f64::from(source_width(app, i.clip));
+            w > 0.0 && (0.5 + i.pan[0] / w - frac).abs() <= 0.01
+        }));
+    }
+    if let Some(which) = rest.strip_prefix("zoom.") {
+        let z = ZOOMS.iter().find(|x| x.0 == which)?.2?;
+        return Some(i.filter(|i| i.croppable()).is_some_and(|i| (i.zoom - z).abs() < 0.005));
+    }
     None
 }
 
@@ -177,10 +232,9 @@ pub fn enabled(app: &FilmcraftApp, id: &str) -> bool {
     }
     match id {
         "layout.menu.swap" => app.session.is_enabled("layout.swap"),
-        // a pan needs a circle or square to move inside the source
-        id if id.starts_with("layout.menu.pan.") => {
-            app.session.is_enabled("layout.pan") && info(app).is_some_and(|i| i.shape == "circle" || i.shape == "square")
-        }
+        // a pan or zoom needs a circle, square or rounded shape to move inside the source
+        id if id.starts_with("layout.menu.pan.") => app.session.is_enabled("layout.pan") && info(app).is_some_and(Info::croppable),
+        id if id.starts_with("layout.menu.zoom.") => app.session.is_enabled("layout.zoom") && info(app).is_some_and(Info::croppable),
         _ => app.session.is_enabled("layout.place"),
     }
 }
@@ -303,16 +357,28 @@ fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, Stri
             None => target(app).into_iter().collect(),
         };
         if clips.is_empty() {
-            return Err("select a video clip with a circle or square shape".into());
+            return Err("select a video clip with a circle, square or rounded shape".into());
         }
         let mut last = Value::Null;
         for c in clips {
             // the shape centred on that fraction of the source width: pan = (frac − ½) × width
-            let w = app.session.active_sequence().and_then(|q| q.find_item(c)).and_then(|(_, it)| app.session.project.source_size(it.item)).map_or(0, |s| s.0);
-            let dx = (frac - 0.5) * f64::from(w);
+            let dx = (frac - 0.5) * f64::from(source_width(app, c));
             last = exec(app, "layout.pan", json!({"clips": [c.0], "dx": dx}))?;
         }
         return Ok(last);
+    }
+    if let Some(which) = rest.strip_prefix("zoom.") {
+        let Some(&(_, _, abs)) = ZOOMS.iter().find(|x| x.0 == which) else { return Err(format!("unknown zoom `{which}`")) };
+        let mut p = match (abs, which) {
+            (Some(z), _) => json!({"zoom": z}),
+            (None, "in") => json!({"by": MENU_ZOOM_STEP}),
+            (None, _) => json!({"by": 1.0 / MENU_ZOOM_STEP}),
+        };
+        if params.get("clips").is_none() {
+            let Some(c) = target(app) else { return Err("select a video clip with a circle, square or rounded shape".into()) };
+            p["clips"] = json!([c.0]);
+        }
+        return exec(app, "layout.zoom", with_clips(p));
     }
     Err(format!("unknown layout command `layout.menu.{rest}`"))
 }
@@ -337,7 +403,7 @@ fn menu_entry(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: &str, label: &str, 
     }
 }
 
-/// The Layout entries (Place ▸, Size ▸, Shape ▸, Pan ▸, Swap With Clip Below, Redact Area ▸), shared by
+/// The Layout entries (Place ▸, Size ▸, Shape ▸, Pan ▸, Zoom ▸, Swap With Clip Below, Redact Area ▸), shared by
 /// the monitor right-click menu and the timeline clip menu.
 pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     refresh(app);
@@ -369,6 +435,15 @@ pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
         }
     });
     app.auto.add("layout.menu.pan", r.response.rect, "Pan");
+    let r = ui.menu_button("Zoom", |ui| {
+        for (z, label, abs) in ZOOMS {
+            if abs.is_none() && z == "in" {
+                ui.separator();
+            }
+            menu_entry(app, ui, &format!("layout.menu.zoom.{z}"), label, &mut run);
+        }
+    });
+    app.auto.add("layout.menu.zoom", r.response.rect, "Zoom");
     ui.separator();
     menu_entry(app, ui, "layout.menu.swap", "Swap With Clip Below", &mut run);
     let r = ui.menu_button("Redact Area", |ui| {
@@ -499,6 +574,8 @@ struct Drag {
     begun: bool,
     /// An Alt-drag inside the box: pan the picture inside the shape, starting from this pan.
     pan: Option<[f64; 2]>,
+    /// An Alt-drag of a corner handle: zoom the picture inside the shape, starting from this zoom.
+    zoom: Option<f64>,
 }
 
 fn in_quad(q: &[Pos2; 4], p: Pos2) -> bool {
@@ -550,10 +627,20 @@ fn pan_target(app: &FilmcraftApp, clip: ClipId, frame: (u32, u32), pan0: [f64; 2
 /// Where the drag puts the clip: (position, scale, scale width) for the pointer at `cur`.
 fn drag_target(d: &Drag, cur: Pos2, k: (f32, f32), snapped: egui::Vec2) -> ([f64; 2], f64, f64) {
     let (kx, ky) = (f64::from(k.0.max(1e-6)), f64::from(k.1.max(1e-6)));
-    let Some(&(_, hx, hy)) = d.handle.and_then(|h| HANDLES.get(h)) else {
+    let Some((f, fixed)) = handle_factor(d, cur, k) else {
         let p = [d.position[0] + f64::from(snapped.x) / kx, d.position[1] + f64::from(snapped.y) / ky];
         return (p, d.scale, d.scale_width);
     };
+    // uniform scaling about the anchor (the position): the fixed point stays where it is
+    let p = [fixed.0 + f * (d.position[0] - fixed.0), fixed.1 + f * (d.position[1] - fixed.1)];
+    (p, (d.scale * f).max(0.1), (d.scale_width * f).max(0.1))
+}
+
+/// A handle drag's size factor (the pointer at `cur` against the handle's start, measured from
+/// the opposite corner or edge, 0.01–100) and that fixed point in frame pixels; `None` for a move.
+fn handle_factor(d: &Drag, cur: Pos2, k: (f32, f32)) -> Option<(f64, (f64, f64))> {
+    let (kx, ky) = (f64::from(k.0.max(1e-6)), f64::from(k.1.max(1e-6)));
+    let &(_, hx, hy) = d.handle.and_then(|h| HANDLES.get(h))?;
     let [bx, by, bw, bh] = d.bx;
     let (hx, hy) = (f64::from(hx), f64::from(hy));
     // the handle and the fixed point opposite it, in frame pixels
@@ -571,9 +658,36 @@ fn drag_target(d: &Drag, cur: Pos2, k: (f32, f32), snapped: egui::Vec2) -> ([f64
         if l2 > 1e-9 { (d1.0 * d0.0 + d1.1 * d0.1) / l2 } else { 1.0 }
     };
     let f = if f.is_finite() { f.clamp(0.01, 100.0) } else { 1.0 };
-    // uniform scaling about the anchor (the position): the fixed point stays where it is
-    let p = [fixed.0 + f * (d.position[0] - fixed.0), fixed.1 + f * (d.position[1] - fixed.1)];
-    (p, (d.scale * f).max(0.1), (d.scale_width * f).max(0.1))
+    Some((f, fixed))
+}
+
+/// Whether handle `n` (index in [`HANDLES`]) is a corner.
+fn is_corner(n: usize) -> bool {
+    HANDLES.get(n).is_some_and(|(_, fx, fy)| *fx != 0.5 && *fy != 0.5)
+}
+
+/// Scroll notches of the Alt/Option wheel events this frame (up / away = positive); the modifiers
+/// are read from each event as well as the key state, since the control channel's `ui.scroll`
+/// only sets them on the event.
+fn alt_wheel_notches(ui: &egui::Ui) -> f64 {
+    ui.input(|inp| {
+        inp.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::MouseWheel { unit, delta, modifiers, .. } if modifiers.alt || inp.modifiers.alt => {
+                    let d = f64::from(if delta.y != 0.0 { delta.y } else { delta.x });
+                    let n = match unit {
+                        egui::MouseWheelUnit::Line => d,
+                        egui::MouseWheelUnit::Point => d / WHEEL_NOTCH_POINTS,
+                        egui::MouseWheelUnit::Page => d * 3.0,
+                    };
+                    n.is_finite().then_some(n)
+                }
+                _ => None,
+            })
+            .sum::<f64>()
+            .clamp(-10.0, 10.0)
+    })
 }
 
 /// Drawn over the Program picture after the graphics and mask overlays.
@@ -613,6 +727,7 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     let press_alt = ui.data(|d| d.get_temp::<bool>(press_alt_id)).unwrap_or(false);
     let mut actions: Vec<(String, Value)> = Vec::new();
     let mut box_resp: Option<egui::Response> = None;
+    let mut wheel_zoomed = false;
     let painter = ui.painter().with_clip_rect(pic.expand(8.0));
     if let Some(i) = &shown {
         let r = Rect::from_min_max(to_screen(i.bx[0], i.bx[1]), to_screen(i.bx[0] + i.bx[2], i.bx[1] + i.bx[3]));
@@ -654,13 +769,19 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
             && let Some((position, scale, scale_width, uniform)) = motion_of(app, i.clip, frame)
         {
             let start = ui.input(|inp| inp.pointer.press_origin()).or(sr.interact_pointer_pos()).unwrap_or(r.center());
-            // Alt/Option-drag inside the box pans the picture inside a circle or square
-            let alt = handle.is_none() && (press_alt || ui.input(|inp| inp.modifiers.alt));
-            let pan = if alt && (i.shape == "circle" || i.shape == "square") { Some(i.pan) } else { None };
-            if alt && pan.is_none() {
-                app.ui.status = "Alt-drag pans inside a circle or square: give the clip a shape first (Layout ▸ Shape)".into();
+            // Alt/Option-drag inside the box pans the picture inside the shape; on a corner handle
+            // it zooms the picture (the box stays put)
+            let alt = press_alt || ui.input(|inp| inp.modifiers.alt);
+            let pan_drag = alt && handle.is_none();
+            let zoom_drag = alt && handle.is_some_and(is_corner);
+            let pan = if pan_drag && i.croppable() { Some(i.pan) } else { None };
+            let zoom = if zoom_drag && i.croppable() { Some(i.zoom) } else { None };
+            if pan_drag && pan.is_none() {
+                app.ui.status = "Alt-drag pans inside a circle, square or rounded shape: give the clip a shape first (Layout ▸ Shape)".into();
+            } else if zoom_drag && zoom.is_none() {
+                app.ui.status = "Alt-drag of a corner zooms inside a circle, square or rounded shape: give the clip a shape first (Layout ▸ Shape)".into();
             } else {
-                drag = Some(Drag { clip: i.clip, handle: *handle, start, screen: r, bx: i.bx, position, scale, scale_width, uniform, begun: false, pan });
+                drag = Some(Drag { clip: i.clip, handle: *handle, start, screen: r, bx: i.bx, position, scale, scale_width, uniform, begun: false, pan, zoom });
             }
         }
         let dragging = starts.iter().any(|(_, sr)| sr.dragged());
@@ -675,7 +796,16 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                 _ => (cur - d.start, Vec::new()),
             };
             crate::panels::monitor_view::draw_snap_lines(&painter, pic, &lines);
-            if let Some(pan0) = d.pan {
+            if let Some(z0) = d.zoom {
+                if (cur - d.start).length() > 0.5
+                    && let Some((f, _)) = handle_factor(d, cur, k)
+                {
+                    let begin = !d.begun;
+                    d.begun = true;
+                    // drag outward = zoom in; one merged undo step for the whole drag (`layout.zoom`)
+                    actions.push(("layout.zoom".into(), json!({"clips": [d.clip.0], "zoom": z0 * f, "merge": true, "begin": begin})));
+                }
+            } else if let Some(pan0) = d.pan {
                 if (cur - d.start).length() > 0.5
                     && let Some([dx, dy]) = pan_target(app, d.clip, frame, pan0, cur - d.start, k)
                 {
@@ -699,6 +829,22 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
                 actions.push(("layout.set".into(), params));
             }
         }
+        // Alt/Option + scroll over the box zooms the picture inside the shape (notches less than
+        // 400 ms apart are one undo step)
+        let notches = if drag.is_none() && hover.is_some_and(|h| r.contains(h)) { alt_wheel_notches(ui) } else { 0.0 };
+        if notches != 0.0 {
+            if let Some(name) = filmcraft_engine::scenes::scene_owning(&app.session, i.clip) {
+                app.ui.status = format!("This clip's layout is set by the scene \"{name}\". Open Sequence ▸ Scenes… to change it.");
+            } else if !i.croppable() {
+                app.ui.status = "Alt-scroll zooms inside a circle, square or rounded shape: give the clip a shape first (Layout ▸ Shape)".into();
+            } else {
+                let now = ui.input(|inp| inp.time);
+                let begin = !app.ui.layout.last_zoom.is_some_and(|(t, c)| c == i.clip && now - t >= 0.0 && now - t < WHEEL_MERGE_SECONDS);
+                app.ui.layout.last_zoom = Some((now, i.clip));
+                actions.push(("layout.zoom".into(), json!({"clips": [i.clip.0], "by": WHEEL_ZOOM_STEP.powf(notches), "merge": true, "begin": begin})));
+                wheel_zoomed = true;
+            }
+        }
         box_resp = Some(resp);
     }
     // ---- run the drag's edits (`layout.set` with `merge`: one undo step per drag)
@@ -711,7 +857,18 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     if let Some(d) = &drag {
         refresh(app);
         if let Some(i) = info(app) {
-            app.ui.status = if d.pan.is_some() { format!("Pan: {:.0}, {:.0} px", i.pan[0], i.pan[1]) } else { format!("Layout: {}", place_label(&i.at)) };
+            app.ui.status = if d.pan.is_some() {
+                format!("Pan: {:.0}, {:.0} px", i.pan[0], i.pan[1])
+            } else if d.zoom.is_some() {
+                zoom_status(i.zoom)
+            } else {
+                format!("Layout: {}", place_label(&i.at))
+            };
+        }
+    } else if wheel_zoomed {
+        refresh(app);
+        if let Some(z) = info(app).map(|i| i.zoom) {
+            app.ui.status = zoom_status(z);
         }
     }
     ui.data_mut(|d| match drag {
@@ -738,6 +895,11 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     {
         select_at(app, p, pic, k);
     }
+}
+
+/// The status bar text of a zoom: "Zoom: 150 %".
+fn zoom_status(z: f64) -> String {
+    format!("Zoom: {:.0} %", z * 100.0)
 }
 
 /// A click at `p` (screen): select the top-most clip there, or the next one on a repeated click.
@@ -785,6 +947,7 @@ mod tests {
             uniform: true,
             begun: false,
             pan: None,
+            zoom: None,
         }
     }
 
@@ -815,7 +978,8 @@ mod tests {
 
     #[test]
     fn place_keeps_size_and_margin_of_a_placed_clip_only() {
-        let mut i = Info { clip: ClipId(1), at: "bottomRight".into(), size: 33.0, margin: Some(5.0), shape: "free".into(), bx: [0.0; 4], pan: [0.0; 2] };
+        let mut i =
+            Info { clip: ClipId(1), at: "bottomRight".into(), size: 33.0, margin: Some(5.0), shape: "free".into(), bx: [0.0; 4], pan: [0.0; 2], zoom: 1.0 };
         assert_eq!(place_params(Some(&i), "topLeft"), json!({"at": "topLeft", "size": 33.0, "margin": 5.0}));
         assert_eq!(place_params(Some(&i), "full"), json!({"at": "full"}));
         i.at = "full".into();
