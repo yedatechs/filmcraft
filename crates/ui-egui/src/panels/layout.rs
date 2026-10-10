@@ -695,13 +695,26 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     if app.ui.tool != Tool::Selection || app.ui.mask_pen.is_some() || app.playback.playing || frame.0 == 0 || frame.1 == 0 {
         return;
     }
-    // a mask being edited owns the picture
+    let k = (pic.width() / frame.0 as f32, pic.height() / frame.1 as f32);
+    // a mask being edited owns the picture, except that a click outside it hands the picture back:
+    // the mask is deselected and the clip under the pointer selected (otherwise a fresh redaction
+    // would leave the rest of the picture dead to clicks)
     if app.session.state.selected_mask.is_some() {
+        let click = ui.ctx().read_response(egui::Id::new("gfx-overlay")).filter(|r| r.clicked()).and_then(|r| r.interact_pointer_pos());
+        let body = app.auto.find("program.mask.body").map(|e| Rect::from_min_size(pos2(e.rect[0], e.rect[1]), vec2(e.rect[2], e.rect[3])).expand(20.0));
+        if let Some(p) = click
+            && pic.contains(p)
+            && !body.is_some_and(|b| b.contains(p))
+        {
+            if let Err(e) = app.session.execute("masks.select", json!({"none": true})) {
+                app.ui.status = e.to_string();
+            }
+            select_at(app, p, pic, k);
+        }
         return;
     }
     refresh(app);
     let t = app.tokens;
-    let k = (pic.width() / frame.0 as f32, pic.height() / frame.1 as f32);
     let to_screen = |x: f64, y: f64| pos2(pic.min.x + x as f32 * k.0, pic.min.y + y as f32 * k.1);
     let quads: Vec<[Pos2; 4]> = crate::panels::graphics::visible_layers(app, pic, frame).iter().map(|v| v.quad()).collect();
     let over_graphic = |p: Pos2| quads.iter().any(|q| in_quad(q, p));

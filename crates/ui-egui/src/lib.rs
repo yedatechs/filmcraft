@@ -1051,6 +1051,8 @@ impl FilmcraftApp {
         if ctx.egui_wants_keyboard_input() || self.dialog == Some(Dialog::Shortcuts) {
             return;
         }
+        // Enter belongs to an open dialog (its Apply / OK), never to Render Effects In to Out
+        let dialog_open = self.dialog.is_some() || self.ui.transcript_pause_dialog || self.ui.transcript_scenes_dialog || self.ui.extras.dialog.is_some();
         // Esc cancels a dynamic trim in progress
         if self.session.trim_play.dynamic.is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             let _ = self.session.execute("trim.cancelDynamic", json!({}));
@@ -1074,6 +1076,9 @@ impl FilmcraftApp {
             let panel = self.bindings.iter().filter(|b| b.3.as_deref() == Some(focused));
             let app_wide = self.bindings.iter().filter(|b| b.3.is_none());
             for (m, k, id, _) in panel.chain(app_wide) {
+                if dialog_open && *k == egui::Key::Enter {
+                    continue;
+                }
                 if i.consume_key(*m, *k) {
                     let is_repeat = repeats.iter().any(|(rm, rk)| rk == k && rm.matches_logically(*m));
                     if NO_REPEAT.contains(&id.as_str()) && is_repeat {

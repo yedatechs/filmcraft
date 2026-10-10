@@ -44,6 +44,9 @@ Paste Insert in the Timeline, the Audio Track Mixer Loop).
 FilmCraft Default keeps its own keys where they differ (Shift+E is Clip ▸ Enable there, so Export
 Frame has no default key; the Premiere preset moves Shift+E to Export Frame and Enable to ⇧⌘E).
 
+While a dialog is open (Remove Pauses, Scenes…, Add Tracks…, the clip dialogs, Preferences…), Return
+belongs to the dialog (Apply / OK) and never fires its application shortcut, Render Effects In to Out.
+
 ## Skipped Premiere default shortcuts
 
 | Premiere command (key, scope) | Reason |

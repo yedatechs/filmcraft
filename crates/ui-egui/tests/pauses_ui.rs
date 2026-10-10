@@ -196,3 +196,23 @@ fn remove_pauses_dialog_with_threshold_and_live_count() {
     assert!(d.ids("text.pauses.").is_empty(), "Cancel closes the dialog");
     assert_eq!(d.cuts(), 0);
 }
+
+#[test]
+fn return_applies_the_dialog_instead_of_rendering_previews() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    d.frames(2);
+    d.click("text.tab.Transcript");
+    gappy(&mut d);
+    d.click("text.transcript.removePauses");
+    d.ok("ui.set", json!({"menuDialog": {"pauseMin": 0.5, "pauseKeep": 0.15}}));
+    d.frames(2);
+    assert!(d.label("text.pauses.count").starts_with("2 pauses,"));
+    // Return is Render Effects In to Out application-wide; with the dialog open it is its Apply
+    d.ok("ui.key", json!({"key": "Enter"}));
+    d.frames(3);
+    assert!(d.ids("text.pauses.").is_empty(), "Return applies and closes the dialog");
+    assert_eq!(d.cuts(), 2);
+    let jobs = d.exec("jobs.list", json!({}));
+    assert_eq!(jobs, json!([]), "no preview render was started: {jobs}");
+}

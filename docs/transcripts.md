@@ -48,7 +48,7 @@ enabled when the sequence has live words) and Sequence ▸ Transcript ▸ Remove
 | `text.pauses.keep` | Shorten to (seconds, 0–2, step 0.05, never above the minimum; default 0.15) |
 | `text.pauses.count` | Live "N pauses, S.s s" from `transcript.pauses` (the element's label carries the text) |
 | `text.pauses.apply` | Apply: runs `transcript.removePauses {minSeconds, keepSeconds}` and closes; disabled (label "Apply (no pauses)") when the count is 0 |
-| `text.pauses.cancel` | Cancel (or Escape) |
+| `text.pauses.cancel` | Cancel (or Escape); Return applies |
 
 The shortened pauses show crossed out in the transcript (wordless cut spans) and restore on click;
 one Edit ▸ Undo brings them all back. The two values are remembered between sessions

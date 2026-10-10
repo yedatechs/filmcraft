@@ -306,3 +306,23 @@ fn the_status_bar_names_the_running_job_with_the_eta_jobs_list_reports() {
         assert_eq!(filmcraft_ui_egui::job_verb(label), verb);
     }
 }
+
+#[test]
+fn a_click_outside_the_new_mask_hands_the_picture_back() {
+    let mut d = Driver::demo();
+    d.exec("playhead.set", json!({"seconds": 2.5}));
+    let clip = first_clip();
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.redact.static.fill"}));
+    d.frames(3);
+    d.draw((0.2, 0.2), (0.4, 0.4));
+    assert_eq!(d.redactions(clip).len(), 1);
+    assert!(d.harness.state().session.state.selected_mask.is_some(), "the new mask is selected, its handles show");
+    assert!(d.ids("program.layout.box").is_empty(), "the layout box steps aside while a mask is selected");
+    // a click on the picture far from the mask deselects it and selects the clip there
+    d.ok("ui.click", json!({"id": "program.picture", "fx": 0.9, "fy": 0.85}));
+    d.frames(3);
+    assert!(d.harness.state().session.state.selected_mask.is_none(), "click outside the mask deselects it");
+    assert_eq!(d.harness.state().session.state.selection, vec![filmcraft_project::ClipId(clip)], "and selects the clip under the pointer");
+    assert_eq!(d.ids("program.layout.box"), ["program.layout.box"], "the layout box is back");
+    assert_eq!(d.redactions(clip).len(), 1, "the redaction itself stays");
+}

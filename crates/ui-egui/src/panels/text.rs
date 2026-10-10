@@ -966,6 +966,10 @@ pub fn pauses_dialog(app: &mut FilmcraftApp, ctx: &egui::Context) {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         action = Some(false);
     }
+    // Return applies (when there is something to shorten), like the Apply button
+    if action.is_none() && count > 0 && ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
+        action = Some(true);
+    }
     match action {
         Some(false) => app.ui.transcript_pause_dialog = false,
         Some(true) => {

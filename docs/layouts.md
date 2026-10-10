@@ -101,7 +101,9 @@ above, so it is one undo step.
   of a corner handle zooms** instead of scaling the clip: dragging outward zooms in by the same
   ratio the plain drag would scale, the box does not move, one undo step. Clips arranged by a
   scene refuse moves, scales, pans and zooms alike. A whole drag is one undo step. The overlay
-  is hidden while playing, while a mask is selected for editing and while the pen draws a mask.
+  is hidden while playing, while a mask is selected for editing and while the pen draws a mask. A
+  click on the picture outside a selected mask (for example the box a Redact Area… just drew)
+  deselects the mask and selects the clip under the pointer, so the picture never goes dead.
 - **Layout menu.** Right-click the box, open the timeline clip menu's **Layout** submenu, or use
   **Clip ▸ Layout**. All three show the same entries: Place ▸ (Top Left … Bottom Right, Full),
   Size ▸ (20 / 25 / 33 / 50 %), Shape ▸ (Circle, Rounded, Square, Free), Pan ▸ (Centre on Left
