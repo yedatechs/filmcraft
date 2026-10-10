@@ -20,12 +20,25 @@ const MAX_COMPARE_WORDS: usize = 64;
 const MAX_WINDOW: usize = 64;
 /// Most retake cue words stripped from the start of an utterance.
 const MAX_CUE_WORDS: usize = 8;
-/// Words that open a retake ("okay again, …"); stripped before comparing.
-const CUES: [&str; 10] = ["okay", "ok", "again", "sorry", "let", "let's", "lets", "take", "redo", "wait"];
+/// Words that open a retake ("okay again, …") or are only a lead-in ("yo", "um"); stripped from the
+/// start of an utterance before comparing.
+const CUES: [&str; 15] = ["okay", "ok", "again", "sorry", "let", "let's", "lets", "take", "redo", "wait", "yo", "alright", "right", "um", "uh"];
 /// How much a retake cue lowers the grouping threshold.
 const CUE_BONUS: f32 = 0.15;
 /// Shortest opening compared by [`similarity`]'s opening-overlap term.
 const OPENING_WORDS: usize = 4;
+/// How far back (in content words, stutters collapsed) a restart looks for the phrase it repeats: a
+/// speaker who restarts says the phrase again within a few words of the abandoned attempt.
+const MAX_LOOKBACK: usize = 10;
+/// Longest false start (words from the first occurrence to the second) a two-word repeat may close;
+/// a repeat of three or more words counts up to [`MAX_LOOKBACK`]. Two words repeat naturally ("the
+/// river … the river"), so they only count close together.
+const SHORT_REPEAT_SPAN: usize = 6;
+/// Most restarts split out of one utterance (bounds the work on a hostile, endless utterance).
+const MAX_RESTARTS: usize = 64;
+/// Words after which a repeated phrase continues the sentence ("I went to the store and then I went
+/// to the bank", "three days to use it and three days to decide") instead of restarting it.
+const JOINERS: [&str; 14] = ["and", "then", "but", "or", "nor", "so", "because", "cause", "while", "when", "until", "if", "plus", "yet"];
 
 /// Parameters of [`detect`]. Every value is treated as hostile: out-of-range values are clamped.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -118,6 +131,11 @@ fn similarity_with(a: &[String], b: &[String], min_prefix: usize) -> f32 {
     if a.len() >= min_prefix.max(1) && b.starts_with(a) {
         return 1.0;
     }
+    // A shorter `a` against the head of `b`: a false start that differs in a word or two.
+    let near_prefix = match b.get(..a.len()) {
+        Some(head) if a.len() >= min_prefix.max(2) && a.len() < b.len() => 1.0 - levenshtein(a, head) as f32 / a.len() as f32,
+        _ => 0.0,
+    };
     let longest = a.len().max(b.len());
     let n = OPENING_WORDS.min(longest);
     let run = a.iter().zip(b.iter()).take(n).take_while(|(x, y)| x == y).count();
@@ -127,12 +145,13 @@ fn similarity_with(a: &[String], b: &[String], min_prefix: usize) -> f32 {
     let union = sa.union(&sb).count();
     let jaccard = if union == 0 { 0.0 } else { sa.intersection(&sb).count() as f32 / union as f32 };
     let edit = 1.0 - levenshtein(a, b) as f32 / longest as f32;
-    opening.max(jaccard).max(edit).clamp(0.0, 1.0)
+    opening.max(jaccard).max(edit).max(near_prefix).clamp(0.0, 1.0)
 }
 
 /// How alike two utterances are, 0..=1, on normalised words ([`normalize_word`]): the best of the
 /// shared opening (the first up-to-four words matching in order), token Jaccard overlap and
-/// `1 - word edit distance / longer length`. An `a` of two or more words that is the opening of `b`
+/// `1 - word edit distance / longer length`; a shorter `a` is also compared with the head of `b` as
+/// long as `a` (`1 - edit distance / len(a)`). An `a` of two or more words that is the opening of `b`
 /// (a false start) scores 1. Utterances are compared on their first 64 words.
 pub fn similarity(a: &[String], b: &[String]) -> f32 {
     similarity_with(a, b, DetectParams::default().min_words)
@@ -156,43 +175,78 @@ fn strip_cues(words: &[String]) -> (&[String], bool) {
     (rest, cue)
 }
 
-/// One utterance prepared for comparison.
+/// One utterance part prepared for comparison.
 struct Utt {
     range: TimeRange,
+    /// Normalised content words, stutters collapsed, at most [`MAX_COMPARE_WORDS`].
     words: Vec<String>,
     cue: bool,
+    /// This part is a false start of the next part (a restart without a pause, [`restarts`]).
+    link: bool,
 }
 
-/// Where `words` (an utterance's content words) first restarts its own opening: the smallest
-/// `j >= min_words` (at most [`MAX_COMPARE_WORDS`]) such that `words[j..]` begins with all of
-/// `words[..j]`, so the part before `j` is a false start of what follows. `None` for openings
-/// shorter than `min_words`.
-fn restart(words: &[String], min_words: usize) -> Option<usize> {
-    let opening = words.get(..min_words)?;
-    let last = MAX_COMPARE_WORDS.min(words.len() / 2);
-    (min_words..=last).find(|&j| words.get(j..).is_some_and(|tail| tail.starts_with(opening) && words.get(..j).is_some_and(|head| tail.starts_with(head))))
+/// `words` with each run of one repeated word kept once ("so so now" reads "so now"), and for each
+/// kept word its index in `words` (the first of its run).
+fn collapse_stutters(words: &[String]) -> (Vec<String>, Vec<usize>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut index = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if out.last() != Some(w) {
+            out.push(w.clone());
+            index.push(i);
+        }
+    }
+    (out, index)
 }
 
-/// The content-word positions where `words` restarts its opening without a pause ("what a what a
-/// time" splits before the second "what"), repeated on each remainder. Openings are at least two
-/// words (`min_words`, raised to 2) so a stutter like "the the" is not a restart. Strictly
-/// increasing.
-fn restarts(words: &[String], min_words: usize) -> Vec<usize> {
+/// The start `i` of the nearest earlier occurrence (at or after `floor`, at most [`MAX_LOOKBACK`]
+/// words back) of a phrase of at least `m` words that `words` says again at `j`, if that repeat is a
+/// restart: two shared words only within [`SHORT_REPEAT_SPAN`] words, three or more anywhere in the
+/// look-back; the repeat must not follow a joining word ([`JOINERS`], "… and then I went …") and must
+/// not extend to the left (then it repeats from an earlier position, which was already examined).
+fn repeat_before(words: &[String], floor: usize, j: usize, m: usize) -> Option<usize> {
+    let before = j.checked_sub(1).and_then(|p| words.get(p))?;
+    if JOINERS.contains(&before.as_str()) {
+        return None;
+    }
+    let lo = floor.max(j.saturating_sub(MAX_LOOKBACK));
+    (lo..j).rev().find(|&i| {
+        let span = j.saturating_sub(i);
+        let shared = (0..span).take_while(|&t| words.get(i.saturating_add(t)).is_some_and(|w| words.get(j.saturating_add(t)) == Some(w))).count();
+        if shared < m || (shared < 3 && span > SHORT_REPEAT_SPAN) {
+            return false;
+        }
+        i == floor || i.checked_sub(1).and_then(|p| words.get(p)) != Some(before)
+    })
+}
+
+/// Where `words` (an utterance's content words, stutters collapsed) restarts without a pause:
+/// `(i, j)` pairs where the phrase at `i` (at least `min_words` words, raised to 2) is said again at
+/// `j` within a few words ([`repeat_before`]), so `i..j` is a false start of what follows `j`.
+/// Scanned left to right, each `i` at or after the previous `j`; at most [`MAX_RESTARTS`] pairs, and
+/// `O(words × MAX_LOOKBACK²)`. "what a what a time" restarts at (0, 2); a stutter ("the the") was
+/// collapsed and never restarts.
+fn restarts(words: &[String], min_words: usize) -> Vec<(usize, usize)> {
     let m = min_words.max(2);
     let mut out = Vec::new();
-    let mut start = 0usize;
-    // Each step moves `start` forward by at least `m`, so this ends within `words.len() / 2` steps.
-    while let Some(j) = words.get(start..).and_then(|rest| restart(rest, m)) {
-        start = start.saturating_add(j);
-        out.push(start);
+    let mut floor = 0usize;
+    for j in 1..words.len() {
+        if out.len() >= MAX_RESTARTS {
+            break;
+        }
+        if let Some(i) = repeat_before(words, floor, j, m) {
+            out.push((i, j));
+            floor = j;
+        }
     }
     out
 }
 
 /// The comparison units of one utterance (word indices `r` of `words`): normalised words with the
-/// leading retake cues stripped, split where the utterance restarts its own opening ([`restarts`]).
-/// Each part spans from its first word's start to its last word's end; the first part keeps the
-/// cue words and the cue flag.
+/// leading retake cues stripped and stutters collapsed, split where the utterance restarts a phrase
+/// ([`restarts`]): before the first occurrence and before the repeat. Each part spans from its first
+/// word's start to its last word's end; the first part keeps the cue words and the cue flag; a part
+/// that is a false start of the next one is `link`ed to it.
 fn utterance_parts(words: &[Word], r: Range<usize>, min_words: usize) -> Vec<Utt> {
     let mut norm: Vec<String> = Vec::new();
     let mut index: Vec<usize> = Vec::new();
@@ -205,74 +259,97 @@ fn utterance_parts(words: &[Word], r: Range<usize>, min_words: usize) -> Vec<Utt
     }
     let (content, cue) = strip_cues(&norm);
     let skipped = norm.len().saturating_sub(content.len());
-    // (first word index, first content index) of each part, then the end.
-    let mut bounds: Vec<(usize, usize)> = vec![(r.start, 0)];
-    for c in restarts(content, min_words) {
-        if let Some(&w) = index.get(skipped.saturating_add(c)) {
-            bounds.push((w, c));
+    let (content, kept) = collapse_stutters(content);
+    let word_at = |c: usize| kept.get(c).and_then(|&k| index.get(skipped.saturating_add(k))).copied();
+    // (first word index, first content index, false start of the next part) of each part, then the end.
+    let mut bounds: Vec<(usize, usize, bool)> = vec![(r.start, 0, false)];
+    for (i, j) in restarts(&content, min_words) {
+        let (Some(wi), Some(wj)) = (word_at(i), word_at(j)) else { continue };
+        match bounds.last_mut() {
+            Some(last) if last.1 == i => last.2 = true,
+            _ => bounds.push((wi, i, true)),
         }
+        bounds.push((wj, j, false));
     }
-    bounds.push((r.end, content.len()));
+    bounds.push((r.end, content.len(), false));
     bounds
         .windows(2)
         .enumerate()
         .filter_map(|(k, pair)| {
-            let (&(wa, ca), &(wb, cb)) = (pair.first()?, pair.get(1)?);
+            let (&(wa, ca, link), &(wb, cb, _)) = (pair.first()?, pair.get(1)?);
             let ws = words.get(wa..wb)?;
             let (first, last) = (ws.first()?, ws.last()?);
             let part: Vec<String> = content.get(ca..cb)?.iter().take(MAX_COMPARE_WORDS).cloned().collect();
-            Some(Utt { range: TimeRange::from_bounds(first.start, last.end.max(first.start)), words: part, cue: cue && k == 0 })
+            Some(Utt { range: TimeRange::from_bounds(first.start, last.end.max(first.start)), words: part, cue: cue && k == 0, link })
         })
         .collect()
 }
 
-/// Group the utterances of `t` that repeat a line, in media order. An utterance that restarts its
-/// own opening without a pause ("what a what a time to be alive") is first split there, so the
-/// false start and the full line are compared like pause-separated takes. Each utterance is compared with
-/// the next `window` utterances that start within `max_gap` of its end; the first one similar
-/// enough (`similarity >= threshold`, the threshold lowered by 0.15 when the later utterance opens
-/// with a retake cue such as "okay", "again" or "one more") joins its group and the chain continues
-/// from it. Groups have at least two takes; ids are 0 (the engine assigns them) and `manual` is
-/// false. Deterministic, and `O(utterances × window)`.
+/// Group the utterances of `t` that repeat a line, in media order. An utterance that restarts a
+/// phrase without a pause ("what a what a time to be alive", "and they don't even have a and they
+/// don't even have a five hour window") is first split there ([`restarts`]); the false starts and
+/// the part they restart form one unit whose parts are takes of one line. Each unit is compared with
+/// the next `window` units that start within `max_gap` of its end: its last part against the other
+/// unit's first and last parts. The first one similar enough (`similarity >= threshold`, the
+/// threshold lowered by 0.15 when the later unit opens with a retake cue such as "okay", "again" or
+/// "one more") joins its group and the chain continues from it. Groups have at least two takes; ids
+/// are 0 (the engine assigns them) and `manual` is false. Deterministic, and
+/// `O(utterances × window)`.
 pub fn detect(t: &Transcript, p: &DetectParams) -> Vec<TakeGroup> {
     let min_words = p.min_words.max(1);
     let window = p.window.min(MAX_WINDOW);
     let threshold = p.threshold();
     let utts: Vec<Utt> = utterances(&t.words, p.pause).into_iter().flat_map(|r| utterance_parts(&t.words, r, p.min_words)).collect();
-    let eligible = |u: &Utt| u.words.len() >= min_words;
-    let mut used = vec![false; utts.len()];
+    // Units: runs of parts each linked to the next (a restart chain), or a single part.
+    let mut units: Vec<Range<usize>> = Vec::new();
+    let mut from = 0usize;
+    for (k, u) in utts.iter().enumerate() {
+        if !u.link {
+            units.push(from..k + 1);
+            from = k + 1;
+        }
+    }
+    if from < utts.len() {
+        units.push(from..utts.len());
+    }
+    let head = |u: &Range<usize>| utts.get(u.start);
+    let tail = |u: &Range<usize>| u.end.checked_sub(1).and_then(|e| utts.get(e));
+    let eligible = |u: &Range<usize>| tail(u).is_some_and(|t| t.words.len() >= min_words);
+    let mut used = vec![false; units.len()];
     let mut groups = Vec::new();
-    for (start, su) in utts.iter().enumerate() {
+    for (start, su) in units.iter().enumerate() {
         if used.get(start).copied().unwrap_or(true) || !eligible(su) {
             continue;
         }
         let mut members = vec![start];
         let mut k = start;
-        // Each step moves `k` strictly forward, so the chain ends within `utts.len()` steps.
-        while let Some(ku) = utts.get(k) {
-            let end = k.saturating_add(window).min(utts.len().saturating_sub(1));
+        // Each step moves `k` strictly forward, so the chain ends within `units.len()` steps.
+        while let Some(ku) = units.get(k).and_then(tail) {
+            let end = k.saturating_add(window).min(units.len().saturating_sub(1));
             let next = (k + 1..=end).find(|&j| {
-                let Some(ju) = utts.get(j) else { return false };
-                if used.get(j).copied().unwrap_or(true) || !eligible(ju) {
+                let Some(jr) = units.get(j) else { return false };
+                let (Some(jh), Some(jt)) = (head(jr), tail(jr)) else { return false };
+                if used.get(j).copied().unwrap_or(true) || !eligible(jr) {
                     return false;
                 }
-                if ju.range.start.0.saturating_sub(ku.range.end().0) > p.max_gap.0 {
+                if jh.range.start.0.saturating_sub(ku.range.end().0) > p.max_gap.0 {
                     return false;
                 }
-                let thr = if ju.cue { threshold - CUE_BONUS } else { threshold };
-                similarity_with(&ku.words, &ju.words, min_words) >= thr
+                let thr = if jh.cue { threshold - CUE_BONUS } else { threshold };
+                similarity_with(&ku.words, &jh.words, min_words) >= thr || similarity_with(&ku.words, &jt.words, min_words) >= thr
             });
             let Some(j) = next else { break };
             members.push(j);
             k = j;
         }
-        if members.len() >= 2 {
+        let parts: Vec<&Utt> = members.iter().filter_map(|&m| units.get(m)).flat_map(|r| utts.get(r.clone()).unwrap_or(&[])).collect();
+        if parts.len() >= 2 {
             for &m in &members {
                 if let Some(u) = used.get_mut(m) {
                     *u = true;
                 }
             }
-            let mut takes: Vec<Take> = members.iter().filter_map(|&m| utts.get(m)).map(|u| Take::new(u.range)).collect();
+            let mut takes: Vec<Take> = parts.iter().map(|u| Take::new(u.range)).collect();
             takes.sort_by_key(|t| (t.range.start, t.range.duration));
             groups.push(TakeGroup { id: 0, takes, ..Default::default() });
         }

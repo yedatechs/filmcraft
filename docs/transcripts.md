@@ -79,10 +79,14 @@ as "okay again" help) and stores the matches as **take groups** on the transcrip
 **live** when the sequence plays at least half of its media, and switching takes is an ordinary
 timeline edit (the live takes are extracted, the chosen take's media is put back at the first of
 their positions), so undo, redo and export need nothing new, and the other takes show crossed out.
-A false start needs no pause: an utterance that restarts its own opening ("what a… what a time to
-be alive", the first two or more words said again, the part before being an opening of what
-follows) is split there, so "what a" becomes a crossed-out take of the full line; a stutter
-("the the") or a phrase repeated mid-sentence is not split.
+A false start needs no pause and can sit anywhere in an utterance: a phrase of two or more words
+said again within a few words ("and they don't even have a… and they don't even have a five hour
+window"; two words within six, three or more within ten) splits the utterance before both
+occurrences, and the false starts become crossed-out takes of the line they restart, the last one
+live. A repeat right after a joining word ("… and then I went …") continues the sentence and is not
+split; a stutter ("so so now", "the the") is read as one word and never splits. Lead-in and retake
+words at the start of an utterance (`yo`, `um`, `uh`, `alright`, `right`, `okay`, `again`, …) are
+ignored when comparing.
 
 | Command | What it does |
 |---|---|

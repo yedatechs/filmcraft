@@ -22,6 +22,10 @@ A `Transcript` SHALL carry `takes: Vec<TakeGroup>`; a `TakeGroup` has an id, an 
 - **WHEN** an utterance of two or more words is the opening of the next utterance
 - **THEN** both are takes of one group
 
+#### Scenario: Restart without a pause
+- **WHEN** an utterance says a phrase of two or more words again within a few words (two words within six, three or more within ten, not right after a joining word such as "and" or "then"), e.g. "and they don't even have a and they don't even have a five hour window"
+- **THEN** it is split before both occurrences and the parts are takes of one group in order, so the last part is the default live take; an immediately repeated word ("so so", "the the") is read once and never splits
+
 #### Scenario: Unrelated sentences
 - **WHEN** consecutive utterances share no content words
 - **THEN** no group is made

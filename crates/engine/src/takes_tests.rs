@@ -399,3 +399,32 @@ fn detect_finds_a_false_start_without_a_pause() {
     assert_eq!(g[0]["active"], json!(1));
     assert_eq!(live_text(&mut s), "what a time to be alive.");
 }
+
+#[test]
+fn detect_finds_a_restart_in_the_middle_of_a_line() {
+    // The owner's line 4: "and they don't even have a" said again without a pause, then finished.
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let item = s.active_sequence().unwrap().audio_tracks[0].items[0].item;
+    let text = "and they don't even have a and they don't even have a five hour window";
+    let mut t = Transcript { language: "en".into(), ..Default::default() };
+    t.words.extend(line(&text.split(' ').collect::<Vec<_>>(), 1.2)); // 1.2–4.95, inside the clip
+    s.execute("transcript.set", json!({"item": item.0, "transcript": serde_json::to_value(&t).unwrap()})).unwrap();
+    let r = s.execute("takes.detect", json!({})).unwrap();
+    assert_eq!(r["items"][0]["groups"], json!(1), "{r}");
+    let g = groups(&mut s);
+    assert_eq!(g.len(), 1, "{g:?}");
+    let takes = g[0]["takes"].as_array().unwrap();
+    assert_eq!(takes.len(), 2, "{g:?}");
+    assert_eq!(takes[0]["text"], json!("and they don't even have a"));
+    assert_eq!(takes[1]["text"], json!("and they don't even have a five hour window"));
+    assert_eq!(g[0]["active"], json!(1));
+    let live: Vec<bool> = takes.iter().map(|t| t["live"].as_bool().unwrap()).collect();
+    assert_eq!(live, [false, true]);
+    // The false start is crossed out on the timeline; the full line plays.
+    assert_eq!(live_text(&mut s), "and they don't even have a five hour window");
+    let cuts = s.execute("transcript.cuts", json!({})).unwrap();
+    let cut_words: Vec<String> =
+        cuts["cuts"].as_array().unwrap().iter().flat_map(|c| c["words"].as_array().unwrap().iter().map(|w| w["text"].as_str().unwrap().to_string())).collect();
+    assert_eq!(cut_words.join(" "), "and they don't even have a");
+}
