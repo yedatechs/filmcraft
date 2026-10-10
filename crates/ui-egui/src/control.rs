@@ -232,10 +232,11 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                 let was_open = app.ui.record.open;
                 let devices = app.ui.record.devices.take();
                 let preview = app.ui.record.preview.clone();
+                let overlay_cache = app.ui.record.overlay_cache.clone();
                 let mut cur = serde_json::to_value(&app.ui.record).unwrap_or_default();
                 merge(&mut cur, patch);
                 match serde_json::from_value::<crate::panels::record::RecordUi>(cur) {
-                    Ok(v) => app.ui.record = crate::panels::record::RecordUi { devices, preview, ..v },
+                    Ok(v) => app.ui.record = crate::panels::record::RecordUi { devices, preview, overlay_cache, ..v },
                     Err(e) => {
                         app.ui.record.devices = devices;
                         return err(format!("`record`: {e}"));

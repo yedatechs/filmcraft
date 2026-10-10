@@ -207,6 +207,7 @@ pub fn sync(app: &mut FilmcraftApp, ctx: &egui::Context) {
     }
     for (i, c) in &rows_out {
         let Some(tap) = filmcraft_engine::record_preview::preview_of(&app.session, &c.device) else { continue };
+        let created = !cache.lock().popouts.contains_key(&c.device);
         let pop = {
             let mut st = cache.lock();
             st.popouts
@@ -225,6 +226,10 @@ pub fn sync(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 .clone()
         };
         *pop.orient.lock().unwrap_or_else(PoisonError::into_inner) = orient_of(c);
+        if created {
+            // a preview window opened during a display recording: leave it out of the file
+            super::record_overlay::schedule_refresh(app);
+        }
         show_popout(ctx, &pop, i + 1);
         if let Some((rect, label)) = pop.drawn.lock().unwrap_or_else(PoisonError::into_inner).take() {
             app.auto.add(&format!("record.preview.{}", i + 1), rect, &label);

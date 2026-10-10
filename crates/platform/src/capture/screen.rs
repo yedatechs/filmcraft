@@ -27,6 +27,7 @@ use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGDisplayCopyDisplayMode, CGDisplayIsBuiltin, CGDisplayMode, CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
 };
@@ -36,11 +37,13 @@ use objc2_core_video::{
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
-use objc2_screen_capture_kit::{SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput, SCStreamOutputType};
+use objc2_screen_capture_kit::{
+    SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
+};
 
 use filmcraft_engine::record::{
-    AudioSink, CaptureError, CaptureErrorKind, CapturedAudio, CapturedFrame, DisplayInfo, FrameSink, Permission, PixelFormat, RecordClock, ScreenTarget,
-    VideoFormat, VideoInput, VideoRequest, WindowInfo,
+    AudioSink, CaptureError, CaptureErrorKind, CapturedAudio, CapturedFrame, DisplayInfo, FrameSink, Permission, PixelFormat, RecordClock, ScreenFrame,
+    ScreenTarget, VideoFormat, VideoInput, VideoRequest, WindowInfo,
 };
 
 use super::{HostClockMap, Need, OS_TIMEOUT, START_TIMEOUT, permission_error, time_ns, waited};
@@ -163,6 +166,70 @@ pub fn devices() -> Result<(Vec<DisplayInfo>, Vec<WindowInfo>), CaptureError> {
         }
     }
     Ok((displays, windows))
+}
+
+/// The process id of a window's app (-1 when unknown).
+fn owner_pid(w: &SCWindow) -> i32 {
+    // SAFETY: `w` is a valid SCWindow; its owning application (if any) is retained while used and
+    // `processID` is a plain `pid_t` property of SCRunningApplication.
+    unsafe { w.owningApplication().map(|a| msg_send![&*a, processID]).unwrap_or(-1) }
+}
+
+/// FilmCraft's own recording border and camera preview windows on screen
+/// (`filmcraft_engine::record_preview::excluded_windows`: this process's windows with those
+/// titles): a display recording leaves them out. FilmCraft's main window stays recordable.
+fn own_overlay_windows(content: &SCShareableContent) -> Vec<Retained<SCWindow>> {
+    // SAFETY: `content` is valid; the windows and their titles are retained while used.
+    let windows: Vec<Retained<SCWindow>> = unsafe { content.windows() }.iter().collect();
+    // SAFETY: as above.
+    let list: Vec<(u32, i32, String)> =
+        windows.iter().map(|w| unsafe { (w.windowID(), owner_pid(w), w.title().map(|t| t.to_string()).unwrap_or_default()) }).collect();
+    let pid = i32::try_from(std::process::id()).unwrap_or(-1);
+    let ids = filmcraft_engine::record_preview::excluded_windows(&list, pid);
+    // SAFETY: as above.
+    windows.into_iter().filter(|w| ids.contains(&unsafe { w.windowID() })).collect()
+}
+
+/// The content filter of display `d`, leaving out FilmCraft's border and preview windows.
+fn display_filter(content: &SCShareableContent, d: &SCDisplay) -> (Retained<SCContentFilter>, usize) {
+    let excluded = own_overlay_windows(content);
+    let n = excluded.len();
+    let list = NSArray::from_retained_slice(&excluded);
+    // SAFETY: `d` and the windows are valid ScreenCaptureKit objects of `content`.
+    (unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), d, &list) }, n)
+}
+
+/// Where a display or window is (points, global; and its pixel size).
+pub fn screen_frame(target: &ScreenTarget) -> Option<ScreenFrame> {
+    let content = shareable_content().ok()?;
+    // SAFETY: `content` is valid; its displays and windows are retained while used.
+    unsafe {
+        match target {
+            ScreenTarget::Display(id) => {
+                let d = content.displays().iter().find(|d| d.displayID().to_string() == *id)?;
+                let f = d.frame();
+                let pts = (f.size.width.max(1.0).round() as u32, f.size.height.max(1.0).round() as u32);
+                let pixels = display_pixels(d.displayID(), pts);
+                Some(ScreenFrame { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height, pixels })
+            }
+            ScreenTarget::Window(id) => {
+                let w = content.windows().iter().find(|w| w.windowID().to_string() == *id)?;
+                let f = w.frame();
+                let scale = main_scale(&content);
+                let pixels = ((f.size.width * scale).round().max(1.0) as u32, (f.size.height * scale).round().max(1.0) as u32);
+                Some(ScreenFrame { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height, pixels })
+            }
+        }
+    }
+}
+
+/// Pixels per point of the main display (2 on a Retina display).
+fn main_scale(content: &SCShareableContent) -> f64 {
+    let main = CGMainDisplayID();
+    let (mpw, _) = display_pixels(main, (0, 0));
+    // SAFETY: `content` is valid; its displays are retained while used.
+    let mpts = unsafe { content.displays().iter().find(|d| d.displayID() == main).map(|d| d.width()).unwrap_or(0) };
+    if mpts > 0 && mpw > 0 { f64::from(mpw) / mpts as f64 } else { 2.0 }
 }
 
 /// State shared with the stream output object (callbacks on ScreenCaptureKit's queue).
@@ -409,6 +476,7 @@ impl VideoInput for ScreenInput {
         }
         let content = shareable_content()?;
         let fps = req.fps.clamp(1, 60);
+        let mut source_rect: Option<CGRect> = None;
         // SAFETY: `content` is valid; every object created here is retained by `Running` (or
         // dropped on error) and only used from this thread until the stream starts, after which
         // ScreenCaptureKit calls the output object on its own serial queue.
@@ -422,7 +490,27 @@ impl VideoInput for ScreenInput {
                         .ok_or_else(|| CaptureError::new(CaptureErrorKind::NoDevice, format!("no display `{id}`")))?;
                     let pts = (u32::try_from(d.width()).unwrap_or(1280), u32::try_from(d.height()).unwrap_or(720));
                     let size = display_pixels(d.displayID(), pts);
-                    (SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &d, &NSArray::new()), size)
+                    let (filter, n) = display_filter(&content, &d);
+                    if n > 0 {
+                        log::info!("display recording: {n} FilmCraft border / preview window(s) left out");
+                    }
+                    match req.area {
+                        // a part of the display: ScreenCaptureKit's `sourceRect` is in points,
+                        // the area in pixels (÷ the display's backing scale, pixels / points)
+                        Some([x, y, aw, ah]) => {
+                            if u64::from(x) + u64::from(aw) > u64::from(size.0) || u64::from(y) + u64::from(ah) > u64::from(size.1) {
+                                return Err(failed(format!("the area {x},{y} {aw}×{ah} is outside the {}×{} display", size.0, size.1)));
+                            }
+                            let scale = if pts.0 > 0 { f64::from(size.0) / f64::from(pts.0) } else { 1.0 };
+                            let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+                            source_rect = Some(CGRect {
+                                origin: CGPoint { x: f64::from(x) / scale, y: f64::from(y) / scale },
+                                size: CGSize { width: f64::from(aw) / scale, height: f64::from(ah) / scale },
+                            });
+                            (filter, (aw, ah))
+                        }
+                        None => (filter, size),
+                    }
                 }
                 ScreenTarget::Window(id) => {
                     let w = content
@@ -432,10 +520,7 @@ impl VideoInput for ScreenInput {
                         .ok_or_else(|| CaptureError::new(CaptureErrorKind::NoDevice, format!("no window `{id}` (it may have closed)")))?;
                     let f = w.frame();
                     // windows are measured in points: capture at the main display's pixel scale
-                    let main = CGMainDisplayID();
-                    let (mpw, _) = display_pixels(main, (0, 0));
-                    let mpts = content.displays().iter().find(|d| d.displayID() == main).map(|d| d.width()).unwrap_or(0);
-                    let scale = if mpts > 0 && mpw > 0 { f64::from(mpw) / mpts as f64 } else { 2.0 };
+                    let scale = main_scale(&content);
                     let size = ((f.size.width * scale).round().max(16.0) as u32, (f.size.height * scale).round().max(16.0) as u32);
                     (SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w), size)
                 }
@@ -447,6 +532,9 @@ impl VideoInput for ScreenInput {
             config.setWidth(w as usize);
             config.setHeight(h as usize);
             config.setPixelFormat(BGRA);
+            if let Some(r) = source_rect {
+                config.setSourceRect(r);
+            }
             config.setMinimumFrameInterval(CMTime { value: 1, timescale: fps as i32, flags: CMTimeFlags::Valid, epoch: 0 });
             config.setQueueDepth(5);
             config.setShowsCursor(req.show_cursor);
@@ -506,6 +594,26 @@ impl VideoInput for ScreenInput {
 
     fn error(&self) -> Option<String> {
         self.error.as_ref().and_then(|s| s.error.lock().unwrap_or_else(PoisonError::into_inner).clone())
+    }
+
+    fn refresh_exclusions(&mut self) -> Result<(), CaptureError> {
+        let ScreenTarget::Display(id) = &self.target else { return Ok(()) };
+        let Some(Sendable(r)) = self.running.as_ref() else { return Ok(()) };
+        let content = shareable_content()?;
+        // SAFETY: `content` is valid; the display, the new filter and the running stream are
+        // retained while used; updating a running stream's filter has no other preconditions
+        // (macOS 12.3+, the version ScreenCaptureKit needs anyway).
+        unsafe {
+            let d = content
+                .displays()
+                .iter()
+                .find(|d| d.displayID().to_string() == *id)
+                .ok_or_else(|| CaptureError::new(CaptureErrorKind::NoDevice, format!("no display `{id}`")))?;
+            let (filter, n) = display_filter(&content, &d);
+            run_with_completion("updating what the screen recording leaves out", |b| r.stream.updateContentFilter_completionHandler(&filter, Some(b)))?;
+            log::info!("display recording: now {n} FilmCraft border / preview window(s) left out");
+        }
+        Ok(())
     }
 
     fn capture_audio(&mut self, sample_rate: u32, channels: u16, sink: AudioSink) -> bool {

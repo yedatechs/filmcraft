@@ -28,8 +28,12 @@ fn tmp(name: &str) -> std::path::PathBuf {
 
 impl Driver {
     fn new(dir: &std::path::Path) -> Self {
+        Self::with_display(dir, (320, 180))
+    }
+
+    fn with_display(dir: &std::path::Path, display_size: (u32, u32)) -> Self {
         let mut session = Session::default();
-        session.record.factory = Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), ..Default::default() }));
+        session.record.factory = Some(Arc::new(SyntheticFactory { display_size, camera_size: (320, 180), ..Default::default() }));
         Arc::make_mut(&mut session.project).settings.scratch.captured = Some(dir.to_string_lossy().into_owned());
         // Record starts at once (the countdown test turns it back on)
         session.prefs.recording.countdown_seconds = 0;
@@ -435,5 +439,86 @@ fn a_camera_row_shows_a_live_preview_and_pops_out() {
     assert!(!d.harness.state().ui.record.open);
     let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
     assert_eq!(st["preview"], json!([]), "{st}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn overlay(d: &mut Driver) -> Value {
+    d.ok("ui.inspect", json!({}))["ui"]["record"]["overlay"].clone()
+}
+
+#[test]
+fn the_border_frames_the_screen_follows_the_recording_and_an_area_can_be_drawn() {
+    let dir = tmp("overlay");
+    let mut d = Driver::with_display(&dir, (1280, 720));
+    // the border needs a screen: nothing before the panel opens
+    assert!(overlay(&mut d).is_null());
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.ok("ui.set", json!({"record": {"cameras": [], "mics": []}}));
+    d.frames(4);
+    // the display is chosen: a grey frame around all of it
+    let o = overlay(&mut d);
+    assert_eq!(o["state"], "idle", "{o}");
+    assert_eq!(o["target"], "display:synthetic:display");
+    assert_eq!(o["rect"], json!([0, 0, 1280, 720]));
+    let e = d.element("record.overlay").unwrap();
+    assert_eq!(e["label"], "idle display:synthetic:display 0,0 1280×720");
+    // recording turns it red
+    d.click("record.panel.record");
+    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    d.frames(2);
+    assert_eq!(overlay(&mut d)["state"], "recording");
+    assert!(d.element("record.overlay").unwrap()["label"].as_str().unwrap().starts_with("recording "));
+    d.run_for(0.4);
+    // stopping closes it
+    d.click("record.panel.record");
+    assert!(!d.harness.state().session.record.recording());
+    d.frames(2);
+    assert!(overlay(&mut d).is_null(), "{}", overlay(&mut d));
+    assert!(d.element("record.overlay").is_none());
+    // Area of Synthetic Display…: the border becomes a drawing surface
+    d.click("record.panel.screen");
+    d.click("record.panel.screen.area.synthetic:display");
+    let o = overlay(&mut d);
+    assert_eq!(o["state"], "drawing", "{o}");
+    assert_eq!(d.ok("ui.inspect", json!({}))["ui"]["record"]["drawing"], true);
+    let e = d.element("record.overlay").unwrap();
+    let (w, h) = (e["rect"][2].as_f64().unwrap(), e["rect"][3].as_f64().unwrap());
+    assert_eq!((w, h), (1280.0, 720.0), "the 1280 × 720 synthetic display at 1:1 in the 1600 × 980 window");
+    d.ok(
+        "ui.drag",
+        json!({"from": {"id": "record.overlay", "fx": 101.0 / 1280.0, "fy": 99.0 / 720.0}, "to": {"id": "record.overlay", "fx": 741.0 / 1280.0, "fy": 459.0 / 720.0}}),
+    );
+    d.frames(3);
+    let ui = d.ok("ui.inspect", json!({}))["ui"]["record"].clone();
+    assert_eq!(ui["screenArea"], json!([100, 98, 640, 360]), "{ui}");
+    assert_eq!(ui["drawing"], false);
+    assert_eq!(ui["overlay"]["state"], "idle");
+    assert_eq!(ui["overlay"]["rect"], json!([100, 98, 640, 360]));
+    assert_eq!(d.element("record.panel.screen.area").unwrap()["label"], "Area 640×360");
+    assert!(d.element("record.panel.screen.area.edit").is_some());
+    // record.start receives the area: the file is 640 × 360
+    d.click("record.panel.record");
+    assert!(d.harness.state().session.record.recording(), "{}", d.harness.state().ui.record.error);
+    d.run_for(0.4);
+    d.click("record.panel.record");
+    let q = d.harness.state().session.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height), (640, 360));
+    let side =
+        std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).map(|e| e.path()).find(|p| p.to_string_lossy().ends_with("Screen.recording.json")).unwrap();
+    let side: Value = serde_json::from_slice(&std::fs::read(side).unwrap()).unwrap();
+    assert_eq!(side["area"], json!([100, 98, 640, 360]));
+    // Edit… redraws; Esc cancels and keeps the area
+    d.ok("ui.set", json!({"record": {"overlayDismissed": false}}));
+    d.frames(2);
+    d.click("record.panel.screen.area.edit");
+    assert_eq!(overlay(&mut d)["state"], "drawing");
+    d.ok("ui.key", json!({"key": "Escape"}));
+    d.frames(2);
+    let ui = d.ok("ui.inspect", json!({}))["ui"]["record"].clone();
+    assert_eq!((ui["drawing"].clone(), ui["screenArea"].clone()), (json!(false), json!([100, 98, 640, 360])));
+    // Off closes the border
+    d.ok("ui.set", json!({"record": {"screen": ""}}));
+    d.frames(2);
+    assert!(overlay(&mut d).is_null());
     std::fs::remove_dir_all(&dir).ok();
 }

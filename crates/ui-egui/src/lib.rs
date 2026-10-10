@@ -1483,6 +1483,12 @@ impl FilmcraftApp {
 }
 
 impl eframe::App for FilmcraftApp {
+    /// Opaque: the main window is created transparent-capable only so the recording border
+    /// (an immediate viewport, cleared transparent by eframe) can be see-through.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_opaque().to_normalized_gamma_f32()
+    }
+
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if !self.synthetic.is_empty() {
             // Pointer events go one per frame so egui sees press → moves → release as a real drag

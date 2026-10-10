@@ -129,13 +129,27 @@ pub struct VideoRequest {
     pub max_height: Option<u32>,
     /// Draw the mouse pointer (screens).
     pub show_cursor: bool,
+    /// Record only this part of a display: `[x, y, w, h]` in display pixels (`record.start
+    /// {screen: {display, area}}`; None = all of it).
+    pub area: Option<[u32; 4]>,
 }
 
 impl VideoRequest {
     /// The source's own size at `fps`, the cursor shown.
     pub fn at(fps: u32) -> Self {
-        Self { width: None, height: None, fps, max_height: None, show_cursor: true }
+        Self { width: None, height: None, fps, max_height: None, show_cursor: true, area: None }
     }
+}
+
+/// Where a display or window is on the desktop: points, global coordinates (origin at the top
+/// left of the main display), and its size in pixels (the backing scale is `pixels.0 / w`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ScreenFrame {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub pixels: (u32, u32),
 }
 
 /// A block of sound from a [`VideoInput`] that also captures audio (system audio of a screen).
@@ -211,6 +225,11 @@ pub trait VideoInput: Send {
     /// preferably at `sample_rate` with `channels`. False: this input cannot.
     fn capture_audio(&mut self, _sample_rate: u32, _channels: u16, _sink: AudioSink) -> bool {
         false
+    }
+    /// A display being recorded: leave out FilmCraft's recording border and camera preview
+    /// windows that appeared after the start (the stream's filter is updated, never restarted).
+    fn refresh_exclusions(&mut self) -> std::result::Result<(), CaptureError> {
+        Ok(())
     }
 }
 
@@ -289,6 +308,10 @@ pub trait VideoInputFactory: Send + Sync {
     /// Whether screen inputs can capture system audio ([`VideoInput::capture_audio`]).
     fn system_audio(&self) -> bool {
         false
+    }
+    /// Where a display or window is now (the recording border follows it); None when unknown.
+    fn screen_frame(&self, _target: &ScreenTarget) -> Option<ScreenFrame> {
+        None
     }
 }
 
@@ -379,6 +402,14 @@ impl VideoInputFactory for SyntheticFactory {
     }
     fn system_audio(&self) -> bool {
         true
+    }
+    fn screen_frame(&self, target: &ScreenTarget) -> Option<ScreenFrame> {
+        let (w, h) = self.display_size;
+        match target {
+            ScreenTarget::Display(id) if id == Self::DISPLAY => Some(ScreenFrame { x: 0.0, y: 0.0, w: f64::from(w), h: f64::from(h), pixels: (w, h) }),
+            ScreenTarget::Window(id) if id == Self::WINDOW => Some(ScreenFrame { x: 100.0, y: 80.0, w: 960.0, h: 540.0, pixels: (960, 540) }),
+            _ => None,
+        }
     }
     fn open_screen(&self, target: &ScreenTarget) -> std::result::Result<Box<dyn VideoInput>, CaptureError> {
         match target {
@@ -475,7 +506,20 @@ impl VideoInput for SyntheticVideoInput {
         }
         // a stopped input can start again (a camera preview restarted for a recording)
         self.stop.store(false, Ordering::Release);
-        let (w, h) = (req.width.unwrap_or(self.native.0), req.height.unwrap_or(self.native.1));
+        let native = match req.area {
+            // an area of the synthetic display is a picture of the area's size
+            Some([x, y, aw, ah]) => {
+                if u64::from(x) + u64::from(aw) > u64::from(self.native.0) || u64::from(y) + u64::from(ah) > u64::from(self.native.1) {
+                    return Err(CaptureError::new(
+                        CaptureErrorKind::Failed,
+                        format!("the area {x},{y} {aw}×{ah} is outside the {}×{} display", self.native.0, self.native.1),
+                    ));
+                }
+                (aw, ah)
+            }
+            None => self.native,
+        };
+        let (w, h) = (req.width.unwrap_or(native.0), req.height.unwrap_or(native.1));
         let (w, h) = req.max_height.and_then(|mh| crate::record_settings::downscale((w, h), mh)).unwrap_or((w, h));
         let (w, h) = (w.clamp(16, 8192) & !1, h.clamp(16, 8192) & !1);
         let fps = req.fps.clamp(1, 60);
@@ -772,6 +816,8 @@ struct VideoSource {
     device_name: String,
     /// Flip the clip horizontally in the sequence (a camera seen as in a mirror).
     mirror: bool,
+    /// The part of the display recorded (screens; sidecar `area`).
+    area: Option<[u32; 4]>,
     input: Box<dyn VideoInput>,
     queue: Arc<FrameQueue>,
     stats: Arc<SourceStats>,
@@ -827,6 +873,10 @@ pub struct Active {
 }
 
 impl Active {
+    /// The inputs of the screen sources (to refresh what they leave out).
+    pub(crate) fn screen_inputs(&mut self) -> impl Iterator<Item = &mut Box<dyn VideoInput>> {
+        self.video.iter_mut().filter(|v| v.src.kind == SourceKind::Screen).map(|v| &mut v.input)
+    }
     fn files(&self) -> Vec<(Src, PathBuf)> {
         let mut v: Vec<(Src, PathBuf)> = self.video.iter().map(|s| (s.src, s.path.clone())).collect();
         v.extend(self.mics.iter().map(|m| (m.src, m.path.clone())));
@@ -1539,12 +1589,17 @@ fn plan(s: &Session, p: &Value) -> Result<Plan> {
                 _ => return Err(bad(cmd, "`screen` takes {display: id} or {window: id}")),
             };
             let resolution = choice_of(v, "resolution", cmd, crate::record_settings::SCREEN_RESOLUTION, &rs.screen_resolution)?;
+            let area = crate::record_preview::area_of(v, cmd)?;
+            if area.is_some() && !matches!(target, ScreenTarget::Display(_)) {
+                return Err(bad(cmd, "`area` is a part of a display: give it with {display: id}"));
+            }
             let req = VideoRequest {
                 width: None,
                 height: None,
                 fps: fps_of(v, cmd, rs.screen_fps)?,
                 max_height: crate::record_settings::resolution_height(&resolution),
                 show_cursor: bool_of(v, "cursor", cmd, rs.show_cursor)?,
+                area,
             };
             Some(ScreenPlan { target, req, system_audio: bool_of(v, "systemAudio", cmd, rs.system_audio)? })
         }
@@ -1562,7 +1617,7 @@ fn plan(s: &Session, p: &Value) -> Result<Plan> {
             (None, None) => crate::record_settings::camera_size(&quality).map_or((None, None), |(w, h)| (Some(w), Some(h))),
             wh => wh,
         };
-        let req = VideoRequest { width, height, fps: fps_of(v, cmd, rs.camera_fps)?, max_height: None, show_cursor: false };
+        let req = VideoRequest { width, height, fps: fps_of(v, cmd, rs.camera_fps)?, max_height: None, show_cursor: false, area: None };
         cameras.push(CameraPlan { device, req, mirror });
     }
     let mut mics: Vec<String> = Vec::new();
@@ -1722,7 +1777,7 @@ fn start_video(
             return Err(e);
         }
     };
-    Ok(VideoSource { src, notes, device_id, device_name, mirror, input, queue, stats, worker: Some(worker), path })
+    Ok(VideoSource { src, notes, device_id, device_name, mirror, area: req.area, input, queue, stats, worker: Some(worker), path })
 }
 
 /// Ask a screen input for its system audio, into `path`; None when it cannot (the start goes on
@@ -2385,6 +2440,7 @@ struct Done {
     device_id: String,
     device_name: String,
     mirror: bool,
+    area: Option<[u32; 4]>,
     first_ns: u64,
     last_ns: u64,
     /// From the source's start to its first sample.
@@ -2435,6 +2491,9 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
         if d.src.kind == SourceKind::Screen {
             o.insert("show_cursor".into(), json!(rs.show_cursor));
             o.insert("resolution".into(), json!(rs.screen_resolution));
+            if let Some(a) = d.area {
+                o.insert("area".into(), json!(a));
+            }
         }
         let notes: Vec<&String> = d.notes.iter().chain(&d.fin.notes).collect();
         if !notes.is_empty() {
@@ -2478,6 +2537,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_id: v.device_id.clone(),
             device_name: v.device_name.clone(),
             mirror: v.mirror,
+            area: v.area,
             first_ns: v.stats.first().unwrap_or(0),
             last_ns: v.stats.last().unwrap_or(0),
             warmup_ns: v.stats.warmup(),
@@ -2503,6 +2563,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_id: m.device.clone(),
             device_name: m.device.clone(),
             mirror: false,
+            area: None,
             first_ns: m.stats.first().unwrap_or(0),
             last_ns: m.stats.last().unwrap_or(0),
             warmup_ns: m.stats.warmup(),
@@ -2525,6 +2586,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             device_id: "system".into(),
             device_name: "System Audio".into(),
             mirror: false,
+            area: None,
             first_ns: sa.stats.first().unwrap_or(0),
             last_ns: sa.stats.last().unwrap_or(0),
             warmup_ns: sa.stats.warmup(),
@@ -2826,7 +2888,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec(
             "record.start",
             "Start Recording",
-            r#"{"screen":{"display":id}|{"window":id},"fps":n?,"resolution":"native|1440p|1080p|720p"?,"cursor":bool?,"systemAudio":bool?}?,"cameras":[{"device":id,"quality":"720p|1080p|4k|native"?,"width":n?,"height":n?,"fps":n?,"mirror":bool?}]?,"camera":{..}?,"mics":[{"device":str?}]?,"mic":{..}?,"name":str?,"dir":str?,"countdown":0..10?,"settings":RecordingSettings?}"#,
+            r#"{"screen":{"display":id,"area":[x,y,w,h]?}|{"window":id},"fps":n?,"resolution":"native|1440p|1080p|720p"?,"cursor":bool?,"systemAudio":bool?}?,"cameras":[{"device":id,"quality":"720p|1080p|4k|native"?,"width":n?,"height":n?,"fps":n?,"mirror":bool?}]?,"camera":{..}?,"mics":[{"device":str?}]?,"mic":{..}?,"name":str?,"dir":str?,"countdown":0..10?,"settings":RecordingSettings?}"#,
             can_start,
             start,
             true,

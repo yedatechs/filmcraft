@@ -100,6 +100,10 @@ fn main() -> eframe::Result {
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false)
+            // lets the recording border (Window ▸ Record) be a transparent window: egui-wgpu gives
+            // every viewport an alpha-capable surface only when the root asks for one; the app
+            // clears the main window opaque (`FilmcraftApp::clear_color`), so it looks the same
+            .with_transparent(true)
             // Started for an agent (`--control`): open without taking the user's keyboard focus.
             .with_active(control_port.is_none())
             .with_icon(app_icon())

@@ -142,6 +142,9 @@ impl filmcraft_engine::record::VideoInputFactory for MacCaptureFactory {
     fn system_audio(&self) -> bool {
         true
     }
+    fn screen_frame(&self, target: &filmcraft_engine::record::ScreenTarget) -> Option<filmcraft_engine::record::ScreenFrame> {
+        screen::screen_frame(target)
+    }
 }
 
 /// Install the system's capture factory (`filmcraft_platform::register` calls it). Returns

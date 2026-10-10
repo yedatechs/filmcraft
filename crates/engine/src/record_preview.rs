@@ -24,11 +24,66 @@ use crate::record::{
     CaptureError, CaptureErrorKind, CapturedFrame, FrameSink, MAX_PER_KIND, RecordClock, Recorder, VideoFormat, VideoInput, VideoInputFactory, VideoRequest,
     choice_of, fps_of, id_of, size_of,
 };
+use crate::record::{ScreenFrame, ScreenTarget};
 use crate::{EngineError, Result, Session};
+
+/// Title of the border window drawn around what is recorded: a screen recording leaves out this
+/// process's windows whose title starts with it.
+pub const OVERLAY_TITLE: &str = "FilmCraft Recording Overlay";
 
 /// Title of the pop-out camera preview windows (`… — <camera>`): a screen recording leaves out
 /// this process's windows whose title starts with it.
 pub const PREVIEW_TITLE: &str = "FilmCraft Camera Preview";
+
+/// The window titles a display recording leaves out (this process's windows only).
+pub const EXCLUDED_TITLES: [&str; 2] = [OVERLAY_TITLE, PREVIEW_TITLE];
+
+/// Smallest recorded area (pixels, each side).
+pub const MIN_AREA: u32 = 64;
+
+/// The windows a display recording of process `pid` leaves out: `(window id, owner pid, title)`
+/// of the windows on screen → the ids of `pid`'s windows titled [`OVERLAY_TITLE`]… or
+/// [`PREVIEW_TITLE`]…. FilmCraft's own main window (and every other app's) stays recorded.
+pub fn excluded_windows(windows: &[(u32, i32, String)], pid: i32) -> Vec<u32> {
+    windows.iter().filter(|(_, p, title)| *p == pid && EXCLUDED_TITLES.iter().any(|t| title.starts_with(t))).map(|w| w.0).collect()
+}
+
+/// `screen.area` of `record.start`: `[x, y, w, h]` whole display pixels, the size at least
+/// [`MIN_AREA`] and at most 8192 per side (made even: encoders need it).
+pub fn area_of(v: &Value, cmd: &str) -> Result<Option<[u32; 4]>> {
+    let Some(a) = v.get("area").filter(|x| !x.is_null()) else { return Ok(None) };
+    let nums: Vec<f64> = match a.as_array() {
+        Some(l) if l.len() == 4 => l.iter().filter_map(Value::as_f64).filter(|f| f.is_finite() && f.fract() == 0.0 && *f >= 0.0).collect(),
+        _ => Vec::new(),
+    };
+    let [x, y, w, h] = nums[..] else {
+        return Err(bad(cmd, "`area` must be [x, y, width, height] in whole display pixels"));
+    };
+    if x > 16384.0 || y > 16384.0 || !(f64::from(MIN_AREA)..=8192.0).contains(&w) || !(f64::from(MIN_AREA)..=8192.0).contains(&h) {
+        return Err(bad(cmd, format!("`area` must be at most 16384 from the corner and {MIN_AREA}–8192 pixels each side, got {a}")));
+    }
+    Ok(Some([x as u32, y as u32, w as u32 & !1, h as u32 & !1]))
+}
+
+/// Where a display or window is now (None: unknown, or no permission).
+pub fn screen_frame(f: &Arc<dyn VideoInputFactory>, target: &ScreenTarget) -> Option<ScreenFrame> {
+    f.screen_frame(target)
+}
+
+/// The capture factory of the session (the platform's, the session's override, or synthetic).
+pub fn capture_factory(s: &Session) -> Arc<dyn VideoInputFactory> {
+    crate::record::factory(s)
+}
+
+/// A recording of a display is running: make it leave out the border / preview windows that
+/// appeared after it started (`VideoInput::refresh_exclusions`). Errors are the screen's.
+pub fn refresh_exclusions(s: &mut Session) -> std::result::Result<(), String> {
+    let Some(a) = s.record.active.as_mut() else { return Ok(()) };
+    for input in a.screen_inputs() {
+        input.refresh_exclusions().map_err(|e| e.message)?;
+    }
+    Ok(())
+}
 
 /// Widest preview picture kept for the UI.
 pub const PREVIEW_MAX_WIDTH: u32 = 640;
@@ -322,7 +377,7 @@ fn preview_plans(s: &Session, p: &Value, cmd: &str) -> Result<Option<Vec<Preview
             (None, None) => crate::record_settings::camera_size(&quality).map_or((None, None), |(w, h)| (Some(w), Some(h))),
             wh => wh,
         };
-        let req = VideoRequest { width, height, fps: fps_of(v, cmd, rs.camera_fps)?, max_height: None, show_cursor: false };
+        let req = VideoRequest { width, height, fps: fps_of(v, cmd, rs.camera_fps)?, max_height: None, show_cursor: false, area: None };
         out.push(PreviewPlan { device, req });
     }
     Ok(Some(out))

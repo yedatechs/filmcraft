@@ -206,3 +206,60 @@ fn record_preview_mirror_flips_the_picture() {
     let bad = PreviewFrame { rgba: vec![1, 2, 3], ..f.clone() };
     assert_eq!(oriented(&bad, true, 90), bad);
 }
+
+#[test]
+fn record_overlay_exclusion_list_takes_only_our_border_and_preview_windows() {
+    use crate::record_preview::{OVERLAY_TITLE, PREVIEW_TITLE, excluded_windows};
+    let me = 4242;
+    let windows = vec![
+        (1, me, "FilmCraft".to_string()),                         // the main window: stays recordable
+        (2, me, OVERLAY_TITLE.to_string()),                       // the border
+        (3, me, format!("{PREVIEW_TITLE} — FaceTime HD Camera")), // a pop-out preview
+        (4, 77, OVERLAY_TITLE.to_string()),                       // another process's window with our title
+        (5, me, String::new()),                                   // untitled
+        (6, me, format!("Untitled — {OVERLAY_TITLE}")),           // the title must start with it
+        (7, 77, "Safari".to_string()),
+    ];
+    assert_eq!(excluded_windows(&windows, me), vec![2, 3]);
+    assert_eq!(excluded_windows(&windows, 1), Vec::<u32>::new());
+    assert_eq!(excluded_windows(&[], me), Vec::<u32>::new());
+}
+
+#[test]
+fn record_an_area_of_the_display() {
+    let dir = tmp("area");
+    let (mut s, _) = session((320, 180));
+    s.record.factory = Some(Arc::new(SyntheticFactory { display_size: (1280, 720), ..Default::default() }));
+    // refused: not four whole numbers, too small, outside the display, a window with an area
+    for area in [json!([0, 0, 640]), json!([0, 0, 32, 360]), json!([-1, 0, 640, 360]), json!([0.5, 0, 640, 360]), json!("all"), json!([0, 0, 9000, 360])] {
+        let p = json!({"screen": {"display": SyntheticFactory::DISPLAY, "area": area}, "dir": dir.to_string_lossy()});
+        assert!(s.execute("record.start", p.clone()).is_err(), "{p}");
+    }
+    let p = json!({"screen": {"display": SyntheticFactory::DISPLAY, "area": [700, 400, 640, 360]}, "dir": dir.to_string_lossy()});
+    let e = s.execute("record.start", p).unwrap_err().to_string();
+    assert!(e.contains("outside"), "{e}");
+    assert!(!s.record.recording());
+    let p = json!({"screen": {"window": SyntheticFactory::WINDOW, "area": [0, 0, 640, 360]}, "dir": dir.to_string_lossy()});
+    assert!(s.execute("record.start", p).is_err());
+    // a 640 × 360 area (odd sizes are made even)
+    let r = s
+        .execute("record.start", json!({"screen": {"display": SyntheticFactory::DISPLAY, "area": [100, 100, 641, 361]}, "dir": dir.to_string_lossy()}))
+        .unwrap();
+    assert_eq!(r["recording"], true, "{r}");
+    std::thread::sleep(Duration::from_millis(400));
+    // nothing to refresh on a synthetic display, but the call goes through
+    crate::record_preview::refresh_exclusions(&mut s).unwrap();
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    let file = v["files"][0].as_str().unwrap();
+    let side: serde_json::Value = serde_json::from_slice(&std::fs::read(file.replace(".mov", ".recording.json")).unwrap()).unwrap();
+    assert_eq!((side["width"].as_u64(), side["height"].as_u64()), (Some(640), Some(360)), "{side}");
+    assert_eq!(side["area"], json!([100, 100, 640, 360]));
+    let q = s.active_sequence().unwrap();
+    assert_eq!((q.settings.width, q.settings.height), (640, 360));
+    // the display's frame on the desktop (for the border)
+    let f = crate::record_preview::capture_factory(&s);
+    let fr = crate::record_preview::screen_frame(&f, &crate::record::ScreenTarget::Display(SyntheticFactory::DISPLAY.into())).unwrap();
+    assert_eq!((fr.w, fr.h, fr.pixels), (1280.0, 720.0, (1280, 720)));
+    std::fs::remove_dir_all(&dir).ok();
+}

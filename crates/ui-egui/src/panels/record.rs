@@ -103,6 +103,15 @@ pub struct RecordUi {
     pub open: bool,
     /// `""` = Off, `display:<id>` or `window:<id>`.
     pub screen: String,
+    /// Record only this part of the display: `[x, y, w, h]` in display pixels (None = all).
+    pub screen_area: Option<[u32; 4]>,
+    /// The border is a drawing surface: drag the area to record.
+    pub drawing: bool,
+    /// The recording border as shown (`record.overlay`; None = not shown). Set every frame.
+    pub overlay: Option<super::record_overlay::OverlayInfo>,
+    /// The border went away after a recording stopped (until the screen is chosen again or the
+    /// panel reopens).
+    pub overlay_dismissed: bool,
     /// Camera rows (at most [`MAX_ROWS`]).
     pub cameras: Vec<CameraRow>,
     /// Microphone rows (at most [`MAX_ROWS`]).
@@ -125,6 +134,9 @@ pub struct RecordUi {
     /// Camera preview textures and pop-out windows (not saved).
     #[serde(skip)]
     pub preview: super::record_preview::PreviewCache,
+    /// The border window's own state (not saved).
+    #[serde(skip)]
+    pub overlay_cache: super::record_overlay::OverlayCache,
 }
 
 /// UI command `window.record`: open the panel (and list the devices).
@@ -141,6 +153,7 @@ pub fn route(app: &mut FilmcraftApp, id: &str) -> Option<Result<Value, String>> 
 pub fn open(app: &mut FilmcraftApp) {
     tick(app);
     app.ui.record.open = true;
+    app.ui.record.overlay_dismissed = false;
     refresh(app);
 }
 
@@ -212,7 +225,10 @@ pub fn status_line(app: &FilmcraftApp) -> Option<String> {
 pub fn start_params(r: &RecordUi) -> Value {
     let mut p = serde_json::Map::new();
     if let Some(id) = r.screen.strip_prefix("display:") {
-        p.insert("screen".into(), json!({"display": id}));
+        match r.screen_area {
+            Some(a) => p.insert("screen".into(), json!({"display": id, "area": a})),
+            None => p.insert("screen".into(), json!({"display": id})),
+        };
     } else if let Some(id) = r.screen.strip_prefix("window:") {
         p.insert("screen".into(), json!({"window": id}));
     }
@@ -312,6 +328,15 @@ pub fn toggle(app: &mut FilmcraftApp) {
         app.ui.record.live.clear();
         return;
     }
+    // the border shows (and exists natively) before the screen stream starts, so the stream
+    // leaves it out from its first frame
+    app.ui.record.overlay_dismissed = false;
+    app.ui.record.drawing = false;
+    if !super::record_overlay::ready_for_start(app) {
+        app.ui.record.overlay_cache.lock().pending_start = true;
+        app.ui.status = "Showing the recording border…".into();
+        return;
+    }
     let mut p = start_params(&app.ui.record);
     let countdown = app.session.prefs.recording.countdown_seconds;
     if let Some(o) = p.as_object_mut() {
@@ -380,6 +405,17 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     tick(app);
     // live camera previews (and their pop-out windows, which stay while recording)
     super::record_preview::sync(app, ctx);
+    // the border around what is (or will be) recorded
+    super::record_overlay::show(app, ctx);
+    let pending = std::mem::take(&mut app.ui.record.overlay_cache.lock().pending_start);
+    if pending && !app.session.record.recording() && app.session.record.countdown.is_none() {
+        if super::record_overlay::ready_for_start(app) {
+            toggle(app);
+        } else {
+            app.ui.record.overlay_cache.lock().pending_start = true;
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
     let counting = app.session.record.countdown.is_some();
     if counting {
         app.ui.record.live = status_line(app).unwrap_or_default();
@@ -423,6 +459,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     screens.extend(list("displays", &|d| {
         (format!("display:{}", d["id"].as_str().unwrap_or("")), format!("{} ({}×{})", d["name"].as_str().unwrap_or("Display"), d["width"], d["height"]))
     }));
+    // "Area of <display>…": draw a part of it on the border
+    screens
+        .extend(list("displays", &|d| (format!("area:{}", d["id"].as_str().unwrap_or("")), format!("Area of {}…", d["name"].as_str().unwrap_or("Display")))));
     screens.extend(list("windows", &|w| {
         (format!("window:{}", w["id"].as_str().unwrap_or("")), format!("{} — {}", w["app"].as_str().unwrap_or(""), w["title"].as_str().unwrap_or("")))
     }));
@@ -457,7 +496,55 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             egui::Grid::new("record-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Screen:");
-                combo(ui, &mut elems, "record.panel.screen", &mut r.screen, &screens, !recording, 300.0);
+                ui.vertical(|ui| {
+                    // an area shows as its display's "Area of …" entry
+                    let shown = match (r.screen.strip_prefix("display:"), r.screen_area.is_some() || r.drawing) {
+                        (Some(id), true) => format!("area:{id}"),
+                        _ => r.screen.clone(),
+                    };
+                    let mut sel = shown.clone();
+                    let first = elems.len();
+                    combo(ui, &mut elems, "record.panel.screen", &mut sel, &screens, !recording, 300.0);
+                    // the area entries also answer to `record.panel.screen.area.<display>`
+                    let aliases: Vec<(String, Rect, String)> = elems[first..]
+                        .iter()
+                        .filter_map(|(id, rect, label)| {
+                            let i: usize = id.strip_prefix("record.panel.screen.")?.parse().ok()?;
+                            let d = screens.get(i)?.0.strip_prefix("area:")?;
+                            Some((format!("record.panel.screen.area.{d}"), *rect, label.clone()))
+                        })
+                        .collect();
+                    elems.extend(aliases);
+                    if sel != shown {
+                        r.screen_area = None;
+                        r.overlay_dismissed = false;
+                        match sel.strip_prefix("area:") {
+                            Some(id) => {
+                                r.screen = format!("display:{id}");
+                                r.drawing = true;
+                            }
+                            None => {
+                                r.screen = sel;
+                                r.drawing = false;
+                            }
+                        }
+                    }
+                    if r.drawing {
+                        let l = ui.label(RichText::new("Drag the area on the screen (Esc cancels)").small().color(dim));
+                        elems.push(("record.panel.screen.area".into(), l.rect, "drawing".into()));
+                    } else if let Some([_, _, w, h]) = r.screen_area {
+                        ui.horizontal(|ui| {
+                            let l = ui.label(format!("Area {w}×{h}"));
+                            elems.push(("record.panel.screen.area".into(), l.rect, format!("Area {w}×{h}")));
+                            let e = ui.add_enabled(!recording, egui::Button::new("Edit…").small());
+                            elems.push(("record.panel.screen.area.edit".into(), e.rect, "Edit…".into()));
+                            if e.clicked() {
+                                r.drawing = true;
+                                r.overlay_dismissed = false;
+                            }
+                        });
+                    }
+                });
                 ui.end_row();
                 let qs: Vec<(String, String)> = Quality::ALL.iter().map(|q| (q.label().to_string(), q.label().to_string())).collect();
                 let mut remove_cam = None;
