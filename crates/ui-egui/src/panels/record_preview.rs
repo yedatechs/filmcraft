@@ -23,6 +23,13 @@ use crate::FilmcraftApp;
 
 /// The thumbnail box in a camera row (16:9).
 pub const THUMB: egui::Vec2 = vec2(240.0, 135.0);
+/// The thumbnail while a recording runs: a glance at the camera, not a monitor.
+pub const THUMB_RECORDING: egui::Vec2 = vec2(120.0, 68.0);
+
+/// The thumbnail's size: smaller while recording.
+pub fn thumb_size(recording: bool) -> egui::Vec2 {
+    if recording { THUMB_RECORDING } else { THUMB }
+}
 /// Default width of the pop-out window (points).
 pub const POPOUT_WIDTH: f32 = 320.0;
 
@@ -300,9 +307,10 @@ pub fn thumbnail(
     app_session: &filmcraft_engine::Session,
     n: usize,
     c: &mut CameraRow,
+    recording: bool,
 ) {
     let id = format!("record.panel.camera.{n}");
-    let (rect, _) = ui.allocate_exact_size(THUMB, Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(thumb_size(recording), Sense::hover());
     let tap = (!c.device.is_empty()).then(|| filmcraft_engine::record_preview::preview_of(app_session, &c.device)).flatten();
     let label = match &tap {
         Some(t) => {

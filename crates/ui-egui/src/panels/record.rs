@@ -564,8 +564,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     let n = i + 1;
                     let id = format!("record.panel.camera.{n}");
                     ui.label(if n == 1 { "Camera:".to_string() } else { format!("Camera {n}:") });
-                    ui.horizontal(|ui| {
-                        super::record_preview::thumbnail(ui, &mut elems, &preview, session, n, c);
+                    // The cell is laid out at the thumbnail's height from the start: a plain
+                    // `horizontal` begins one widget tall, the grid centres that small box in the
+                    // row, and the thumbnail then grows down out of it, over the rows below.
+                    let thumb = super::record_preview::thumb_size(recording);
+                    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), thumb.y), egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                        super::record_preview::thumbnail(ui, &mut elems, &preview, session, n, c, recording);
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 combo(ui, &mut elems, &format!("{id}.device"), &mut c.device, &cameras, !recording, 220.0);

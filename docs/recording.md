@@ -179,7 +179,7 @@ the sequence itself is made upright (1080 × 1920 for a 1080p camera) and the cl
 ## Preview
 
 While the Record panel is open, each camera row shows its camera live in a 16:9 box about
-240 px wide (letterboxed), at the camera's frame rate, mirrored and turned like its clip will be
+240 px wide (letterboxed; 120 px while recording, a glance rather than a monitor), at the camera's frame rate, mirrored and turned like its clip will be
 ("is something in my teeth, is the angle bad"). Pop out opens it in a small preview window
 (320 pt wide, resizable, always on top, moved by its title bar; its close box puts it back in the
 panel) that keeps showing the camera during the recording even when the panel is closed. A

@@ -549,3 +549,28 @@ fn rotate_turns_the_camera_preview_and_lands_on_the_clip() {
     assert!(d.element("record.panel.settings.cameraRotate").is_some());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn the_camera_thumbnail_never_overlaps_the_rows_below_and_shrinks_while_recording() {
+    let dir = tmp("thumb-rows");
+    let mut d = Driver::new(&dir);
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    d.ok(
+        "ui.set",
+        json!({"record": {"screen": "display:synthetic:display", "cameras": [{"device": "synthetic:camera", "quality": "native", "rotate": 270}], "mics": [{"device": "default"}]}}),
+    );
+    wait_label(&mut d, "record.panel.camera.1.preview", |l| frame_no(l) > 1);
+    let thumb = d.element("record.panel.camera.1.preview").unwrap()["rect"].clone();
+    let mic = d.element("record.panel.mic.1.device").unwrap()["rect"].clone();
+    let (ty, th) = (thumb[1].as_f64().unwrap(), thumb[3].as_f64().unwrap());
+    assert!(mic[1].as_f64().unwrap() >= ty + th, "the microphone row starts below the thumbnail: thumb {thumb} mic {mic}");
+    assert!((thumb[2].as_f64().unwrap(), th) == (240.0, 135.0), "{thumb}");
+    d.click("record.panel.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
+    d.frames(2);
+    let small = d.element("record.panel.camera.1.preview").unwrap()["rect"].clone();
+    assert!(small[2].as_f64().unwrap() <= 130.0 && small[3].as_f64().unwrap() <= 75.0, "smaller while recording: {small}");
+    d.click("record.panel.record");
+    assert!(!d.harness.state().session.record.recording());
+    std::fs::remove_dir_all(&dir).ok();
+}
