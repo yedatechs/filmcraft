@@ -174,6 +174,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("layout.menu.zoom.in", "Zoom In", ["Clip", "Layout", "Zoom"], None),
     uic!("layout.menu.zoom.out", "Zoom Out", ["Clip", "Layout", "Zoom"], None),
     uic!("layout.menu.swap", "Swap With Clip Below", ["Clip", "Layout"], None),
+    uic!("layout.menu.applyToSource", "Apply to All Clips of This Source", ["Clip", "Layout"], None),
     uic!("layout.menu.redact.static.mosaic", "Static Mosaic…", ["Clip", "Layout", "Redact Area"], None),
     uic!("layout.menu.redact.static.blur", "Static Blur…", ["Clip", "Layout", "Redact Area"], None),
     uic!("layout.menu.redact.static.fill", "Static Fill…", ["Clip", "Layout", "Redact Area"], None),

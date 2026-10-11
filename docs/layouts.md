@@ -26,6 +26,7 @@ nothing. None of them has a menu path or shortcut of its own: the UI adds its La
 | `layout.pan` | `clips?`, `dx?`, `dy?` (source pixels), `merge?`, `begin?` | Sets the pan of the clips' circle, square or rounded shape: the shape moves by `(dx, dy)` inside the source (a missing component keeps its value, one that is not a finite number counts as 0), clamped so it stays inside the source (a 3840 × 2160 circle pans ±840 px sideways and not at all vertically; at zoom 2 ±1380 × ±540; a rounded rectangle only pans when zoomed). The zoom is kept. The visible box stays where it is: Motion `position` moves by the opposite of the pan, rotated and scaled like the picture, so the picture slides under the shape. Refused for a clip without a circle, square or rounded shape. `merge` / `begin` as in `layout.set` (the Alt-drag is one undo step). → `{clips, pan: [[dx, dy]…]}` | Pan Clip |
 | `layout.zoom` | `clips?`, `zoom?` (absolute, 1–8) or `by?` (a factor on the current zoom; one of the two), `merge?`, `begin?` | Zooms the picture inside the clips' circle, square or rounded shape: the shape's extent in the source is divided by the zoom (clamped to 1–8; a value that is not a positive finite number counts as 1 for `zoom`, as no change for `by`), centred at the source centre plus the pan, which is clamped to the smaller shape's room (zooming out pulls it back in). The visible box stays where it is: Motion `scale` (and `scale_width` when Uniform Scale is off) is multiplied by the change of zoom and `position` keeps the shape's centre; a zoom that would take the scale past 10 000 % stops there. Refused for a clip without a circle, square or rounded shape. `merge` / `begin` as in `layout.set` (Option-scroll and the Option-corner drag are one undo step). → `{clips, zoom: [z…]}` | Zoom Clip |
 | `layout.set` | `clips?`, `position: [x, y]?`, `scale?`, `scaleWidth?`, `merge?`, `begin?` | Motion position / scale of the clips at the playhead (keyframes when animated). `merge` folds consecutive calls into one undo step and `begin` starts a new one: the Program monitor's move and scale drags use it, so a drag is one undo step even though it changes several parameters. | Transform Clip |
+| `layout.applyToSource` | `clips: [id]?` (default: the selected video clip) | Copies each given clip's layout to every other clip of the same media item on the same track of the active sequence (see [One layout for every clip of a source](#one-layout-for-every-clip-of-a-source)). Refused when a given clip is not a video clip of a media file, when it is the only clip of its source on its track ("no other clip of this source on the track"), or when two given clips are the same source on one track. Clips arranged by a scene are skipped. → `{applied: n, clips: [ids], skipped: k}` (no undo step when nothing was applied) | Apply Layout to Source |
 | `layout.inspect` | `clips?`, `time?` | `{clips: [{clip, at, size, margin, shape, radius, pan: [dx, dy], zoom, box: [x, y, w, h], track}]}`: `at` is the place the box is at (within 1 % of the frame width) or `"custom"`, `margin` the margin it implies (`null` for `center`, `full`, `custom`), `shape` `"custom"` for a hand-edited layout mask, `radius` `null` unless rounded, `pan` the shape's pan inside the source (`[0, 0]` for free and custom), `zoom` the picture's zoom inside the shape (1 for free and custom). | – |
 | `layout.pick` | `x`, `y` (frame pixels), `time?` | `{clips: [id…]}`: the enabled video clips (enabled tracks, graphics left out) whose span covers the time and whose visible box contains the point, top track first. | – |
 
@@ -63,6 +64,37 @@ nothing. None of them has a menu path or shortcut of its own: the UI adds its La
 - The geometry is pure and unit-tested in `filmcraft_edit::layout` (`place`, `place_box`, `refit`,
   `visible_box`, `shape_bounds`, `shape_path`, `shape_of_path`, `clamp_pan`, `clamp_zoom`,
   `clamp_crop`, `pan_position`, `crop_motion`, `source_delta`, `nearest_place`, `infer_place`).
+
+### One layout for every clip of a source
+
+A text edit, a razor or a removed pause cuts one recording into several clips on its track, and a
+layout belongs to one clip: put the camera in a circle bottom right on one of four camera clips
+and the other three still fill the frame. `layout.applyToSource` copies the layout of one clip to
+its **source siblings**: the other clips of the same media item on the same track of the active
+sequence (clips of that media on other tracks, and clips of other media, are not touched). Use
+it when one recording should look the same the whole way through ("my face bottom right the whole
+time"); set the layout on any one of its clips, then apply.
+
+What is copied is the layout as the clip stores it, exactly what the `layout.*` commands write
+and `layout.inspect` reads back:
+
+- the Motion parameters `position`, `scale`, `scale_width`, `uniform_scale`, `rotation` and
+  `anchor`, with their keyframes as they are, and whether Motion is on. Keyframes are in media
+  time, so an animation set on one clip continues across the others where their media reaches it
+  (a clip before the first keyframe holds the first value, one after the last holds the last);
+- the `Layout shape` mask of the Opacity effect with its feather, opacity, expansion and mode
+  (shape, pan and zoom live in its path); a source clip without one removes it from the others;
+- Scale to Frame, because the visible box depends on it.
+
+Other effects, other masks (a redaction, a mask drawn by hand), the Opacity value and blend mode,
+speed, the clips' position in time and all audio stay as they are. After it, `layout.inspect` of
+every sibling gives the source clip's `at`, `size`, `margin`, `box`, `shape`, `radius`, `pan`
+and `zoom` (for a layout without keyframes at every time; with keyframes, at the same media
+time). It is one undo step, "Apply Layout to Source". Clips whose media a scene arranges are
+skipped and counted in `skipped`: change the scene instead.
+
+`filmcraft_engine::layout::source_siblings(session, clip)` lists the siblings (or says why there
+are none) and `sibling_layouts(session, clip)` how many of them differ, for the UI below.
 
 ### How the UI uses `inspect` and `pick`
 
@@ -108,7 +140,7 @@ above, so it is one undo step.
   **Clip ▸ Layout**. All three show the same entries: Place ▸ (Top Left … Bottom Right, Full),
   Size ▸ (20 / 25 / 33 / 50 %), Shape ▸ (Circle, Rounded, Square, Free), Pan ▸ (Centre on Left
   Third, Centre, Centre on Right Third), Zoom ▸ (100 %, 125 %, 150 %, 200 %, Zoom In, Zoom Out),
-  Swap With Clip Below, Redact Area ▸ (Static Mosaic…,
+  Swap With Clip Below, Apply to All Clips of This Source, Redact Area ▸ (Static Mosaic…,
   Static Blur…, Static Fill…, Tracked Mosaic…, Tracked Blur…, Tracked Fill…, then the clip's
   redactions to remove). The current place,
   size and shape of the selected clip are checked, and so are the Pan ▸ entry whose x-centre the
@@ -120,7 +152,11 @@ above, so it is one undo step.
   Size keeps the clip's place (a full-frame clip goes to the centre; a box at no place grows or
   shrinks about its centre through `effects.setParam scale`). Swap With Clip Below swaps the
   selected clip with the first visible video clip on a lower track (`layout.swap {clips: [a, b]}`);
-  with nothing below, `layout.swap` picks the two top-most clips. Redact Area ▸ turns the Program
+  with nothing below, `layout.swap` picks the two top-most clips. **Apply to All Clips of This
+  Source** runs `layout.applyToSource` for the selected clip: the other clips of the same media on
+  its track get its place, size, shape, pan and zoom, and the status bar says how many ("Layout
+  applied to the other 3 clips of Recording 2 - Camera.mov"). It is disabled, with the reason as
+  its tooltip, when the clip is the only one of its source on the track. Redact Area ▸ turns the Program
   picture into a draw surface for one box ([draw mode](#draw-mode-program-monitor)): a **Static**
   entry keeps the box where it is drawn (no tracking job; right for screen recordings, where
   nothing moves), a **Tracked** entry makes it follow what is under it (forward, then backward
@@ -132,6 +168,14 @@ above, so it is one undo step.
   they take an optional `clips` param in place of the selection. `ui.menu.list` gives a disabled
   Layout entry a `reason` ("select a video clip", "No redactions on this clip"); the menus show
   it as the entry's tooltip.
+- **"This clip only" hint.** A layout belongs to one clip. After a layout change made in the UI
+  (a Layout menu entry, an Effect Controls or Properties layout button, the end of a move, scale,
+  pan or zoom drag in the Program monitor) on a clip whose source siblings are laid out
+  differently, the status bar reads "Layout set on this clip only. Layout ▸ Apply to All Clips of
+  This Source copies it to the other 3." (after an Alt-scroll zoom it follows the zoom: "Zoom:
+  150 %. Layout set on this clip only. …"). It is only a hint: nothing is asked and nothing else
+  changes. No hint when the siblings already match, when the clip has none, or when a scene
+  arranges them.
 - **Effect Controls.** Under Motion (Effect Controls) and in the Transform section of the
   Properties panel, a **Layout** row has nine place buttons (a 3 × 3 dot grid; the clip's place is
   outlined) and four shape buttons; the tooltips name the command (`layout.place`,
@@ -143,7 +187,7 @@ above, so it is one undo step.
 | `program.layout.box` | the selected clip's box (drag to move, Alt-drag to pan, Alt-scroll to zoom, right-click for the menu) |
 | `program.layout.handle.{nw\|n\|ne\|e\|se\|s\|sw\|w}` | scale handles (Alt-drag of a corner zooms) |
 | `layout.menu.place`, `layout.menu.size`, `layout.menu.shape`, `layout.menu.pan`, `layout.menu.zoom`, `layout.menu.redact` | the submenus (right-click menu and timeline clip menu) |
-| `layout.menu.place.{at}`, `layout.menu.size.{20\|25\|33\|50}`, `layout.menu.shape.{circle\|rounded\|square\|free}`, `layout.menu.pan.{left\|center\|right}`, `layout.menu.zoom.{100\|125\|150\|200\|in\|out}`, `layout.menu.swap`, `layout.menu.redact.{static\|tracked}.{mosaic\|blur\|fill}` | menu entries; also the UI command ids of Clip ▸ Layout (`layout.menu.redact` as a command: an alias of `layout.menu.redact.static.mosaic`) |
+| `layout.menu.place.{at}`, `layout.menu.size.{20\|25\|33\|50}`, `layout.menu.shape.{circle\|rounded\|square\|free}`, `layout.menu.pan.{left\|center\|right}`, `layout.menu.zoom.{100\|125\|150\|200\|in\|out}`, `layout.menu.swap`, `layout.menu.applyToSource`, `layout.menu.redact.{static\|tracked}.{mosaic\|blur\|fill}` | menu entries; also the UI command ids of Clip ▸ Layout (`layout.menu.redact` as a command: an alias of `layout.menu.redact.static.mosaic`) |
 | `layout.menu.redact.remove.{n}`, `layout.menu.redact.removeAll`, `layout.menu.redact.none` | Redact Area ▸ Remove Redaction N (one per redaction of the selected clip), Remove All Redactions (with more than one), and the disabled "No redactions on this clip"; `remove.{n}` and `removeAll` are UI commands too |
 | `layout.menu.redact.removeLast`, `layout.menu.redact.removeAll` | Clip ▸ Layout ▸ Redact Area ▸ Remove Last Redaction / Remove All Redactions (UI commands) |
 | `timeline.clipMenu.layout` | the Layout submenu of the timeline clip menu |

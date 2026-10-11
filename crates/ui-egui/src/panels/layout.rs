@@ -15,6 +15,10 @@
 //!   one table of entries: Place ▸, Size ▸, Shape ▸, Pan ▸, Zoom ▸, Swap With Clip Below, Redact
 //!   Area ▸ (Static / Tracked Mosaic, Blur, Fill…, then one Remove entry per redaction of the
 //!   selected clip), with the current place, size, shape, pan and zoom checked.
+//! - **One layout per source.** Apply to All Clips of This Source (`layout.applyToSource`) copies the
+//!   selected clip's layout to the other clips of the same media item on its track. After a layout
+//!   change on a clip whose siblings are laid out differently, the status bar says so and names
+//!   the entry ([`after_change`]).
 //! - **Effect Controls.** One row of nine place buttons and four shape buttons under Motion.
 //!
 //! Automation ids: `program.layout.box`, `program.layout.handle.{nw|n|ne|e|se|s|sw|w}`,
@@ -22,7 +26,8 @@
 //! `layout.menu.size.{20|25|33|50}`, `layout.menu.shape.{circle|rounded|square|free}`,
 //! `layout.menu.pan` (the submenu), `layout.menu.pan.{left|center|right}`,
 //! `layout.menu.zoom` (the submenu), `layout.menu.zoom.{100|125|150|200|in|out}`,
-//! `layout.menu.swap`, `layout.menu.redact` (the submenu), `layout.menu.redact.{static|tracked}.{mosaic|blur|fill}`,
+//! `layout.menu.swap`, `layout.menu.applyToSource`,
+//! `layout.menu.redact` (the submenu), `layout.menu.redact.{static|tracked}.{mosaic|blur|fill}`,
 //! `layout.menu.redact.remove.{n}`, `layout.menu.redact.removeAll`, `layout.menu.redact.removeLast`
 //! (Clip ▸ Layout only), `layout.menu.redact.none` (the disabled "No redactions on this clip"),
 //! `effectControls.layout.place.{at}`,
@@ -73,6 +78,9 @@ pub const WHEEL_ZOOM_STEP: f64 = 1.05;
 const WHEEL_NOTCH_POINTS: f64 = 40.0;
 /// Scroll notches closer together than this (seconds) are one undo step.
 const WHEEL_MERGE_SECONDS: f64 = 0.4;
+
+/// Label of the entry that copies the selected clip's layout to its source siblings.
+pub const APPLY_TO_SOURCE: &str = "Apply to All Clips of This Source";
 
 /// The disabled Redact Area ▸ entry of a clip without redactions (also the reason the Remove
 /// entries of Clip ▸ Layout give).
@@ -282,6 +290,11 @@ pub fn disabled_reason(app: &FilmcraftApp, id: &str) -> Option<String> {
     }
     match id {
         "layout.menu.swap" => engine_reason(app, "layout.swap"),
+        // copying a layout needs another clip of the same source on the clip's track
+        "layout.menu.applyToSource" => match target(app) {
+            Some(c) => filmcraft_engine::layout::source_siblings(&app.session, c).err(),
+            None => engine_reason(app, "layout.place").or_else(|| Some("select a video clip".into())),
+        },
         // a pan or zoom needs a circle, square or rounded shape to move inside the source
         id if id.starts_with("layout.menu.pan.") => {
             engine_reason(app, "layout.pan").or_else(|| (!info(app).is_some_and(Info::croppable)).then(|| NEEDS_SHAPE.into()))
@@ -324,12 +337,62 @@ fn clip_below(app: &FilmcraftApp, clip: ClipId) -> Option<ClipId> {
 /// Route a `layout.menu.*` UI command (menus, the control channel). `params.clips` overrides the
 /// selection.
 pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
+    /// The entries that change a clip's layout (`layout.menu.` + one of these prefixes).
+    const CHANGES: [&str; 6] = ["place.", "size.", "shape.", "pan.", "zoom.", "swap"];
     let rest = id.strip_prefix("layout.menu.")?;
     let r = run(app, rest, params);
-    if let Err(e) = &r {
-        app.ui.status = e.clone();
+    match &r {
+        Err(e) => app.ui.status = e.clone(),
+        Ok(_) if CHANGES.iter().any(|c| rest.starts_with(c)) => {
+            let named = params.get("clips").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_u64).map(ClipId);
+            if let Some(c) = named.or_else(|| target(app)) {
+                after_change(app, c);
+            }
+        }
+        Ok(_) => {}
     }
     Some(r)
+}
+
+/// The status bar hint after a layout change on a clip whose source siblings (the other clips of
+/// its media item on its track) are laid out differently, `None` when they all match or the clip
+/// has none.
+pub fn only_this_clip_hint(app: &FilmcraftApp, clip: ClipId) -> Option<String> {
+    let (siblings, differ) = filmcraft_engine::layout::sibling_layouts(&app.session, clip)?;
+    if differ == 0 {
+        return None;
+    }
+    let others = if siblings == 1 { "the other clip".to_string() } else { format!("the other {siblings}") };
+    Some(format!("Layout set on this clip only. Layout ▸ {APPLY_TO_SOURCE} copies it to {others}."))
+}
+
+/// Called after the UI changed `clip`'s layout (a Layout menu entry, an Effect Controls button,
+/// the end of a drag in the Program monitor): shows [`only_this_clip_hint`] in the status bar.
+pub fn after_change(app: &mut FilmcraftApp, clip: ClipId) {
+    if let Some(hint) = only_this_clip_hint(app, clip) {
+        app.ui.status = hint;
+    }
+}
+
+/// Apply to All Clips of This Source: `layout.applyToSource` for the selected clip (or
+/// `params.clips`), and the status bar says how many clips got the layout.
+fn apply_to_source(app: &mut FilmcraftApp, params: &Value) -> Result<Value, String> {
+    let p = match params.get("clips") {
+        Some(c) => json!({"clips": c}),
+        None => json!({"clips": [target(app).ok_or("select a video clip")?.0]}),
+    };
+    let first = p["clips"].as_array().and_then(|a| a.first()).and_then(Value::as_u64).map(ClipId);
+    let r = app.session.execute("layout.applyToSource", p).map_err(|e| e.to_string())?;
+    let name = first.and_then(|c| app.session.active_sequence().and_then(|q| q.find_item(c)).map(|(_, it)| it.name.clone())).filter(|n| !n.is_empty());
+    let of = name.map(|n| format!(" of {n}")).unwrap_or_default();
+    let (applied, skipped) = (r["applied"].as_u64().unwrap_or(0), r["skipped"].as_u64().unwrap_or(0));
+    app.ui.status = match (applied, skipped) {
+        (0, _) => format!("The other clips{of} are arranged by a scene. Change the scene in Sequence ▸ Scenes…"),
+        (1, 0) => format!("Layout applied to the other clip{of}"),
+        (n, 0) => format!("Layout applied to the other {n} clips{of}"),
+        (n, k) => format!("Layout applied to {n} other clips{of}; {k} arranged by a scene left as they are"),
+    };
+    Ok(r)
 }
 
 fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, String> {
@@ -353,6 +416,9 @@ fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, Stri
         // Redact Area ▸ …: the Program picture becomes a draw surface (`panels::redact`)
         let (_, _, track, style) = crate::panels::redact::MODES.iter().find(|m| m.0 == mode).ok_or_else(|| format!("unknown redaction `{mode}`"))?;
         return crate::panels::redact::start(app, &json!({"style": style, "track": track}));
+    }
+    if rest == "applyToSource" {
+        return apply_to_source(app, params);
     }
     if rest == "swap" {
         let p = match params.get("clips") {
@@ -491,8 +557,8 @@ fn menu_entry(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: &str, label: &str, 
     }
 }
 
-/// The Layout entries (Place ▸, Size ▸, Shape ▸, Pan ▸, Zoom ▸, Swap With Clip Below, Redact Area ▸), shared by
-/// the monitor right-click menu and the timeline clip menu. Redact Area ▸ ends with one Remove
+/// The Layout entries (Place ▸, Size ▸, Shape ▸, Pan ▸, Zoom ▸, Swap With Clip Below, Apply to All Clips of This
+/// Source, Redact Area ▸), shared by the monitor right-click menu and the timeline clip menu. Redact Area ▸ ends with one Remove
 /// entry per redaction of the selected clip (and Remove All Redactions when it has several), or
 /// the disabled "No redactions on this clip".
 pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
@@ -536,6 +602,7 @@ pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     app.auto.add("layout.menu.zoom", r.response.rect, "Zoom");
     ui.separator();
     menu_entry(app, ui, "layout.menu.swap", "Swap With Clip Below", &mut run);
+    menu_entry(app, ui, "layout.menu.applyToSource", APPLY_TO_SOURCE, &mut run);
     let r = ui.menu_button("Redact Area", |ui| {
         for (i, (mode, label, _, _)) in crate::panels::redact::MODES.iter().enumerate() {
             if i == 3 {
@@ -982,9 +1049,17 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
         }
     } else if wheel_zoomed {
         refresh(app);
-        if let Some(z) = info(app).map(|i| i.zoom) {
-            app.ui.status = zoom_status(z);
+        if let Some((c, z)) = info(app).map(|i| (i.clip, i.zoom)) {
+            // the zoom, and that the clip's source siblings do not have it
+            app.ui.status = match only_this_clip_hint(app, c) {
+                Some(hint) => format!("{}. {hint}", zoom_status(z)),
+                None => zoom_status(z),
+            };
         }
+    }
+    // a finished drag changed this clip only: say so when its source siblings differ
+    if let Some(d) = drag.filter(|d| released && d.begun) {
+        after_change(app, d.clip);
     }
     ui.data_mut(|d| match drag {
         Some(dr) if !released => {

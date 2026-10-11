@@ -728,8 +728,15 @@ fn run(app: &mut FilmcraftApp, ctx: &egui::Context, actions: Vec<(String, Value)
             p["begin"] = json!(begun != press);
             ctx.data_mut(|d| d.insert_temp(key, press));
         }
-        if let Err(e) = app.session.execute(&cmd, p) {
-            app.ui.status = e.to_string();
+        // a Layout row button (place, shape): the clip it acts on, for the "this clip only" hint
+        let layout_clip = cmd.starts_with("layout.").then(|| p["clips"][0].as_u64()).flatten().map(ClipId);
+        match app.session.execute(&cmd, p) {
+            Err(e) => app.ui.status = e.to_string(),
+            Ok(_) => {
+                if let Some(c) = layout_clip {
+                    crate::panels::layout::after_change(app, c);
+                }
+            }
         }
     }
 }
