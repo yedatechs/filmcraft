@@ -356,6 +356,12 @@ desktop points}`, `null` when hidden).
 
 ## Not there yet
 
+- **Known issue (2026-10-10):** opening a capture session can switch an Insta360 Link 2C to its
+  9:16 (portrait) mode, visibly also in the Insta360 Link Controller. Set Rotate in the Record
+  panel rather than turning the camera back in the vendor app, which then records wrongly. Tracked
+  in `openspec/changes/recording/tasks.md` § 8.1.
+- Pop-out preview: Pause / Resume / Stop, a microphone level meter, and a window the size of the
+  camera picture (§ 8.2).
 - Several screens at once, pause / resume, a teleprompter.
 - Click tracking and auto zoom (the sidecar's `events` list is ready for a click log).
 - Camera audio (a camera's microphone can be picked as a microphone).

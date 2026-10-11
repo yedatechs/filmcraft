@@ -35,4 +35,25 @@
 ## 6. Acceptance
 
 - [x] 6.1 Smoke test on a Mac: `record.devices` lists the display and two cameras; 5 s screen + mic with the defaults (VideoToolbox H.264), 3 s screen at 60 fps / 720p / no cursor / HEVC, 3 s screen + system audio (no camera recorded: Camera permission undetermined)
-- [ ] 6.2 Owner: screen + FaceTime camera + mic for a minute, transcribe, circle the face bottom right
+- [x] 6.2 Owner (2026-10-10, 16:46 and 17:29): screen + Insta360 Link 2C + mic recorded into one synced sequence (Recording 4 / 5 and a 19 s run with the live preview pop-out); transcribe + circle layout not yet exercised on a recording
+
+## 7. Shipped on 2026-10-10 after the first owner run (fork branch `feat/whisper-cpp-engine`)
+
+- [x] 7.1 Aligned start: every source live before the clock starts, `warmup_ns` per sidecar, `START_TIMEOUT` 20 s, "Starting…" state, `wait: false` (532a686)
+- [x] 7.2 Live camera preview (`record.preview`, thumbnails, pop-out viewport), border overlay viewport around the recorded display / window (idle grey, red + "● REC" while recording), area selection (`screen.area` → `sourceRect`), overlay and preview windows excluded from the file by title + pid (ee75b4d, b16afa0, fb08c14)
+- [x] 7.3 Objective-C exceptions caught at every AVFoundation / ScreenCaptureKit / AppKit call (`capture::catch_objc`, ADR 0002 §4): an exception is the source's error, never an abort (a8f94e1); the Insta360's exact-fraction frame rates set with the format's own duration bounds (3ff3d8c)
+- [x] 7.4 Rotation written into the MOV `tkhd` matrix instead of a clip effect; Rotate Auto from the camera's reported orientation (rotation coordinator on macOS 14+, polled); a camera of another aspect gets Scale to Frame next to the screen (a68b87f, e5fb61f, 88e686a)
+- [x] 7.5 Record panel: thumbnail no longer overlaps the rows below, 120 px while recording (9be7262); minimize to a strip (3a4e917)
+- [x] 7.6 `cargo xtask bundle` → "FilmCraft Dev.app" (own bundle id `ai.storyteller.filmcraft.dev`, camera / microphone usage descriptions, `.fcproj` document type, ad-hoc signed) (cb8fd3e, 636e8b3)
+- [x] 7.7 Border frames from CoreGraphics (no ScreenCaptureKit polling), a silent first `startCapture` retried once, the stalled-start error names the stale Screen Recording entry a rebuilt bare binary leaves in macOS (a449601)
+- [x] 7.8 `Logs/session-<day>.log`: app start and every quit request (b9aca22)
+
+## 8. Open after the owner's evening run (2026-10-10, 17:29)
+
+- [ ] 8.1 **Opening a capture session turns the Insta360 Link 2C to 9:16.** When FilmCraft starts a preview / recording the camera flips to portrait and the Insta360 Link Controller shows it switched too, so the owner has to turn it back inside FilmCraft; Rotate set in FilmCraft then records fine, but turning it back in the vendor app gives a wrong result. Suspects: the session preset / `activeFormat` chosen for the quality (`preset_for`, 1080p), `AVCaptureDeviceRotationCoordinator` creation, or the connection's `videoRotationAngle`; the vendor app may react to a format with portrait dimensions. Reproduce with the Link Controller open and log the format and angles at session start; prefer the camera's current format and never touch its rotation unless Rotate is set by hand.
+- [ ] 8.2 Pop-out preview: Pause / Resume and Stop buttons, a microphone level meter, and a window sized to the camera picture (today it opens far larger than the thumbnail)
+- [ ] 8.3 The thumbnail while recording is still large in the pop-out; the panel's own thumbnail shrink is done (7.5)
+- [ ] 8.4 A stable code-signing identity for the dev bundle (self-signed certificate) so Screen Recording / Camera grants survive rebuilds; until then launch the bare binary from iTerm and remove a stale "FilmCraft" Screen Recording entry after a rebuild (docs/recording.md § Permissions)
+- [ ] 8.5 Retina (2×) display untested for area selection and the overlay placement; Continuity Camera ("Jerephone Camera") listed but not recorded yet
+- [ ] 8.6 Double-clicking a `.fcproj` on the bundle opens FilmCraft but not the file (Apple events not handled)
+- [ ] 8.7 Still from the original list: camera audio, pause / resume of a recording, several screens, teleprompter, click log (F14), Windows / Linux capture, recovery of a file cut off by a crash
