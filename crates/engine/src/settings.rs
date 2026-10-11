@@ -1031,6 +1031,7 @@ static CATEGORIES: &[Category] = &[
                     f("recording.channels", "Channels", Kind::Choice(rs::CHANNELS), true),
                     f("recording.audioFormat", "Format", Kind::Choice(rs::AUDIO_FORMATS), true),
                     b("recording.autoGain", "Auto gain (toward −18 dBFS, in the file only)", true),
+                    b("recording.levelBeforeRecording", "Show the level before recording (keeps the microphone open while the Record panel is)", true),
                 ],
             ),
             Row::Group(

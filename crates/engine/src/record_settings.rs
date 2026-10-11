@@ -64,6 +64,10 @@ pub struct RecordingSettings {
     pub audio_format: String,
     /// Normalise the written microphone files toward −18 dBFS (never the level meter).
     pub auto_gain: bool,
+    /// Show the microphone level before a recording: the Record panel listens to the microphones
+    /// of its rows while it is open (the system shows its microphone indicator). Off: the meter
+    /// moves only while recording, and no microphone is opened before Record.
+    pub level_before_recording: bool,
     // Behaviour
     /// 0 / 3 / 5 / 10 seconds of countdown before the Record panel starts.
     pub countdown_seconds: u32,
@@ -95,6 +99,7 @@ impl Default for RecordingSettings {
             channels: "mono".into(),
             audio_format: "f32".into(),
             auto_gain: false,
+            level_before_recording: false,
             countdown_seconds: 3,
             stop_after_minutes: 0,
             open_sequence: true,

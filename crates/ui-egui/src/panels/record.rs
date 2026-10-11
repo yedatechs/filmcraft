@@ -226,14 +226,16 @@ pub(crate) fn mic_level(status: &Value) -> Option<f32> {
     mics.filter_map(|m| m["level"].as_f64()).map(|l| if l.is_finite() { l.clamp(0.0, 1.0) as f32 } else { 0.0 }).reduce(f32::max)
 }
 
-/// The microphones whose level shows before a recording: the panel's microphone rows while the
+/// The microphones whose level shows before a recording, when Settings ▸ Recording ▸ Show the
+/// level before recording is on (off by default: no microphone is opened before Record): the
+/// panel's microphone rows while the
 /// panel is open or a pop-out exists (the engine lets go of them while a recording or a
 /// voice-over uses the microphones and brings them back afterwards). Asked of `record.monitor`
 /// when the list changes; closing the panel with no pop-out stops them, and with them the
 /// system's microphone indicator.
 fn sync_monitors(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let r = &app.ui.record;
-    let shown = r.open || !r.popouts.is_empty();
+    let shown = app.session.prefs.recording.level_before_recording && (r.open || !r.popouts.is_empty());
     let known = |name: &str| r.devices.as_ref().and_then(|d| d["microphones"].as_array()).is_some_and(|a| a.iter().any(|m| m == name));
     let mut want: Vec<String> = Vec::new();
     if shown {
@@ -1068,6 +1070,7 @@ fn settings_section(
         choice(ui, elems, patch, "channels", "Channels:", rs.channels.clone(), opts(k::CHANNELS), false, en);
         choice(ui, elems, patch, "audioFormat", "Format:", rs.audio_format.clone(), opts(k::AUDIO_FORMATS), false, en);
         check(ui, elems, patch, "autoGain", "Auto gain (−18 dBFS, file only)", rs.auto_gain, en);
+        check(ui, elems, patch, "levelBeforeRecording", "Level before recording (keeps the microphone open)", rs.level_before_recording, en);
         head(ui, "Behaviour");
         choice(ui, elems, patch, "countdownSeconds", "Countdown:", rs.countdown_seconds.to_string(), opts(k::COUNTDOWNS), true, en);
         ui.label("Stop after:");

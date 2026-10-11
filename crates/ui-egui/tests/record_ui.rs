@@ -301,6 +301,7 @@ fn the_settings_section_and_preferences_show_the_same_recording_settings() {
         "keyframeSeconds",
         "sampleRate",
         "autoGain",
+        "levelBeforeRecording",
         "countdownSeconds",
         "stopAfterMinutes",
         "outputFolder",
@@ -1038,6 +1039,14 @@ fn the_microphone_meter_moves_before_record_is_pressed() {
     let mut d = Driver::new(&dir);
     assert_eq!(monitored(&mut d), json!([]), "no microphone is open before the panel is");
     pop_out(&mut d, json!(0), json!({"screen": "", "mics": [{"device": "default"}]}));
+    d.frames(3);
+    // off by default: the panel opens no microphone before Record, the meters stay empty
+    assert!(!d.harness.state().session.prefs.recording.level_before_recording);
+    assert_eq!(monitored(&mut d), json!([]), "Show the level before recording is off");
+    assert_eq!(label_of(&mut d, "record.panel.level"), "0.00");
+    assert_eq!(label_of(&mut d, "record.preview.1.level"), "0.00");
+    // turned on in the settings (the panel's Settings section; Settings ▸ Recording)
+    d.harness.state_mut().session.prefs.recording.level_before_recording = true;
     d.frames(3);
     // the panel asked for its microphone row: the meter moves, in the panel and in the pop-out
     assert_eq!(monitored(&mut d)[0]["device"], "default");
