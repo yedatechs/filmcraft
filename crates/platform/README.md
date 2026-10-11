@@ -148,7 +148,9 @@ For recording (Window ▸ Record, `record.*`; [docs/recording.md](../../docs/rec
   skipped.
 - `capture::camera` (FFI): AVFoundation. `devicesWithMediaType:` for the list (no permission
   needed), an `AVCaptureSession` with an `AVCaptureVideoDataOutput` (BGRA, late frames discarded)
-  per recording; size from the quality through the session preset. No camera audio.
+  per recording; the format is chosen from the device's own list (landscape unless a portrait size
+  is asked for) and set as its `activeFormat`, the session on `InputPriority`: never a size preset,
+  which picks a webcam's portrait twin when that is listed first. No camera audio.
 - `capture` (safe): the factory, permission messages naming the System Settings pane, and the
   mapping of sample presentation times (host clock) onto the recording clock, anchored at stream
   start and never going backwards.
