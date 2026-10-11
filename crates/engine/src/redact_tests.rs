@@ -142,6 +142,74 @@ fn remove_takes_effect_and_mask_away_in_one_undo_step() {
     assert_eq!(list(&mut s, v1).len(), 2, "undo brings the removed redaction back");
 }
 
+#[test]
+fn removing_one_of_two_leaves_the_other_with_its_number() {
+    let mut s = demo(2.5);
+    let v1 = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+    let name = s.active_sequence().unwrap().find_item(v1).unwrap().1.name.clone();
+    s.execute("redact.add", json!({"rect": [100, 100, 200, 200], "track": false})).unwrap();
+    s.execute("redact.add", json!({"rect": [400, 100, 200, 200], "style": "blur", "track": false})).unwrap();
+    assert_eq!(crate::redact::summary(&s, v1), vec![(1, "mosaic"), (2, "blur")]);
+    // the second redaction's mask is the selected one; it stays selected when the first goes
+    let sel = s.state.selected_mask.unwrap();
+    let r = s.execute("redact.remove", json!({"clip": v1.0, "redaction": 1})).unwrap();
+    assert_eq!((r["removed"].clone(), r["name"].clone()), (json!(1), json!(name)), "{r}");
+    assert_eq!(s.history.undo.last().unwrap().0, "Remove Redaction");
+    // exactly that one went; the other is not renumbered
+    let l = list(&mut s, v1);
+    assert_eq!(l.len(), 1);
+    assert_eq!((l[0]["redaction"].clone(), l[0]["name"].clone(), l[0]["style"].clone()), (json!(2), json!("Redaction 2"), json!("blur")), "{l:?}");
+    assert_eq!(crate::redact::summary(&s, v1), vec![(2, "blur")]);
+    let now = s.state.selected_mask.unwrap();
+    assert_eq!((now.clip, now.effect, now.mask), (sel.clip, sel.effect - 1, sel.mask), "the selection follows its effect down");
+    assert_eq!(effect(&s, v1, now.effect).masks[0].name, "Redaction 2");
+    // undo brings it back with its number
+    s.execute("edit.undo", json!({})).unwrap();
+    let names: Vec<String> = list(&mut s, v1).iter().map(|r| r["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names, ["Redaction 1", "Redaction 2"]);
+}
+
+#[test]
+fn remove_all_takes_every_redaction_away_in_one_undo_step() {
+    let mut s = demo(2.5);
+    let v1 = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+    let before = s.active_sequence().unwrap().find_item(v1).unwrap().1.effects.clone();
+    // nothing to remove yet
+    let e = s.execute("redact.remove", json!({"clip": v1.0, "redaction": "all"})).unwrap_err();
+    assert!(e.to_string().contains("no redactions"), "{e}");
+    for (rect, style) in [([100, 100, 200, 200], "mosaic"), ([400, 100, 200, 200], "blur"), ([700, 100, 200, 200], "fill")] {
+        s.execute("redact.add", json!({"rect": rect, "style": style, "track": false})).unwrap();
+    }
+    // a Gaussian Blur of the user's own between them stays
+    s.execute("effects.apply", json!({"clips": [v1.0], "effect": "Gaussian Blur"})).unwrap();
+    let with_blur = s.active_sequence().unwrap().find_item(v1).unwrap().1.effects.len();
+    assert_eq!(with_blur, before.len() + 4);
+    let steps = undo_labels(&mut s).len();
+    let r = s.execute("redact.remove", json!({"redaction": "All"})).unwrap();
+    assert_eq!(r["removed"], json!([1, 2, 3]), "{r}");
+    assert_eq!(r["clip"], json!(v1.0));
+    let labels = undo_labels(&mut s);
+    assert_eq!(labels.len(), steps + 1, "one undo step for all of them");
+    assert_eq!(labels.last().map(String::as_str), Some("Remove All Redactions"));
+    assert!(list(&mut s, v1).is_empty());
+    assert!(s.state.selected_mask.is_none(), "the selected redaction mask went with its effect");
+    let left = s.active_sequence().unwrap().find_item(v1).unwrap().1.effects.clone();
+    assert_eq!(left.len(), before.len() + 1, "only the redactions went");
+    assert!(left.iter().any(|e| e.effect == "gaussian_blur" && e.masks.is_empty()), "the user's blur stays");
+    // one undo brings all three back
+    s.execute("edit.undo", json!({})).unwrap();
+    let l = list(&mut s, v1);
+    let got: Vec<(u64, String)> = l.iter().map(|r| (r["redaction"].as_u64().unwrap(), r["style"].as_str().unwrap().to_string())).collect();
+    assert_eq!(got, [(1, "mosaic".to_string()), (2, "blur".to_string()), (3, "fill".to_string())]);
+    // hostile values of `redaction`
+    for bad in [json!("some"), json!(""), json!(null), json!([1]), json!({"n": 1}), json!(true), json!(-1), json!(1e300), json!(0), json!(99)] {
+        assert!(s.execute("redact.remove", json!({"clip": v1.0, "redaction": bad.clone()})).is_err(), "{bad}");
+    }
+    assert_eq!(list(&mut s, v1).len(), 3, "a refused remove changes nothing");
+    assert!(s.execute("redact.remove", json!({"clip": 999_999, "redaction": "all"})).is_err());
+    assert!(crate::redact::summary(&s, ClipId(999_999)).is_empty());
+}
+
 // ---------------------------------------------------------------- tracking
 
 /// A 320×240 24 fps clip of a textured disc moving right and down by a known amount per frame
@@ -301,4 +369,30 @@ fn removing_a_redaction_while_it_tracks_stops_the_tracking() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(s.jobs.len(), 1, "no backward run for a removed redaction");
+}
+
+#[test]
+fn remove_all_while_a_redaction_tracks_cancels_the_job_first() {
+    use std::sync::atomic::Ordering;
+    let (mut s, clip) = tracking_session();
+    let r = s.execute("redact.add", json!({"rect": box_on_disc()})).unwrap();
+    let job = r["jobs"][0].as_u64().unwrap();
+    assert_eq!(list(&mut s, clip)[0]["tracking"], true);
+    let r = s.execute("redact.remove", json!({"redaction": "all"})).unwrap();
+    assert_eq!(r["removed"], json!([1]), "{r}");
+    assert!(s.mask_jobs.is_empty(), "the tracking results are no longer written");
+    assert!(s.jobs.iter().find(|j| j.id == job).unwrap().progress.cancel.load(Ordering::Relaxed), "the job was told to stop");
+    assert!(list(&mut s, clip).is_empty());
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_millis() < 300 {
+        s.poll_persistence();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(s.jobs.len(), 1, "no backward run for a removed redaction");
+    assert!(list(&mut s, clip).is_empty(), "nothing writes to the clip after the removal");
+    // the clip is free again: a new redaction can be added, and undo of the removal still works
+    s.execute("redact.add", json!({"rect": [0, 0, 20, 20], "track": false})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(list(&mut s, clip).len(), 1, "undo brings the tracked redaction back");
 }

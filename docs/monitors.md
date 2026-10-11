@@ -31,7 +31,8 @@ Automation ids: `<monitor>.zoom`, `<monitor>.zoom.<level>`, `<monitor>.settings.
 dialogs `guides.add.vertical|horizontal|position|ok|cancel`, `guides.save.name|ok|cancel`,
 `guides.manage.row.<n>|apply|delete|close`.
 
-Redact Area… (`redact.start`, Clip ▸ Layout) turns the Program picture into a draw surface (`program.redact.draw`): drag a box to add a tracked mosaic; see [layouts.md](layouts.md#tracked-redaction-redact).
+Redact Area ▸ … (`redact.start`, Clip ▸ Layout) turns the Program picture into a draw surface (`program.redact.draw`): drag a box to add a static or tracked mosaic, blur or fill; see [layouts.md](layouts.md#tracked-redaction-redact). To remove one, right-click the clip's box (or the clip in the timeline) and choose Layout ▸ Redact Area ▸ Remove Redaction N (`layout.menu.redact.remove.{n}`; `layout.menu.redact.removeAll` with several, the disabled `layout.menu.redact.none` with none), or use Clip ▸ Layout ▸ Redact Area ▸ Remove Last Redaction / Remove All Redactions (`layout.menu.redact.removeLast`, `layout.menu.redact.removeAll`); see [Removing a redaction](layouts.md#removing-a-redaction).
+
 ## Selecting and moving video clips in the Program monitor
 
 With the Selection tool, a click on the Program picture that hits no graphic selects the top-most

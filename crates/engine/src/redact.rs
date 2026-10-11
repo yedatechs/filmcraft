@@ -45,7 +45,7 @@ pub fn commands() -> Vec<CommandSpec> {
             true,
         ),
         spec("redact.list", "List Redactions", r#"{"clip":id?}"#, list, false),
-        spec("redact.remove", "Remove Redaction", r#"{"clip":id?,"redaction":n}"#, remove, true),
+        spec("redact.remove", "Remove Redaction", r#"{"clip":id?,"redaction":n|"all"}"#, remove, true),
     ]
 }
 
@@ -221,38 +221,85 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"clip": it.id.0, "redactions": out}))
 }
 
+/// The redactions of a clip of the active sequence as (N, style), in `redact.list` order: what
+/// the menus list. Empty for a clip that is not there.
+pub fn summary(s: &Session, clip: ClipId) -> Vec<(u64, &'static str)> {
+    let Some((_, it)) = s.active_sequence().and_then(|q| q.find_item(clip)) else { return Vec::new() };
+    redactions(it).into_iter().filter_map(|(ei, _, n)| it.effects.get(ei).map(|e| (n, style_of(e)))).collect()
+}
+
+/// `redact.remove`: take one redaction (`redaction: N`) or every redaction (`redaction: "all"`)
+/// off the clip, effect and mask together, in one undo step. The redactions that stay keep their
+/// numbers (removing Redaction 1 of two leaves Redaction 2; the next one added is Redaction 3).
+/// A tracking job of a removed redaction is cancelled first, and its queued backward run dropped.
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
-    let it = target(s, p, "redact.remove")?;
+    const CMD: &str = "redact.remove";
+    let it = target(s, p, CMD)?;
     let clip = it.id;
-    let n = u64_p(p, "redaction").ok_or_else(|| bad("redact.remove", "need `redaction` (its number N, see redact.list)"))?;
-    let (ei, _, _) = redactions(&it).into_iter().find(|r| r.2 == n).ok_or_else(|| bad("redact.remove", format!("no Redaction {n} on clip {}", clip.0)))?;
-    if s.mask_jobs.iter().any(|j| j.target.clip == clip && j.target.effect > ei) {
-        return Err(bad("redact.remove", "another mask on this clip is being tracked; wait for it or cancel it first"));
+    let on_clip = redactions(&it);
+    let all = str_p(p, "redaction").is_some_and(|v| v.eq_ignore_ascii_case("all"));
+    // (effect index, N) of what goes
+    let gone: Vec<(usize, u64)> = if all {
+        if on_clip.is_empty() {
+            return Err(bad(CMD, format!("no redactions on clip {}", clip.0)));
+        }
+        on_clip.iter().map(|r| (r.0, r.2)).collect()
+    } else {
+        let n = match p.get("redaction") {
+            Some(Value::Number(_)) => u64_p(p, "redaction"),
+            _ => None,
+        }
+        .ok_or_else(|| bad(CMD, "need `redaction`: its number N (see redact.list) or \"all\""))?;
+        let r = on_clip.iter().find(|r| r.2 == n).ok_or_else(|| bad(CMD, format!("no Redaction {n} on clip {}", clip.0)))?;
+        vec![(r.0, r.2)]
+    };
+    // effect indices, highest first, each once (a hand-made effect could hold two redaction masks)
+    let mut eis: Vec<usize> = gone.iter().map(|g| g.0).collect();
+    eis.sort_unstable_by(|a, b| b.cmp(a));
+    eis.dedup();
+    let lowest = eis.last().copied().unwrap_or(usize::MAX);
+    // removing an effect shifts the indices running tracking jobs of later effects write to
+    if s.mask_jobs.iter().any(|j| j.target.clip == clip && j.target.effect > lowest && !eis.contains(&j.target.effect)) {
+        return Err(bad(CMD, "another mask on this clip is being tracked; wait for it or cancel it first"));
     }
-    let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
-    s.edit("Remove Redaction", move |pr, st| {
-        let q = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
-        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
-        if ei >= it.effects.len() {
-            return Err(bad("redact.remove", "the redaction is gone"));
-        }
-        it.effects.remove(ei);
-        match st.selected_mask {
-            Some(m) if m.clip == clip && m.effect == ei => st.selected_mask = None,
-            Some(m) if m.clip == clip && m.effect > ei => st.selected_mask = Some(MaskSel { effect: m.effect - 1, ..m }),
-            _ => {}
-        }
-        Ok(())
-    })?;
-    // stop tracking the removed mask
-    for j in s.mask_jobs.iter().filter(|j| j.target.clip == clip && j.target.effect == ei) {
+    // stop tracking the removed masks before they go: cancel the jobs, forget their results and
+    // the queued backward runs (the jobs end on their own at the next frame)
+    for j in s.mask_jobs.iter().filter(|j| j.target.clip == clip && eis.contains(&j.target.effect)) {
         if let Some(job) = s.jobs.iter().find(|x| x.id == j.job) {
             job.progress.cancel.store(true, Ordering::Relaxed);
         }
     }
-    s.mask_jobs.retain(|j| !(j.target.clip == clip && j.target.effect == ei));
-    drop_pending(s, clip, ei);
-    Ok(json!({"clip": clip.0, "removed": n}))
+    s.mask_jobs.retain(|j| !(j.target.clip == clip && eis.contains(&j.target.effect)));
+    for ei in &eis {
+        drop_pending(s, clip, *ei);
+    }
+    let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
+    let label = if all { "Remove All Redactions" } else { "Remove Redaction" };
+    let order = eis.clone();
+    s.edit(label, move |pr, st| {
+        let q = pr.sequence_mut(seq_id).ok_or(EngineError::NoSequence)?;
+        let (_, it) = q.find_item_mut(clip).ok_or(filmcraft_edit::EditError::NoItem(clip))?;
+        for ei in &order {
+            if *ei >= it.effects.len() {
+                return Err(bad(CMD, "the redaction is gone"));
+            }
+            it.effects.remove(*ei);
+        }
+        if let Some(m) = st.selected_mask.filter(|m| m.clip == clip) {
+            st.selected_mask = if order.contains(&m.effect) {
+                None
+            } else {
+                let below = order.iter().filter(|ei| **ei < m.effect).count();
+                Some(MaskSel { effect: m.effect.saturating_sub(below), ..m })
+            };
+        }
+        Ok(())
+    })?;
+    let name = it.name.clone();
+    match gone.as_slice() {
+        [(_, n)] if !all => Ok(json!({"clip": clip.0, "name": name, "removed": n})),
+        _ => Ok(json!({"clip": clip.0, "name": name, "removed": gone.iter().map(|g| g.1).collect::<Vec<_>>()})),
+    }
 }
 
 // ------------------------------------------------------------------ tracking

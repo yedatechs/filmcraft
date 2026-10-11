@@ -144,6 +144,7 @@ pub fn menu(app: &FilmcraftApp, items: &mut Vec<MenuItem>) {
                 shortcut: app.session.shortcuts.primary(&id),
                 enabled: true,
                 checked: Some(n == app.ui.workspace),
+                reason: None,
                 id,
             }
         })

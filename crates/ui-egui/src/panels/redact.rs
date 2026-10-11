@@ -5,7 +5,8 @@
 //! Fill…) enters a draw mode on the Program monitor; the drag (automation id `program.redact.draw`)
 //! draws a rubber band, and the release maps it into the top-most video clip under the box (clip
 //! pixels) and runs `redact.add` with that style, tracking only when `track` (static by default:
-//! the box stays where it was drawn). Esc cancels.
+//! the box stays where it was drawn). Esc cancels. The clip that got the box becomes the selected
+//! clip; Redact Area ▸ Remove Redaction N (`panels::layout`) takes a redaction off again.
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, StrokeKind};
 use filmcraft_geom::{Affine, Vec2};
@@ -156,6 +157,9 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
     let ctx = ui.ctx().clone();
     match crate::menus::invoke(app, &ctx, "redact.add", params) {
         Ok(v) => {
+            // the clip that got the box becomes the selected clip, so Effect Controls shows the new
+            // effect and the Layout menus (Redact Area ▸ Remove Redaction N) act on it
+            app.session.state.selection = vec![clip];
             let name = v["name"].as_str().unwrap_or("Redaction");
             app.ui.status = match v["trackError"].as_str() {
                 Some(e) => format!("{name} added (tracking failed: {e})"),
