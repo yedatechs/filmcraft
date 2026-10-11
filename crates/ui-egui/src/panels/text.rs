@@ -859,7 +859,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                             _ => (i, i),
                         });
                         let (a, b) = app.ui.transcript_sel.unwrap_or((i, i));
-                        actions.push(("transcript.select".into(), json!({"from": a.min(b), "to": a.max(b)})));
+                        actions.push(("transcript.select".into(), json!({"from": a.min(b), "to": a.max(b), "mark": false})));
                     }
                     for ci in cuts_after.get(&i).into_iter().flatten() {
                         span(app, ui, *ci, &mut actions);
@@ -876,7 +876,7 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if app.ui.transcript_drag.is_some() && ui.input(|inp| !inp.pointer.any_down()) {
         app.ui.transcript_drag = None;
         if let Some((a, b)) = app.ui.transcript_sel {
-            actions.push(("transcript.select".into(), json!({"from": a.min(b), "to": a.max(b)})));
+            actions.push(("transcript.select".into(), json!({"from": a.min(b), "to": a.max(b), "mark": false})));
         }
     }
     if let Some(r) = takes_rect {

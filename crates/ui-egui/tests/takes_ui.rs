@@ -220,6 +220,17 @@ fn a_click_on_a_crossed_out_word_puts_back_that_word_only() {
     assert_eq!(d.ids("text.transcript.extract").len(), 1);
     assert!(d.ids("text.transcript.lift").is_empty());
 
+    // selecting live words (a click, a drag) moves the playhead and marks nothing: an In / Out
+    // range left behind by a selection is what a later export would have taken for its range
+    d.click("text.transcript.word.2");
+    d.ok("ui.drag", json!({"from": {"id": "text.transcript.word.6"}, "to": {"id": "text.transcript.word.8"}, "steps": 6}));
+    d.frames(3);
+    {
+        let q = d.harness.state().session.active_sequence().unwrap();
+        assert_eq!((q.mark_in, q.mark_out), (None, None), "selecting text left In / Out marks");
+    }
+    assert!(d.harness.state().ui.transcript_sel.is_some());
+
     // a click on "the": that word is back, its neighbours stay crossed out
     d.click("text.transcript.cut.0.2");
     d.frames(3);

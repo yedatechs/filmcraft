@@ -347,6 +347,29 @@ fn putting_text_back_never_costs_a_clip_its_effects() {
 }
 
 #[test]
+fn selecting_text_can_leave_in_and_out_alone() {
+    let (mut s, _) = session();
+    let marks = |s: &Session| {
+        let q = s.active_sequence().unwrap();
+        (q.mark_in, q.mark_out)
+    };
+    assert_eq!(marks(&s), (None, None));
+    let depth = s.history.undo.len();
+    // what the Text panel sends: the playhead goes to the words, nothing is marked and nothing
+    // is added to the undo history (an export would take a marked word for the part to export)
+    let r = s.execute("transcript.select", json!({"from": 3, "to": 4, "mark": false})).unwrap();
+    assert_eq!(marks(&s), (None, None));
+    assert_eq!(s.history.undo.len(), depth);
+    assert_eq!(s.playhead().0, r["start"].as_i64().unwrap());
+    // the command's own default still marks In / Out around the words, as one undo step
+    s.execute("transcript.select", json!({"from": 3, "to": 4})).unwrap();
+    let (i, o) = marks(&s);
+    assert_eq!(i.map(|t| t.0), r["start"].as_i64());
+    assert!(o.is_some_and(|o| o.0 < r["end"].as_i64().unwrap()));
+    assert_eq!(s.history.undo.len(), depth + 1);
+}
+
+#[test]
 fn hostile_parameters_are_errors_not_crashes() {
     let (mut s, item) = session();
     for (cmd, p) in [

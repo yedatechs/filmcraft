@@ -360,8 +360,32 @@ fn export_button_and_quick_export_popup() {
     // Quick Export: header button → popup with presets → Export
     d.exec("markers.markIn", json!({"seconds": 0.0}));
     d.exec("markers.markOut", json!({"seconds": 0.2}));
+    // the Export page says when its range leaves part of the sequence out, and Custom starts
+    // as the range it replaces instead of a fixed ten seconds
+    assert!(d.has("export.range.note"), "custom 0 to 0.5 s (set above) is a fraction of the sequence");
+    d.ok("ui.set", json!({"export": {"range": "entire"}}));
+    d.frames(2);
+    assert!(!d.has("export.range.note"), "the whole sequence: nothing to warn about");
+    d.ok("ui.set", json!({"export": {"range": "inOut"}}));
+    d.frames(2);
+    assert!(d.has("export.range.note"), "In to Out is a fraction of a second of the sequence");
+    d.click("export.range");
+    d.click("export.range.option.3");
+    d.frames(2);
+    {
+        let ex = &d.app().ui.export;
+        assert_eq!(ex.range, "custom");
+        assert!(ex.custom_start.abs() < 1e-6 && (ex.custom_end - 0.2).abs() < 0.1, "Custom took over In to Out: {} to {}", ex.custom_start, ex.custom_end);
+    }
     d.click("header.quickExport");
     assert!(d.app().ui.export.quick_open);
+    // Quick Export takes In to Out when it is marked: it says so and offers the whole sequence
+    assert!(d.has("quickExport.range.note"));
+    assert!(!d.app().ui.export.quick_entire);
+    d.click("quickExport.entire");
+    assert!(d.app().ui.export.quick_entire);
+    d.click("quickExport.entire");
+    assert!(!d.app().ui.export.quick_entire, "this test exports In to Out, a fraction of a second");
     for id in ["quickExport.path", "quickExport.go", "quickExport.preset.Match Source – Adaptive High Bitrate", "quickExport.preset.YouTube 1080p Full HD"] {
         assert!(d.has(id), "{id}");
     }

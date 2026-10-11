@@ -27,7 +27,7 @@ the control channel and MCP agents can do the same.
 | `transcript.delete` | Remove transcripts. |
 | `transcript.inspect` | The sequence transcript: words (index, text, sequence times, speaker, clip), paragraphs, speakers, the word at the playhead. |
 | `transcript.search` | Word-index ranges matching a phrase (case and punctuation ignored; the last word may be a prefix). |
-| `transcript.select` | Mark In/Out around words `from..=to` (frame-snapped outward) and move the playhead there. |
+| `transcript.select` | Move the playhead to words `from..=to` and mark In/Out around them (frame-snapped outward, one undo step); `mark: false` only moves the playhead. The Text panel passes `mark: false`: a selection there never leaves an In/Out range behind (Quick Export and the Export page's Source In/Out would export only that range, a few frames for one word). |
 | `transcript.extract` / `transcript.lift` | Extract (ripple) or lift the words' frames on the targeted tracks. The playhead stays where it was unless it was inside the removed words (then it moves to the cut point); `transcript.restore` leaves it alone too. |
 | `transcript.renameSpeaker` | Rename a speaker by name (every transcript) or by index in one `item`. |
 | `transcript.removeFillers` | Ripple-delete filler words (`fillers`, default um/uh/erm/…; phrases such as "you know" allowed). |

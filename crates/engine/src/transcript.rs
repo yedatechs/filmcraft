@@ -482,14 +482,20 @@ fn range_json(r: TimeRange) -> Value {
     json!({"start": r.start.0, "end": r.end().0})
 }
 
+/// `transcript.select {from, to?, mark?}`: move the playhead to the words and, unless `mark` is
+/// false, mark In/Out around them (one undo step). The Text panel passes `mark: false`: selecting
+/// words to read or cross them out must not leave an In/Out range behind, which an export would
+/// then take for the part to export.
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
     let r = range_p(s, p, "transcript.select")?;
-    let fd = s.sequence_rate().frame_duration();
-    s.edit_sequence("Mark Transcript Selection", |q, _, _| {
-        q.mark_in = Some(r.start);
-        q.mark_out = Some(r.end() - fd);
-        Ok(())
-    })?;
+    if bool_p(p, "mark").unwrap_or(true) {
+        let fd = s.sequence_rate().frame_duration();
+        s.edit_sequence("Mark Transcript Selection", |q, _, _| {
+            q.mark_in = Some(r.start);
+            q.mark_out = Some(r.end() - fd);
+            Ok(())
+        })?;
+    }
     s.set_playhead(r.start);
     Ok(range_json(r))
 }
@@ -820,7 +826,7 @@ pub fn commands() -> Vec<CommandSpec> {
         ),
         spec("transcript.models", "List Speech Models", &[], "{}", always, models, false),
         spec("transcript.downloadModel", "Download Speech Model", &[], r#"{"model":"whisper-base"?}"#, can_download, download_model, true),
-        spec("transcript.select", "Mark Selected Text", &[], r#"{"from":word,"to":word?}"#, has_transcript, select, true),
+        spec("transcript.select", "Mark Selected Text", &[], r#"{"from":word,"to":word?,"mark":bool=true}"#, has_transcript, select, true),
         spec("transcript.extract", "Extract Selected Text", &[], r#"{"from":word,"to":word?}"#, has_transcript, |s, p| extract_or_lift(s, p, true), true),
         spec("transcript.lift", "Lift Selected Text", &[], r#"{"from":word,"to":word?}"#, has_transcript, |s, p| extract_or_lift(s, p, false), true),
         spec(

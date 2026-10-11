@@ -57,6 +57,8 @@ pub struct ExportUi {
     pub quick_open: bool,
     pub quick_path: String,
     pub quick_preset: String,
+    /// Quick Export: the whole sequence although In / Out are marked.
+    pub quick_entire: bool,
 }
 
 impl Default for ExportUi {
@@ -76,6 +78,7 @@ impl Default for ExportUi {
             quick_open: false,
             quick_path: String::new(),
             quick_preset: String::new(),
+            quick_entire: false,
         }
     }
 }
@@ -905,6 +908,13 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
         let cur = RANGES.iter().find(|(k, _)| *k == ex.range).map(|x| x.1).unwrap_or("Entire Source");
         let labels: Vec<(String, bool)> = RANGES.iter().map(|(k, l)| (l.to_string(), *k != "workArea" || has_work_area)).collect();
         if let Some(i) = combo(ui, &mut reg, "export.range", cur, &labels, 140.0) {
+            if RANGES[i].0 == "custom" && ex.range != "custom" {
+                // Custom starts as the range it replaces (the whole sequence, In to Out…), not
+                // as a fixed ten seconds
+                let (a, b) = range_ticks(ex, &q);
+                ex.custom_start = a.seconds();
+                ex.custom_end = b.seconds();
+            }
             ex.range = RANGES[i].0.into();
         }
         if ex.range == "custom" {
@@ -925,6 +935,15 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
     }
     // summary
     let range = range_ticks(ex, &q);
+    let whole = q.duration().max(rate.frame_duration());
+    let exported = range.1 - range.0;
+    // a range that leaves part of the sequence out says so, where it is seen before Export
+    let partial = exported + rate.frame_duration() < whole;
+    if partial {
+        let note = format!("Exports {:.2} s of the {:.2} s sequence. Range ▸ Entire Source exports all of it.", exported.seconds(), whole.seconds());
+        let r = child.label(egui::RichText::new(&note).color(crate::panels::record::AMBER).size(11.5));
+        reg.add("export.range.note", r.rect, note);
+    }
     let sum = ex.settings.summary(q.settings.width, q.settings.height, rate, q.settings.sample_rate, range.1 - range.0);
     child.add_space(8.0);
     let resp = egui::Frame::NONE
@@ -948,7 +967,12 @@ fn preview_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, seq_id:
                 line(
                     ui,
                     "Range",
-                    &format!("{} ({:.2} s)", RANGES.iter().find(|(k, _)| *k == ex.range).map(|x| x.1).unwrap_or(""), (range.1 - range.0).seconds()),
+                    &format!(
+                        "{} ({:.2} s{})",
+                        RANGES.iter().find(|(k, _)| *k == ex.range).map(|x| x.1).unwrap_or(""),
+                        exported.seconds(),
+                        if partial { format!(" of {:.2} s", whole.seconds()) } else { String::new() }
+                    ),
                 );
             });
         })
@@ -1212,11 +1236,21 @@ pub fn quick_export(app: &mut FilmcraftApp, ctx: &egui::Context, anchor: egui::P
         };
         app.ui.export.quick_path = std::path::Path::new(&dir).join(format!("{name}.{ext}")).to_string_lossy().to_string();
     }
-    let est = app
-        .session
-        .execute("export.resolve", json!({"preset": app.ui.export.quick_preset}))
-        .ok()
-        .and_then(|v| v["summary"]["estimated_size"].as_str().map(str::to_string));
+    // (marked seconds, whole seconds) when the sequence has an In or Out mark that leaves part of
+    // it out
+    let quick_range = app.session.active_sequence().and_then(|q| {
+        let fd = q.settings.frame_rate.frame_duration();
+        let whole = q.duration().max(fd);
+        let a = q.mark_in.unwrap_or(Tick::ZERO);
+        let b = q.mark_out.map(|o| o + fd).unwrap_or(whole).max(a + fd);
+        ((q.mark_in.is_some() || q.mark_out.is_some()) && (b - a) + fd < whole).then(|| ((b - a).seconds(), whole.seconds()))
+    });
+    let entire = quick_range.is_some() && app.ui.export.quick_entire;
+    let mut resolve = json!({"preset": app.ui.export.quick_preset});
+    if entire {
+        resolve["range"] = json!("entire");
+    }
+    let est = app.session.execute("export.resolve", resolve).ok().and_then(|v| v["summary"]["estimated_size"].as_str().map(str::to_string));
     let presets = quick_presets(app);
     let mut reg = Reg::default();
     let mut go = false;
@@ -1248,6 +1282,15 @@ pub fn quick_export(app: &mut FilmcraftApp, ctx: &egui::Context, anchor: egui::P
                 }
             });
             ui.add_space(4.0);
+            if let Some((marked, whole)) = quick_range {
+                // In to Out is what Quick Export takes when the sequence has marks: say so, and
+                // offer the whole sequence
+                let note = format!("In to Out is marked: {marked:.2} s of the {whole:.2} s sequence.");
+                let r = ui.label(egui::RichText::new(&note).color(crate::panels::record::AMBER).size(11.5));
+                reg.add("quickExport.range.note", r.rect, note);
+                let r = ui.checkbox(&mut q.quick_entire, "Export the whole sequence instead");
+                reg.add("quickExport.entire", r.rect, format!("Export the whole sequence {}", q.quick_entire));
+            }
             ui.label(egui::RichText::new(format!("Estimated file size: {}", est.as_deref().unwrap_or("–"))).color(t.text_dim).size(11.5));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let r = ui
@@ -1262,7 +1305,10 @@ pub fn quick_export(app: &mut FilmcraftApp, ctx: &egui::Context, anchor: egui::P
     let toggled = ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("quick-export-toggled")).unwrap_or(false));
     reg.flush(app);
     if go {
-        let p = json!({"preset": app.ui.export.quick_preset, "path": app.ui.export.quick_path});
+        let mut p = json!({"preset": app.ui.export.quick_preset, "path": app.ui.export.quick_path});
+        if entire {
+            p["range"] = json!("entire");
+        }
         match app.session.execute("export.quick", p) {
             Ok(v) => app.ui.status = format!("Quick Export: {}", v["path"].as_str().unwrap_or("")),
             Err(e) => app.ui.status = e.to_string(),

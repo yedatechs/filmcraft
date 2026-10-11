@@ -300,6 +300,16 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     let layout = Layout { content, ruler, rows: rows.clone(), pps, scroll, split_y };
     app.tl.layout = Some(layout.clone());
+    // the blank parts above the first track and under the last, where a marquee can start (for
+    // automation)
+    let rows_top = rows.iter().map(|r| r.rect.min.y).fold(content.max.y, f32::min);
+    let rows_bottom = rows.iter().map(|r| r.rect.max.y).fold(content.min.y, f32::max);
+    if rows_top - content.min.y > 8.0 {
+        app.auto.add("timeline.blank.above", Rect::from_min_max(content.min, pos2(content.max.x, rows_top)), "Empty area above the tracks");
+    }
+    if content.max.y - rows_bottom > 8.0 {
+        app.auto.add("timeline.blank.below", Rect::from_min_max(pos2(content.min.x, rows_bottom), content.max), "Empty area under the tracks");
+    }
 
     // ---- backgrounds
     painter.rect_filled(Rect::from_min_max(pos2(content.min.x, content.min.y), content.max), 0.0, t.tl_bg);
@@ -1891,7 +1901,20 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
             (_, Hit::Transition { .. }) => None,
             (_, Hit::Empty { .. }) => {
                 if resp.drag_started() {
-                    Some(Drag::Marquee { start: p })
+                    // from where the button went down, not from where the drag was recognised
+                    Some(Drag::Marquee { start: ctx.input(|i| i.pointer.press_origin()).unwrap_or(p) })
+                } else {
+                    app.session.state.selection.clear();
+                    app.session.state.edit_points.clear();
+                    None
+                }
+            }
+            // The blank part of the Timeline (under the last track, above the first, between the
+            // video and the audio tracks) starts a marquee too, and a click there deselects: when
+            // every track is full of clips there is no empty lane to start a drag in.
+            (_, Hit::None) if layout.content.contains(p) => {
+                if resp.drag_started() {
+                    Some(Drag::Marquee { start: ctx.input(|i| i.pointer.press_origin()).unwrap_or(p) })
                 } else {
                     app.session.state.selection.clear();
                     app.session.state.edit_points.clear();
