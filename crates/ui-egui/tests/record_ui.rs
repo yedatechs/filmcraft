@@ -891,3 +891,111 @@ fn the_popout_survives_the_panel_being_minimized() {
     assert_eq!(popouts(&mut d), json!([]));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------------------------------------------------- pause / resume
+
+fn paused(d: &Driver) -> bool {
+    d.harness.state().session.record.active.as_ref().is_some_and(|a| a.paused())
+}
+
+fn label_of(d: &mut Driver, id: &str) -> String {
+    d.element(id).unwrap_or_else(|| panic!("{id} is not on screen"))["label"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn pause_and_resume_from_the_panel_the_strip_and_the_popout() {
+    let dir = tmp("pause-ui");
+    let mut d = Driver::new(&dir);
+    pop_out(&mut d, json!(0), json!({"screen": "display:synthetic:display", "mics": [{"device": "default"}]}));
+    // nothing records: the panel's Pause is there (disabled), the pop-out has none
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Pause");
+    assert!(d.element("record.preview.1.pause").is_none());
+    d.click("record.panel.pause");
+    assert!(!d.harness.state().session.record.recording() && d.harness.state().ui.record.error.is_empty());
+    d.click("record.panel.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.status);
+    d.run_for(0.4);
+    assert_eq!(label_of(&mut d, "record.preview.1.pause"), "Pause");
+    // the panel's Pause: every place says Paused, in amber, and the time stands still
+    d.click("record.panel.pause");
+    assert!(paused(&d), "{}", d.harness.state().ui.record.error);
+    d.frames(2);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Resume");
+    assert_eq!(label_of(&mut d, "record.preview.1.pause"), "Resume");
+    assert_eq!(label_of(&mut d, "record.preview.1.record"), "Stop");
+    let stop = label_of(&mut d, "record.panel.record");
+    assert!(stop.starts_with("■  Stop  Paused 00:0"), "{stop}");
+    let time = label_of(&mut d, "record.preview.1.time");
+    assert!(time.starts_with("Paused 00:0"), "{time}");
+    let live = d.harness.state().ui.record.live.clone();
+    assert!(live.starts_with("Paused · 00:0") && live.contains("screen ") && live.contains("camera "), "{live}");
+    assert_eq!(overlay(&mut d)["state"], "paused");
+    assert!(label_of(&mut d, "record.overlay").starts_with("paused display:synthetic:display"));
+    d.snapshot("paused");
+    let frames = |d: &mut Driver| {
+        let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
+        st["sources"].as_array().unwrap().iter().map(|s| s["frames"].as_u64().unwrap()).collect::<Vec<_>>()
+    };
+    // what was captured just before the pause is still on its way into the files for a moment
+    d.run_for(0.3);
+    let before = frames(&mut d);
+    let n = frame_no(&label_of(&mut d, "record.preview.1"));
+    d.run_for(1.2);
+    assert_eq!(label_of(&mut d, "record.preview.1.time"), time, "the time stands still while paused");
+    assert_eq!(frames(&mut d), before, "nothing is written while paused");
+    assert!(frame_no(&label_of(&mut d, "record.preview.1")) > n + 10, "the preview keeps running while paused");
+    // the pop-out's Resume: recording again everywhere
+    d.click("record.preview.1.pause");
+    assert!(!paused(&d), "{}", d.harness.state().ui.record.error);
+    d.frames(2);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Pause");
+    assert_eq!(label_of(&mut d, "record.preview.1.pause"), "Pause");
+    assert!(label_of(&mut d, "record.preview.1.time").starts_with("● 00:0"));
+    assert!(label_of(&mut d, "record.panel.record").starts_with("■  Stop  00:0"));
+    assert!(d.harness.state().ui.record.live.starts_with("Recording · 00:0"));
+    assert_eq!(overlay(&mut d)["state"], "recording");
+    d.run_for(0.3);
+    assert!(frames(&mut d).iter().zip(&before).all(|(now, then)| now > then), "the files grow again");
+    // the pop-out's Pause, then the minimized strip shows it and resumes
+    d.click("record.preview.1.pause");
+    assert!(paused(&d));
+    d.click("record.panel.minimize");
+    d.frames(3);
+    assert!(d.harness.state().ui.record.minimized);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Resume");
+    assert!(label_of(&mut d, "record.panel.record").starts_with("■  Stop  Paused 00:0"));
+    d.snapshot("paused-strip");
+    d.click("record.panel.pause");
+    assert!(!paused(&d));
+    d.frames(2);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Pause");
+    d.run_for(0.3);
+    // the strip's Pause, then Stop while paused: the sequence is built from what was recorded
+    d.click("record.panel.pause");
+    assert!(paused(&d));
+    let before = d.sequences();
+    d.click("record.panel.record");
+    assert!(!d.harness.state().session.record.recording());
+    assert_eq!(d.sequences(), before + 1);
+    let last = d.harness.state().ui.record.last.clone();
+    assert!(last.starts_with("Recorded ") && last.contains("3 file(s)"), "{last}");
+    d.frames(2);
+    assert!(d.element("record.panel.pause").is_none(), "the strip has no Pause when nothing records");
+    assert!(d.element("record.preview.1.pause").is_none() && d.element("record.preview.1.time").is_none());
+    assert!(d.harness.state().ui.record.live.is_empty());
+    assert!(overlay(&mut d).is_null(), "the border goes when the recording stops");
+    // the three pauses are in every sidecar
+    let sides: Vec<Value> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".recording.json"))
+        .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(sides.len(), 3);
+    for sd in &sides {
+        assert_eq!(sd["pauses"].as_array().unwrap().len(), 3, "{sd}");
+        assert!(sd["paused_ns"].as_u64().unwrap() > 1_000_000_000, "{sd}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

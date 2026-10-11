@@ -8,7 +8,7 @@
 //! The pop-out is the size of the camera picture: its long side is [`POPOUT_LONG_SIDE`] points,
 //! the other side follows the picture as shown (after Mirror / Rotate), and a control bar
 //! ([`POPOUT_BAR`] points) sits under it: the state and time, Record / Stop (Cancel while a
-//! countdown or a start runs) and the microphone level. The window's callback cannot reach the
+//! countdown or a start runs), Pause / Resume while recording, and the microphone level. The window's callback cannot reach the
 //! app, so [`sync`] writes what the bar shows into [`Popout::status`] every frame of the main
 //! window and runs the clicks the bar queued in [`Popout::actions`] through the panel's own
 //! functions.
@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 
 use filmcraft_engine::record_preview::{CameraTap, PREVIEW_TITLE, PreviewFrame, oriented};
 
-use super::record::{CameraRow, Quality};
+use super::record::{AMBER, CameraRow, Quality};
 use crate::FilmcraftApp;
 
 /// The thumbnail box in a camera row (16:9).
@@ -49,7 +49,6 @@ pub const POPOUT_BAR: f32 = 28.0;
 pub const POPOUT_MIN: egui::Vec2 = vec2(160.0, 118.0);
 
 const RED: Color32 = Color32::from_rgb(0xd8, 0x50, 0x3f);
-const AMBER: Color32 = Color32::from_rgb(0xe0, 0xa0, 0x30);
 
 /// A picture `shown` (pixels, after Rotate) with its long side `long` points: 320 × 180 for 16:9,
 /// 180 × 320 for 9:16.
@@ -90,8 +89,8 @@ pub struct PopoutStatus {
     pub paused: bool,
     /// Recorded time, seconds.
     pub elapsed: f64,
-    /// The state and time at the left of the bar: `● 00:12`, the countdown, `Starting…`; empty
-    /// when idle.
+    /// The state and time at the left of the bar: `● 00:12`, `Paused 00:12`, the countdown,
+    /// `Starting…`; empty when idle.
     pub label: String,
     /// The loudest microphone's peak, 0 to 1 (None: no microphone, the meter stays empty).
     pub level: Option<f32>,

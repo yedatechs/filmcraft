@@ -9,7 +9,7 @@
 //! `.quality` (+ `.quality.<i>`), `.mirror`, `.offset`, `.remove`, and `record.panel.camera.add`;
 //! per microphone row `record.panel.mic.<n>.device` (+ `.device.<i>`), `.remove`, and
 //! `record.panel.mic.add`; `record.panel.name`, `record.panel.record` (Record / Stop),
-//! `record.panel.cancel`, `record.panel.refresh`, `record.panel.counters`, `record.panel.level`,
+//! `record.panel.pause` (Pause / Resume), `record.panel.cancel`, `record.panel.refresh`, `record.panel.counters`, `record.panel.level`,
 //! `record.panel.error`, `record.panel.close`, the title row's `record.panel.minimize` (–),
 //! `record.panel.restore` (+, while minimized) and `record.panel.titleClose` (×); the Program monitor button is
 //! `program.transport.record`. UI command: `window.record` (open). The panel state is
@@ -24,6 +24,8 @@ use crate::FilmcraftApp;
 use filmcraft_engine::record_settings::CameraRotate;
 
 const RED: Color32 = Color32::from_rgb(0xd8, 0x50, 0x3f);
+/// A paused recording: its time, the Stop button, the border's pill.
+pub(crate) const AMBER: Color32 = Color32::from_rgb(0xe0, 0xa0, 0x30);
 
 /// Camera quality: the size asked of the camera.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,8 +249,16 @@ pub(crate) fn popout_status(app: &FilmcraftApp) -> super::record_preview::Popout
     }
     let st = filmcraft_engine::record::status_of(&app.session);
     let elapsed = st["elapsed"].as_f64().unwrap_or(0.0);
+    let paused = st["paused"] == true;
     PopoutStatus {
-        recording: true, elapsed, label: format!("● {}", mmss(elapsed)), level: mic_level(&st), record: ("Stop", PopoutAction::Stop, true), ..idle
+        recording: true,
+        paused,
+        elapsed,
+        label: if paused { time_text(elapsed, true) } else { format!("● {}", mmss(elapsed)) },
+        level: mic_level(&st),
+        record: ("Stop", PopoutAction::Stop, true),
+        pause: Some(if paused { ("Resume", PopoutAction::Resume) } else { ("Pause", PopoutAction::Pause) }),
+        ..idle
     }
 }
 
@@ -259,10 +269,13 @@ pub(crate) fn run_popout_action(app: &mut FilmcraftApp, action: super::record_pr
     use super::record_preview::PopoutAction;
     let rec = &app.session.record;
     let pending = rec.countdown.is_some() || rec.starting.is_some();
+    let paused = rec.active.as_ref().is_some_and(|a| a.paused());
     match action {
         PopoutAction::Record if !rec.recording() && !pending => toggle(app),
         PopoutAction::Stop if rec.recording() => toggle(app),
         PopoutAction::Cancel if pending => cancel(app),
+        PopoutAction::Pause if rec.recording() && !paused => pause_toggle(app),
+        PopoutAction::Resume if paused => pause_toggle(app),
         _ => {}
     }
 }
@@ -289,7 +302,14 @@ pub fn status_line(app: &FilmcraftApp) -> Option<String> {
     if parts.is_empty() && frames("mic").is_some() {
         parts.push("microphone".into());
     }
-    Some(format!("Recording · {} · {}", mmss(st["elapsed"].as_f64().unwrap_or(0.0)), parts.join(" / ")))
+    let state = if st["paused"] == true { "Paused" } else { "Recording" };
+    Some(format!("{state} · {} · {}", mmss(st["elapsed"].as_f64().unwrap_or(0.0)), parts.join(" / ")))
+}
+
+/// The recorded time as the panel, the strip and the pop-outs show it: `00:12`, or
+/// `Paused 00:12` while the recording is paused.
+pub(crate) fn time_text(elapsed: f64, paused: bool) -> String {
+    if paused { format!("Paused {}", mmss(elapsed)) } else { mmss(elapsed) }
 }
 
 /// The `record.start` parameters for the panel's choices.
@@ -475,6 +495,17 @@ pub fn cancel(app: &mut FilmcraftApp) {
     app.ui.record.live.clear();
 }
 
+/// Pause / Resume: the panel's button, the strip's and the pop-outs'. Nothing goes into the
+/// files while paused; the previews, the border and the microphone level stay live.
+pub fn pause_toggle(app: &mut FilmcraftApp) {
+    let Some(a) = app.session.record.active.as_ref() else { return };
+    let id = if a.paused() { "record.resume" } else { "record.pause" };
+    if let Err(e) = app.session.execute(id, json!({})) {
+        app.ui.record.error = e.to_string();
+        app.ui.status = e.to_string();
+    }
+}
+
 fn combo(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, id: &str, value: &mut String, options: &[(String, String)], enabled: bool, width: f32) {
     let shown = options.iter().find(|o| o.0 == *value).map(|o| o.1.clone()).unwrap_or_else(|| if value.is_empty() { "Off".into() } else { value.clone() });
     let cb = ui.add_enabled_ui(enabled, |ui| {
@@ -491,13 +522,20 @@ fn combo(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, id: &str, v
     elems.push((id.to_string(), cb.inner.response.rect, shown));
 }
 
-/// The Record / Stop button (red, with the elapsed time while recording); true when clicked.
-fn record_button(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, label: &str, enabled: bool) -> bool {
-    let b = ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(label).color(Color32::WHITE).size(16.0)).fill(RED).corner_radius(18.0).min_size(vec2(150.0, 36.0)),
-    );
+/// The Record / Stop button (red, with the elapsed time while recording; amber with
+/// `Paused 00:12` while paused); true when clicked.
+fn record_button(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, label: &str, enabled: bool, paused: bool) -> bool {
+    let (fill, ink) = if paused { (AMBER, Color32::from_gray(20)) } else { (RED, Color32::WHITE) };
+    let b = ui.add_enabled(enabled, egui::Button::new(RichText::new(label).color(ink).size(16.0)).fill(fill).corner_radius(18.0).min_size(vec2(150.0, 36.0)));
     elems.push(("record.panel.record".into(), b.rect, label.to_string()));
+    b.clicked()
+}
+
+/// The Pause / Resume button right of Stop (`record.panel.pause`); true when clicked.
+fn pause_button(ui: &mut egui::Ui, elems: &mut Vec<(String, Rect, String)>, paused: bool, enabled: bool) -> bool {
+    let text = if paused { "Resume" } else { "Pause" };
+    let b = ui.add_enabled(enabled, egui::Button::new(text));
+    elems.push(("record.panel.pause".into(), b.rect, text.to_string()));
     b.clicked()
 }
 
@@ -605,7 +643,10 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let sys_ok = dev["systemAudio"].as_bool().unwrap_or(false);
     let mut patch = serde_json::Map::new();
     let mut choose_folder = false;
-    let (mut do_toggle, mut do_cancel, mut do_refresh, mut close) = (false, false, false, false);
+    let (mut do_toggle, mut do_cancel, mut do_refresh, mut close, mut do_pause) = (false, false, false, false, false);
+    // a recording runs (not a countdown or a start): it can be paused
+    let active = st.is_some();
+    let paused = st.as_ref().is_some_and(|s| s["paused"] == true);
     let accent = app.tokens.accent;
     let dim = app.tokens.text_dim;
     let preview = app.ui.record.preview.clone();
@@ -615,7 +656,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     } else if let Some(left) = countdown_left {
         format!("{}  (Cancel)", countdown_text(left))
     } else if recording {
-        format!("■  Stop  {}", mmss(st.as_ref().and_then(|s| s["elapsed"].as_f64()).unwrap_or(0.0)))
+        format!("■  Stop  {}", time_text(st.as_ref().and_then(|s| s["elapsed"].as_f64()).unwrap_or(0.0), paused))
     } else {
         "●  Record".to_string()
     };
@@ -634,8 +675,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             if r.minimized {
                 // the strip: Record / Stop with the time, and the cameras at the recording size
                 ui.horizontal(|ui| {
-                    if record_button(ui, &mut elems, &record_label, starting_label.is_none()) {
+                    if record_button(ui, &mut elems, &record_label, starting_label.is_none(), paused) {
                         do_toggle = true;
+                    }
+                    if active && pause_button(ui, &mut elems, paused, true) {
+                        do_pause = true;
                     }
                     for (i, c) in r.cameras.iter_mut().enumerate().filter(|(_, c)| !c.device.is_empty()) {
                         super::record_preview::thumbnail(ui, &mut elems, &preview, session, i + 1, c, true);
@@ -787,8 +831,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 // disabled while the sources start (Cancel stops them)
-                if record_button(ui, &mut elems, &record_label, starting_label.is_none()) {
+                if record_button(ui, &mut elems, &record_label, starting_label.is_none(), paused) {
                     do_toggle = true;
+                }
+                if pause_button(ui, &mut elems, paused, active) {
+                    do_pause = true;
                 }
                 let c = ui.add_enabled(recording, egui::Button::new("Cancel"));
                 elems.push(("record.panel.cancel".into(), c.rect, "Cancel (discard the recording)".into()));
@@ -874,6 +921,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     }
     if do_toggle {
         toggle(app);
+    }
+    if do_pause {
+        pause_toggle(app);
     }
     if do_cancel {
         cancel(app);

@@ -766,3 +766,515 @@ fn a_source_that_never_delivers_fails_the_start_and_leaves_no_files() {
     assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "no files remain");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ------------------------------------------------------------------------------------- pause / resume
+
+/// The pause tests record in real time and compare pictures frame by frame: they take turns, so
+/// their encoders are not starved by each other (the test harness runs a test per core).
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether no video source of a stopped recording dropped a frame. When an encoder could not
+/// keep up (a loaded machine) the oldest waiting frame is dropped and the file shows an older
+/// picture for a while: lengths and cuts are still exact, a frame-by-frame comparison of the
+/// pictures is not.
+fn no_frame_dropped(sides: &[Value]) -> bool {
+    let clean = sides.iter().filter(|sd| sd["source"] == "screen" || sd["source"] == "camera").all(|sd| sd["dropped"] == 0);
+    if !clean {
+        eprintln!("an encoder dropped frames: the pictures are not compared frame by frame in this run");
+    }
+    clean
+}
+
+/// Start the synthetic screen, camera and microphone.
+fn start_three(s: &mut Session, dir: &std::path::Path) -> Value {
+    s.execute(
+        "record.start",
+        json!({"screen": {"display": SyntheticFactory::DISPLAY}, "camera": {"device": SyntheticFactory::CAMERA}, "mic": {}, "dir": dir.to_string_lossy()}),
+    )
+    .unwrap()
+}
+
+/// The recorded seconds of the running recording (`record.status` `elapsed`).
+fn elapsed(s: &mut Session) -> f64 {
+    s.execute("record.status", json!({})).unwrap()["elapsed"].as_f64().unwrap()
+}
+
+/// The length of an imported recording file, seconds.
+fn media_seconds(s: &Session, v: &Value, key: &str) -> f64 {
+    let item = filmcraft_project::ItemId(v["items"][key].as_u64().unwrap());
+    secs(s.project.item(item).unwrap().as_media().unwrap().info.duration)
+}
+
+/// The samples of a mono 32-bit float WAV written by a recording.
+fn wav_f32(path: &str) -> Vec<f32> {
+    let b = std::fs::read(path).unwrap();
+    assert_eq!(wav_fmt(path), (3, 1, 48_000, 32), "{path}");
+    b[44..].as_chunks::<4>().0.iter().map(|x| f32::from_le_bytes(*x)).collect()
+}
+
+fn files_of(v: &Value) -> Vec<String> {
+    v["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect()
+}
+
+/// Every file of a stopped recording is as long as the recorded time, and so they agree: within
+/// 1.5 frames (60 ms).
+fn every_file_lasts(s: &Session, v: &Value, keys: &[&str], recorded: f64) {
+    let lens: Vec<f64> = keys.iter().map(|k| media_seconds(s, v, k)).collect();
+    for (k, d) in keys.iter().zip(&lens) {
+        assert!((d - recorded).abs() < 0.06, "{k} lasts {d} s, recorded {recorded} s ({lens:?})");
+    }
+    let (min, max) = lens.iter().fold((f64::MAX, 0f64), |(lo, hi), d| (lo.min(*d), hi.max(*d)));
+    assert!(max - min < 0.06, "the files agree: {lens:?}");
+}
+
+#[test]
+fn pause_and_resume_cut_every_source_at_the_same_instants() {
+    let _turn = one_at_a_time();
+    let dir = tmp("pause");
+    let mut s = session(0);
+    start_three(&mut s, &dir);
+    std::thread::sleep(Duration::from_millis(500));
+    let p = s.execute("record.pause", json!({})).unwrap();
+    assert_eq!((p["paused"].as_bool(), p["pauses"].as_u64()), (Some(true), Some(1)), "{p}");
+    let at_pause = p["elapsed"].as_f64().unwrap();
+    assert!((0.45..2.0).contains(&at_pause), "paused after about 0.5 s: {p}");
+    // paused: the recorded time stands still, nothing is written, the sources keep running
+    std::thread::sleep(Duration::from_millis(300));
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!((st["recording"].as_bool(), st["paused"].as_bool(), st["pauses"].as_u64()), (Some(true), Some(true), Some(1)), "{st}");
+    assert_eq!(st["elapsed"].as_f64().unwrap(), at_pause, "the time stands still while paused");
+    let frames = |st: &Value, key: &str| st["sources"].as_array().unwrap().iter().find(|x| x["key"] == key).unwrap()["frames"].as_u64().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let st2 = s.execute("record.status", json!({})).unwrap();
+    for key in ["screen", "camera", "mic"] {
+        assert_eq!(frames(&st, key), frames(&st2, key), "{key} writes nothing while paused");
+    }
+    assert!(st2["sources"][2]["level"].as_f64().is_some(), "the microphone is still read: {st2}");
+    assert!(st2["error"].is_null(), "{st2}");
+    let r = s.execute("record.resume", json!({})).unwrap();
+    assert_eq!((r["paused"].as_bool(), r["pauses"].as_u64()), (Some(false), Some(1)), "{r}");
+    assert!((r["elapsed"].as_f64().unwrap() - at_pause).abs() < 0.05, "the time goes on from where it stopped: {r}");
+    std::thread::sleep(Duration::from_millis(500));
+    let before_stop = elapsed(&mut s);
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    assert_eq!(v["pauses"], 1, "{v}");
+    // Stop says how much was recorded: what the status said just before it
+    let recorded = v["elapsed"].as_f64().unwrap();
+    assert!((0.9..3.0).contains(&recorded) && recorded >= before_stop && recorded - before_stop < 0.25, "about 1 s was recorded: {recorded} ({before_stop})");
+    // every file is as long as the recorded time: the pause is in none of them
+    every_file_lasts(&s, &v, &["screen", "camera", "mic"], recorded);
+    let files = files_of(&v);
+    let sides: Vec<Value> = files.iter().map(|f| sidecar(f)).collect();
+    // the sidecars: the pause on the recording clock (the same in each) and its length
+    for sd in &sides {
+        let pauses = sd["pauses"].as_array().unwrap();
+        assert_eq!(pauses.len(), 1, "{sd}");
+        let (from, to) = (pauses[0][0].as_u64().unwrap(), pauses[0][1].as_u64().unwrap());
+        assert!((from as f64 / 1e9 - at_pause).abs() < 1e-6, "the pause began at the recorded time it reported: {sd}");
+        assert_eq!(sd["paused_ns"].as_u64().unwrap(), to - from, "{sd}");
+        assert_eq!(sd["pauses"], sides[0]["pauses"]);
+        assert!(sd["last_sample_ns"].as_u64().unwrap() as f64 / 1e9 <= recorded + 0.06, "sample times are file times: {sd}");
+    }
+    let paused = sides[0]["paused_ns"].as_u64().unwrap() as f64 / 1e9;
+    assert!((0.59..2.0).contains(&paused), "paused for about 0.6 s: {paused}");
+    // the WAV holds the recorded time, to the sample: what was read less the paused samples
+    let n_of = |ns: u64| ns * 48_000 / 1_000_000_000;
+    let (from, to) = (sides[2]["pauses"][0][0].as_u64().unwrap(), sides[2]["pauses"][0][1].as_u64().unwrap());
+    let cut = n_of(to) - n_of(from);
+    let samples = sides[2]["samples"].as_u64().unwrap();
+    assert!((samples as f64 / 48_000.0 - recorded).abs() < 0.001, "{samples} samples, recorded {recorded} s");
+    // the synthetic microphone clicks every 12 000 samples: across the cut the spacing is short
+    // by exactly the paused samples, so not one sample too many or too few was left out
+    let pcm = wav_f32(&files[2]);
+    assert_eq!(pcm.len() as u64, samples);
+    let clicks: Vec<u64> = pcm.iter().enumerate().filter(|(_, v)| **v > 0.4).map(|(i, _)| i as u64).collect();
+    assert!(clicks.len() >= 3, "{clicks:?}");
+    let cut_at = n_of(from);
+    for w in clicks.windows(2) {
+        if w[0] < cut_at && w[1] >= cut_at {
+            assert_eq!((w[1] - w[0] + cut) % 12_000, 0, "clicks {} and {} around the cut of {cut} samples at {cut_at}", w[0], w[1]);
+        } else {
+            assert_eq!(w[1] - w[0], 12_000, "clicks {} and {} away from the cut at {cut_at}", w[0], w[1]);
+        }
+    }
+    assert!(clicks.iter().any(|c| *c < cut_at) && clicks.iter().any(|c| *c >= cut_at), "clicks on both sides of the cut: {clicks:?} / {cut_at}");
+    if no_frame_dropped(&sides) {
+        // the pictures jump by the pause: 0.4 s of file time around it are 0.4 s + the pause of capture
+        for key in ["screen", "camera"] {
+            let (a, b) = (index_at(&mut s, &v, key, at_pause - 0.2), index_at(&mut s, &v, key, at_pause + 0.2));
+            let want = (0.4 + paused) * 30.0;
+            assert!(((b - a) as f64 - want).abs() <= 2.5, "{key}: frames {a} and {b} around the pause, want {want:.1} apart");
+        }
+        // and both show the same moment after it
+        same_moment(&mut s, &v, "screen", "camera", at_pause + 0.25, 2.0);
+        same_moment(&mut s, &v, "screen", "camera", at_pause - 0.25, 2.0);
+    }
+    for key in ["screen", "camera", "mic"] {
+        let c = clip(&s, &v, key);
+        assert_eq!((c.start, c.source_in), (Tick::ZERO, Tick::ZERO), "{key} starts at 0");
+    }
+    assert!(s.voiceover.input.is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn two_pauses_are_both_left_out() {
+    let _turn = one_at_a_time();
+    let dir = tmp("pause-two");
+    let mut s = session(0);
+    start_three(&mut s, &dir);
+    let mut at = Vec::new();
+    for _ in 0..2 {
+        std::thread::sleep(Duration::from_millis(350));
+        at.push(s.execute("record.pause", json!({})).unwrap()["elapsed"].as_f64().unwrap());
+        std::thread::sleep(Duration::from_millis(250));
+        s.execute("record.resume", json!({})).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(350));
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!((st["paused"].as_bool(), st["pauses"].as_u64()), (Some(false), Some(2)), "{st}");
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!((v["errors"].as_array().unwrap().len(), v["pauses"].as_u64()), (0, Some(2)), "{v}");
+    let recorded = v["elapsed"].as_f64().unwrap();
+    assert!(recorded >= st["elapsed"].as_f64().unwrap(), "{v}");
+    every_file_lasts(&s, &v, &["screen", "camera", "mic"], recorded);
+    let sides: Vec<Value> = files_of(&v).iter().map(|f| sidecar(f)).collect();
+    let pauses: Vec<(u64, u64)> = sides[0]["pauses"].as_array().unwrap().iter().map(|p| (p[0].as_u64().unwrap(), p[1].as_u64().unwrap())).collect();
+    assert_eq!(pauses.len(), 2, "{}", sides[0]);
+    assert!(pauses[0].0 < pauses[0].1 && pauses[0].1 < pauses[1].0 && pauses[1].0 < pauses[1].1, "in order: {pauses:?}");
+    let lens: Vec<f64> = pauses.iter().map(|p| (p.1 - p.0) as f64 / 1e9).collect();
+    assert_eq!(sides[0]["paused_ns"].as_u64().unwrap(), pauses.iter().map(|p| p.1 - p.0).sum::<u64>());
+    // a pause is on the recording clock (wall time since the start): the first began at the
+    // recorded time it reported, the second that plus the first pause
+    assert!((pauses[0].0 as f64 / 1e9 - at[0]).abs() < 1e-6, "{pauses:?} {at:?}");
+    assert!((pauses[1].0 as f64 / 1e9 - (at[1] + lens[0])).abs() < 1e-6, "{pauses:?} {at:?}");
+    assert!(sides.iter().all(|sd| sd["pauses"] == sides[0]["pauses"]));
+    if no_frame_dropped(&sides) {
+        // the pictures jump at each pause by its length
+        for (t, len) in at.iter().zip(&lens) {
+            let (a, b) = (index_at(&mut s, &v, "screen", t - 0.15), index_at(&mut s, &v, "screen", t + 0.15));
+            let want = (0.3 + len) * 30.0;
+            assert!(((b - a) as f64 - want).abs() <= 2.5, "frames {a} and {b} around the pause at {t}, want {want:.1} apart");
+        }
+        same_moment(&mut s, &v, "screen", "camera", at[1] + 0.2, 2.0);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stop_while_paused_ends_the_recording_where_the_pause_began() {
+    let _turn = one_at_a_time();
+    let dir = tmp("pause-stop");
+    let mut s = session(0);
+    start_three(&mut s, &dir);
+    std::thread::sleep(Duration::from_millis(500));
+    let at_pause = s.execute("record.pause", json!({})).unwrap()["elapsed"].as_f64().unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!((v["errors"].as_array().unwrap().len(), v["pauses"].as_u64(), v["placed"].as_bool()), (0, Some(1), Some(true)), "{v}");
+    assert_eq!(v["elapsed"].as_f64().unwrap(), at_pause, "the recording ends where the pause began");
+    every_file_lasts(&s, &v, &["screen", "camera", "mic"], at_pause);
+    let files = files_of(&v);
+    let sides: Vec<Value> = files.iter().map(|f| sidecar(f)).collect();
+    for sd in &sides {
+        let p = &sd["pauses"];
+        assert_eq!(p.as_array().unwrap().len(), 1, "{sd}");
+        assert!((p[0][0].as_u64().unwrap() as f64 / 1e9 - at_pause).abs() < 1e-6, "{sd}");
+        assert!(sd["paused_ns"].as_u64().unwrap() >= 390_000_000, "the pause lasted until Stop: {sd}");
+    }
+    // the microphone file ends at the sample the pause began
+    assert_eq!(sides[2]["samples"].as_u64().unwrap(), sides[2]["pauses"][0][0].as_u64().unwrap() * 48_000 / 1_000_000_000);
+    if no_frame_dropped(&sides) {
+        // nothing captured during the pause is at the end of the pictures
+        let (first, last) = (index_at(&mut s, &v, "screen", 0.0), index_at(&mut s, &v, "screen", at_pause - 0.01));
+        assert!(((last - first) as f64 - at_pause * 30.0).abs() <= 2.5, "frames {first}..{last} in {at_pause} s");
+    }
+    assert!(!s.record.recording() && s.voiceover.input.is_some());
+    // a cancel while paused leaves nothing behind
+    let dir2 = tmp("pause-cancel");
+    start_three(&mut s, &dir2);
+    std::thread::sleep(Duration::from_millis(200));
+    s.execute("record.pause", json!({})).unwrap();
+    s.execute("record.cancel", json!({})).unwrap();
+    assert!(std::fs::read_dir(&dir2).unwrap().next().is_none(), "no files remain");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir2).ok();
+}
+
+#[test]
+fn pause_and_resume_are_refused_when_they_make_no_sense() {
+    let dir = tmp("pause-refused");
+    let mut s = Session::default();
+    s.record.factory = Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), camera_delay_ms: 700, ..Default::default() }));
+    let d = dir.to_string_lossy().into_owned();
+    let refused = |s: &mut Session, id: &str, why: &str| {
+        let e = s.execute(id, json!({})).unwrap_err().to_string();
+        assert!(e.contains(why), "{id}: {e}");
+        let spec = crate::commands::find(id).unwrap();
+        assert_eq!((spec.enabled)(s).unwrap_err(), why, "{id} says why it is disabled");
+    };
+    // nothing records
+    refused(&mut s, "record.pause", "not recording");
+    refused(&mut s, "record.resume", "not recording");
+    // the sources are still starting (the camera takes 700 ms)
+    s.execute("record.start", json!({"camera": {"device": SyntheticFactory::CAMERA}, "mic": {}, "dir": d, "wait": false})).unwrap();
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["starting"], true);
+    refused(&mut s, "record.pause", "not recording");
+    refused(&mut s, "record.resume", "not recording");
+    let t0 = std::time::Instant::now();
+    while !s.record.recording() && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+        s.execute("record.status", json!({})).unwrap();
+    }
+    assert!(s.record.recording());
+    // recording: Resume has nothing to resume; Pause works once
+    refused(&mut s, "record.resume", "the recording is not paused");
+    assert!((crate::commands::find("record.pause").unwrap().enabled)(&s).is_ok());
+    s.execute("record.pause", json!({})).unwrap();
+    refused(&mut s, "record.pause", "the recording is already paused");
+    assert!(s.record.active.as_ref().unwrap().paused());
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["pauses"], 1, "a refused pause is not counted");
+    s.execute("record.resume", json!({})).unwrap();
+    refused(&mut s, "record.resume", "the recording is not paused");
+    // a countdown is not a recording either
+    s.execute("record.cancel", json!({})).unwrap();
+    s.execute("record.start", json!({"mic": {}, "dir": d, "countdown": 5})).unwrap();
+    refused(&mut s, "record.pause", "not recording");
+    s.execute("record.cancel", json!({})).unwrap();
+    refused(&mut s, "record.resume", "not recording");
+    // both are listed with their (empty) parameter doc
+    for id in ["record.pause", "record.resume"] {
+        let spec = crate::commands::find(id).unwrap();
+        assert!(!spec.label.is_empty() && spec.params == "{}", "{id}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn hostile_pause_calls_never_panic_and_a_recording_takes_only_so_many_pauses() {
+    let _turn = one_at_a_time();
+    let dir = tmp("pause-hostile");
+    let mut s = session(0);
+    start_three(&mut s, &dir);
+    std::thread::sleep(Duration::from_millis(200));
+    // the parameters are ignored, whatever they are
+    let junk = [json!(null), json!([1, 2, 3]), json!("pause"), json!(1e300), json!(-1), json!({"paused": "no", "elapsed": [], "at": 1e99}), json!(true)];
+    for (i, p) in junk.iter().enumerate() {
+        let id = if i % 2 == 0 { "record.pause" } else { "record.resume" };
+        let r = s.execute(id, p.clone()).unwrap_or_else(|e| panic!("{id} {p}: {e}"));
+        assert_eq!(r["paused"], i % 2 == 0, "{id} {p}: {r}");
+        assert_eq!(r["pauses"].as_u64().unwrap() as usize, i / 2 + 1, "{id} {p}: {r}");
+    }
+    // junk[6] paused it: many quick pauses and resumes in a row, some of them refused
+    for k in 0..40 {
+        let _ = s.execute("record.resume", json!({"k": k}));
+        let _ = s.execute("record.resume", json!({}));
+        let _ = s.execute("record.pause", json!({"k": k}));
+        let _ = s.execute("record.pause", json!({}));
+    }
+    s.execute("record.resume", json!({})).unwrap();
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["pauses"], 44);
+    // a recording remembers its pauses until Stop: there is a limit, and the error says what to do
+    {
+        let ledger = s.record.active.as_ref().unwrap().pauses();
+        let t0 = ledger.pause_at(u64::MAX / 4).unwrap();
+        ledger.resume_at(t0).unwrap();
+        while ledger.count() < crate::record::MAX_PAUSES {
+            let t = ledger.pause_at(0).unwrap();
+            ledger.resume_at(t).unwrap();
+        }
+    }
+    let e = s.execute("record.pause", json!({})).unwrap_err().to_string();
+    assert!(e.contains("paused 10000 times") && e.contains("stop it"), "{e}");
+    assert!(!s.record.active.as_ref().unwrap().paused());
+    // Stop still finishes the files
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!((v["placed"].as_bool(), v["pauses"].as_u64()), (Some(true), Some(10_000)), "{}", v["errors"]);
+    assert!(!s.record.recording() && s.voiceover.input.is_some());
+    assert!(s.execute("record.pause", json!({})).is_err() && s.execute("record.resume", json!([])).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stop_after_counts_recorded_time_not_the_pauses() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tmp("pause-stopafter");
+    let mut s = session(0);
+    let clock = Arc::new(AtomicU64::new(0));
+    s.record.test_clock_ms = Some(clock.clone());
+    s.execute("record.settings", json!({"set": {"stopAfterMinutes": 2}})).unwrap();
+    s.execute("record.start", json!({"mic": {}, "dir": dir.to_string_lossy()})).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    // one minute recorded, one minute paused, one more minute recorded: three minutes of wall time
+    clock.store(60_000, Ordering::Release);
+    s.execute("record.pause", json!({})).unwrap();
+    clock.store(119_000, Ordering::Release);
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["recording"], true);
+    clock.store(120_000, Ordering::Release);
+    let st = s.execute("record.status", json!({})).unwrap();
+    assert_eq!((st["recording"].as_bool(), st["paused"].as_bool()), (Some(true), Some(true)), "two minutes passed, one of them paused: {st}");
+    s.execute("record.resume", json!({})).unwrap();
+    clock.store(179_000, Ordering::Release);
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["recording"], true);
+    clock.store(180_000, Ordering::Release);
+    assert_eq!(s.execute("record.status", json!({})).unwrap()["recording"], false);
+    let ev = s.record.last_event.clone().unwrap();
+    assert_eq!((ev["event"].as_str(), ev["result"]["pauses"].as_u64()), (Some("stoppedAfter"), Some(1)), "{ev}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_pause_is_not_filled_with_silence_in_the_system_audio() {
+    let _turn = one_at_a_time();
+    let dir = tmp("pause-system-audio");
+    let mut s = session(0);
+    s.execute(
+        "record.start",
+        json!({"screen": {"display": SyntheticFactory::DISPLAY, "systemAudio": true}, "mic": {}, "dir": dir.to_string_lossy(), "settings": {"audioFormat": "f32", "channels": "mono"}}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(450));
+    s.execute("record.pause", json!({})).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    s.execute("record.resume", json!({})).unwrap();
+    std::thread::sleep(Duration::from_millis(450));
+    let v = s.execute("record.stop", json!({})).unwrap();
+    assert_eq!(v["errors"].as_array().unwrap().len(), 0, "{v}");
+    let recorded = v["elapsed"].as_f64().unwrap();
+    every_file_lasts(&s, &v, &["screen", "mic", "systemAudio"], recorded);
+    // the tone runs through: half a second of silence would show in the level
+    let pcm = wav_f32(&files_of(&v)[2]);
+    let quiet = pcm.chunks(2400).filter(|c| c.len() == 2400 && c.iter().all(|v| v.abs() < 0.01)).count();
+    assert!(quiet <= 1, "{quiet} silent 50 ms stretches in the system audio");
+    let rms = (pcm.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>() / pcm.len() as f64).sqrt();
+    assert!((rms - 0.25 / 2f64.sqrt()).abs() < 0.02, "the tone fills the file: rms {rms}");
+    let sd = sidecar(&files_of(&v)[2]);
+    assert_eq!(sd["source"], "systemAudio");
+    assert_eq!(sd["pauses"].as_array().unwrap().len(), 1, "{sd}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_still_screen_shows_what_it_looked_like_at_the_resume() {
+    use crate::record::{PauseLedger, SourceStats, video_worker};
+    use filmcraft_export::recorder::MovRecorder;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // a screen that only sends a frame when its picture changes: one before the pause, one
+    // during it (the window the person switched to), none after the resume
+    let dir = tmp("pause-held");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Held - Screen.mov");
+    let rate = filmcraft_time::FrameRate::new(30, 1);
+    let rec = MovRecorder::create(&path, 320, 180, rate, false).unwrap();
+    let queue = Arc::new(FrameQueue::new(8));
+    let (stats, stop, origin, pauses) =
+        (Arc::new(SourceStats::default()), Arc::new(AtomicU64::new(u64::MAX)), Arc::new(AtomicU64::new(u64::MAX)), Arc::new(PauseLedger::default()));
+    let frame =
+        |k: u64, t: u64| CapturedFrame { width: 320, height: 180, stride: 1280, format: PixelFormat::Rgba8, data: synthetic_frame(320, 180, k, t), time_ns: t };
+    const S: u64 = 1_000_000_000;
+    let worker = {
+        let (q, st, sp, o, p) = (queue.clone(), stats.clone(), stop.clone(), origin.clone(), pauses.clone());
+        std::thread::spawn(move || video_worker(rec, q, st, sp, o, p, rate))
+    };
+    origin.store(10 * S, Ordering::Release);
+    queue.push(frame(7, 10 * S)); // the picture at the start
+    pauses.pause_at(11 * S).unwrap(); // paused after 1 s
+    queue.push(frame(40, 11 * S + S / 2)); // the screen changes twice while paused
+    queue.push(frame(41, 12 * S));
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(stats.frames.load(Ordering::Relaxed), 1, "nothing is written while paused");
+    pauses.resume_at(13 * S).unwrap(); // resumed 2 s later; the screen stays still
+    let t0 = std::time::Instant::now();
+    while stats.frames.load(Ordering::Relaxed) < 2 && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(stats.frames.load(Ordering::Relaxed), 2, "the picture at the resume is written without waiting for a change");
+    // a second pause whose picture is replaced by a real frame right at the resume
+    pauses.pause_at(14 * S).unwrap();
+    queue.push(frame(50, 14 * S + S / 2));
+    pauses.resume_at(15 * S).unwrap();
+    queue.push(frame(51, 15 * S + 1_000_000));
+    // a third pause, resumed just before Stop: its picture is still written, and what the
+    // source delivers after Stop is not
+    pauses.pause_at(16 * S).unwrap();
+    queue.push(frame(60, 16 * S + S / 5));
+    pauses.resume_at(16 * S + S / 2).unwrap();
+    stop.store(17 * S + S / 2, Ordering::Release); // 7.5 s of wall time, 3.5 s of them paused
+    queue.push(frame(70, 17 * S + S / 2 + 1));
+    queue.push(frame(71, 18 * S));
+    queue.close();
+    let fin = worker.join().unwrap().unwrap();
+    assert_eq!(fin.frames, 4, "the start, the pictures at the first and third resumes, the frame at the second");
+    assert_eq!(stats.dropped.load(Ordering::Relaxed), 0, "paused frames are not dropped frames");
+    let mut s = Session::default();
+    let item = crate::commands::import_streamed(&mut s, &path.to_string_lossy(), None).unwrap();
+    let info = s.project.item(item).unwrap().as_media().unwrap().info.clone();
+    assert!((secs(info.duration) - 4.0).abs() < 0.04, "4 s were recorded: {}", secs(info.duration));
+    let src = s.media.source_for(&s.project, item, &*s.services).unwrap();
+    let at = |m: f64| {
+        let f = src.video_frame(FrameRequest::full(Tick::from_seconds_f64(m))).unwrap();
+        read_synthetic_index(&f.luma8(), f.width, f.height).unwrap()
+    };
+    assert_eq!((at(0.5), at(0.95)), (7, 7), "the picture before the pause");
+    assert_eq!((at(1.05), at(1.9)), (41, 41), "from the resume on: the latest picture of the pause, not the one before it");
+    assert_eq!((at(2.05), at(2.9)), (51, 51), "a frame that arrives with the resume takes the held one's place");
+    assert_eq!((at(3.05), at(3.9)), (60, 60), "a picture held when Stop comes is written; frames after Stop are not");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_pause_ledger_maps_capture_time_to_file_time() {
+    use crate::record::PauseLedger;
+    let l = PauseLedger::default();
+    assert!(!l.paused() && l.count() == 0 && !l.contains(5) && l.before(u64::MAX) == 0);
+    assert_eq!(l.file_ns(150, 100), 50);
+    assert_eq!(l.file_ns(50, 100), 0, "before the start");
+    assert_eq!(l.resume_at(10), None, "nothing to resume");
+    assert_eq!(l.pause_at(200), Some(200));
+    assert_eq!(l.pause_at(250), None, "already paused");
+    assert!(l.paused() && l.count() == 1 && l.open_start() == Some(200));
+    // inside the open pause the file time stands still
+    assert!(l.contains(200) && l.contains(u64::MAX) && !l.contains(199));
+    assert_eq!((l.file_ns(199, 100), l.file_ns(200, 100), l.file_ns(999, 100)), (99, 100, 100));
+    assert_eq!(l.kept_file_ns(199, 100), Some(99));
+    assert_eq!(l.kept_file_ns(200, 100), None);
+    assert_eq!(l.kept_file_ns(99, 100), None, "before the start");
+    assert_eq!(l.end_of(250), None, "still open");
+    assert_eq!(l.resume_at(300), Some((200, 300)));
+    assert_eq!((l.contains(299), l.contains(300), l.end_of(250), l.end_of(300)), (true, false, Some(300), None));
+    assert_eq!((l.before(250), l.before(300), l.before(1000)), (50, 100, 100));
+    assert_eq!((l.file_ns(300, 100), l.file_ns(350, 100)), (100, 150), "the file goes on right where it stopped");
+    // a second pause; a clock that seems to go back never puts a pause before the last one
+    assert_eq!(l.pause_at(250), Some(300));
+    assert_eq!(l.resume_at(100), Some((300, 300)));
+    assert_eq!(l.pause_at(400), Some(400));
+    assert_eq!(l.resume_at(450), Some((400, 450)));
+    assert_eq!(l.count(), 3);
+    assert_eq!(l.file_ns(500, 100), 250);
+    assert_eq!(l.intervals(100, 9999), vec![[100, 200], [200, 200], [300, 350]]);
+    // sample ranges: one index per time unit here
+    let cut = |a, b| l.cut(a, b, |t| t);
+    assert_eq!(cut(0, 100), vec![(0, 100)]);
+    assert_eq!(cut(150, 500), vec![(150, 200), (300, 400), (450, 500)]);
+    assert_eq!(cut(200, 300), vec![]);
+    assert_eq!(cut(250, 420), vec![(300, 400)]);
+    assert_eq!(cut(450, 450), vec![]);
+    assert_eq!(cut(500, 400), vec![], "a backwards range is empty");
+    // an open pause cuts everything from its start
+    l.pause_at(600);
+    assert_eq!(cut(500, 10_000), vec![(500, 600)]);
+    assert_eq!(cut(700, u64::MAX), vec![]);
+    assert_eq!(l.intervals(100, 650), vec![[100, 200], [200, 200], [300, 350], [500, 550]]);
+    assert_eq!(l.intervals(100, 0), vec![[100, 200], [200, 200], [300, 350], [500, 500]], "never ends before it began");
+    // hostile times never overflow
+    let l = PauseLedger::default();
+    l.pause_at(u64::MAX);
+    l.resume_at(0);
+    assert_eq!(l.file_ns(u64::MAX, 0), u64::MAX);
+    assert_eq!(l.before(0), 0);
+    assert_eq!(l.cut(0, u64::MAX, |_| u64::MAX), vec![(0, u64::MAX)]);
+}

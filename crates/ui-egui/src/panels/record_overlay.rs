@@ -1,7 +1,8 @@
 //! The recording border: a borderless, transparent, always-on-top, mouse-pass-through window
 //! (an egui immediate viewport titled [`OVERLAY_TITLE`]) over the chosen display or window that
 //! draws a 3 pt frame just inside its edges: grey while the Record panel is open with a screen
-//! chosen ("this is what will be recorded"), red with a `● REC 00:12` pill while recording. On a
+//! chosen ("this is what will be recorded"), red with a `● REC 00:12` pill while recording, amber
+//! with a `❙❙ PAUSED 00:12` pill while the recording is paused. On a
 //! window source it follows the window (its frame is read from CoreGraphics every 0.5 s on a background thread);
 //! on an area it frames the area. Choosing "Area of <display>…" turns it into a drawing surface
 //! (not pass-through, crosshair): drag the rectangle, Esc cancels.
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use filmcraft_engine::record::{ScreenFrame, ScreenTarget, VideoInputFactory};
 use filmcraft_engine::record_preview::{MIN_AREA, OVERLAY_TITLE};
 
+use super::record::AMBER;
 use crate::FilmcraftApp;
 
 const RED: Color32 = Color32::from_rgb(0xe0, 0x3a, 0x2f);
@@ -41,7 +43,8 @@ const READY_FRAMES: u32 = 6;
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct OverlayInfo {
-    /// `idle` (grey), `recording` (red) or `drawing` (choosing an area).
+    /// `idle` (grey), `recording` (red), `paused` (amber: a recording that is paused) or
+    /// `drawing` (choosing an area).
     pub state: String,
     /// `display:<id>` or `window:<id>`.
     pub target: String,
@@ -247,20 +250,35 @@ fn paint(ui: &mut egui::Ui, rect: Rect, visible: Rect, look: &Look, drag_from: &
         }
         return out;
     }
-    let color = if look.state == "recording" { RED } else { IDLE };
+    let paused = look.state == "paused";
+    let color = match look.state {
+        "recording" => RED,
+        "paused" => AMBER,
+        _ => IDLE,
+    };
     painter.rect_stroke(framed.shrink(BORDER / 2.0), 0.0, Stroke::new(BORDER, color), StrokeKind::Middle);
-    if look.state == "recording" {
+    if look.state == "recording" || paused {
         let s = if look.elapsed.is_finite() { look.elapsed.max(0.0) as u64 } else { 0 };
-        let text = format!("● REC {:02}:{:02}", s / 60, s % 60);
-        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
-        let size = galley.size() + vec2(18.0, 8.0);
+        let ink = if paused { Color32::from_gray(20) } else { Color32::WHITE };
+        let text = if paused { format!("PAUSED {:02}:{:02}", s / 60, s % 60) } else { format!("● REC {:02}:{:02}", s / 60, s % 60) };
+        let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), ink);
+        // the pause sign (two bars) is drawn: the UI fonts have no glyph for it
+        let sign = if paused { 13.0 } else { 0.0 };
+        let size = galley.size() + vec2(18.0 + sign, 8.0);
         // below the menu bar when the border is at the very top of the display
         let from_top = framed.top() - rect.top();
         let inset = if from_top < look.pill_inset { look.pill_inset - from_top } else { 0.0 };
         let top = framed.top() + BORDER + inset + 6.0;
         let pill = Rect::from_min_size(pos2(framed.center().x - size.x / 2.0, top), size);
-        painter.rect_filled(pill, size.y / 2.0, RED);
-        painter.galley(pill.min + vec2(9.0, 4.0), galley, Color32::WHITE);
+        painter.rect_filled(pill, size.y / 2.0, color);
+        if paused {
+            let h = (galley.size().y * 0.62).round();
+            for i in 0..2 {
+                let bar = Rect::from_min_size(pos2(pill.min.x + 9.0 + i as f32 * 5.0, pill.center().y - h / 2.0), vec2(3.0, h));
+                painter.rect_filled(bar, 0.5, ink);
+            }
+        }
+        painter.galley(pill.min + vec2(9.0 + sign, 4.0), galley, ink);
     }
     None
 }
@@ -279,6 +297,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let st_json = app.session.record.recording().then(|| filmcraft_engine::record::status_of(&app.session));
     let rec_screen = st_json.as_ref().is_some_and(|s| s["sources"].as_array().is_some_and(|a| a.iter().any(|x| x["kind"] == "screen")));
     let elapsed = st_json.as_ref().and_then(|s| s["elapsed"].as_f64()).unwrap_or(0.0);
+    let paused = st_json.as_ref().is_some_and(|s| s["paused"] == true);
     let counting = app.session.record.countdown.is_some();
     let embedded = ctx.embed_viewports();
     {
@@ -333,6 +352,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let drawing = r.drawing && is_display && !rec_screen && !counting;
     let state = if drawing {
         "drawing"
+    } else if rec_screen && paused {
+        "paused"
     } else if rec_screen {
         "recording"
     } else {

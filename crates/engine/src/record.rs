@@ -8,6 +8,7 @@
 //! | `record.devices` | displays, windows, cameras, microphones and the permission states |
 //! | `record.start` | start the chosen sources; the recording begins when every one is live (its files, the clock start) |
 //! | `record.status` | elapsed time and per-source frames / dropped / bytes (and the mic level) |
+//! | `record.pause` / `record.resume` | leave a stretch out of every file: each source is cut at the same instants ([`PauseLedger`]) |
 //! | `record.stop` | finish the files, import them and build the synced sequence (or `discard`) |
 //! | `record.cancel` | stop and delete the files |
 //!
@@ -570,15 +571,18 @@ impl VideoInput for SyntheticVideoInput {
                         let data = synthetic_frame(w, h, k, t);
                         sink(CapturedFrame { width: w, height: h, stride: w as usize * 4, format: PixelFormat::Rgba8, data, time_ns: t });
                         if let Some((rate, ch, asink)) = &audio {
-                            // the sound of this frame period
+                            // the sound up to this frame: like a real capture, a block only holds
+                            // what was already heard (nothing stamped later than now)
                             let rate = u64::from((*rate).max(1));
-                            let end = (u128::from(k + 1) * u128::from(period) * u128::from(rate) / 1_000_000_000) as u64;
+                            let end = (u128::from(k) * u128::from(period) * u128::from(rate) / 1_000_000_000) as u64;
                             let n = end.saturating_sub(sample).min(rate) as usize;
-                            let w = 2.0 * std::f64::consts::PI * SYNTHETIC_TONE_HZ / rate as f64;
-                            let tone: Vec<f32> = (0..n).map(|i| (0.25 * (w * (sample + i as u64) as f64).sin()) as f32).collect();
-                            let time_ns = first.saturating_add((u128::from(sample) * 1_000_000_000 / u128::from(rate)) as u64);
-                            asink(CapturedAudio { sample_rate: rate as u32, channels: vec![tone; usize::from((*ch).max(1))], time_ns });
-                            sample += n as u64;
+                            if n > 0 {
+                                let w = 2.0 * std::f64::consts::PI * SYNTHETIC_TONE_HZ / rate as f64;
+                                let tone: Vec<f32> = (0..n).map(|i| (0.25 * (w * (sample + i as u64) as f64).sin()) as f32).collect();
+                                let time_ns = first.saturating_add((u128::from(sample) * 1_000_000_000 / u128::from(rate)) as u64);
+                                asink(CapturedAudio { sample_rate: rate as u32, channels: vec![tone; usize::from((*ch).max(1))], time_ns });
+                                sample += n as u64;
+                            }
                         }
                         k += 1;
                     }
@@ -676,6 +680,149 @@ impl<T> BoundedQueue<T> {
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+// ------------------------------------------------------------------------------------- pauses
+
+/// Most pauses one recording takes (each is remembered until Stop).
+pub const MAX_PAUSES: usize = 10_000;
+
+/// The pauses of a recording (`record.pause` / `record.resume`), on the clock its sources are
+/// stamped on: the closed intervals `[start, end)` in order, and the start of the open one while
+/// the recording is paused. Every worker holds it. A sample captured at `t` is left out when `t`
+/// is inside a pause, and its place in the file is its **file time**, `t` since the recording's
+/// start less the pauses before `t`: the files have no gap where the recording was paused, and
+/// every source is cut at the same instants.
+#[derive(Debug, Default)]
+pub struct PauseLedger {
+    inner: Mutex<Pauses>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Pauses {
+    closed: Vec<(u64, u64)>,
+    open: Option<u64>,
+}
+
+impl Pauses {
+    fn contains(&self, t: u64) -> bool {
+        self.open.is_some_and(|s| t >= s) || self.closed.iter().any(|(s, e)| t >= *s && t < *e)
+    }
+    /// How much pause lies before `t`.
+    fn before(&self, t: u64) -> u64 {
+        let closed = self.closed.iter().filter(|(s, _)| *s < t).fold(0u64, |sum, (s, e)| sum.saturating_add((*e).min(t).saturating_sub(*s)));
+        closed.saturating_add(self.open.filter(|s| *s < t).map_or(0, |s| t - s))
+    }
+}
+
+impl PauseLedger {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Pauses> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    /// Begin a pause now on `clock`; None when already paused. The time is read while the ledger
+    /// is held, so no worker can have kept a sample captured after it.
+    pub fn pause(&self, clock: &RecordClock) -> Option<u64> {
+        let mut g = self.lock();
+        let t = clock.now_ns();
+        Self::pause_in(&mut g, t)
+    }
+    /// End the open pause now on `clock`: its `(start, end)`; None when not paused.
+    pub fn resume(&self, clock: &RecordClock) -> Option<(u64, u64)> {
+        let mut g = self.lock();
+        let t = clock.now_ns();
+        Self::resume_in(&mut g, t)
+    }
+    /// [`Self::pause`] at a given time (tests).
+    pub fn pause_at(&self, t: u64) -> Option<u64> {
+        Self::pause_in(&mut self.lock(), t)
+    }
+    /// [`Self::resume`] at a given time (tests).
+    pub fn resume_at(&self, t: u64) -> Option<(u64, u64)> {
+        Self::resume_in(&mut self.lock(), t)
+    }
+    fn pause_in(g: &mut Pauses, t: u64) -> Option<u64> {
+        if g.open.is_some() {
+            return None;
+        }
+        // never before the end of the last pause: the intervals stay in order
+        let t = g.closed.last().map_or(t, |l| t.max(l.1));
+        g.open = Some(t);
+        Some(t)
+    }
+    fn resume_in(g: &mut Pauses, t: u64) -> Option<(u64, u64)> {
+        let start = g.open.take()?;
+        let end = t.max(start);
+        g.closed.push((start, end));
+        Some((start, end))
+    }
+    /// Whether the recording is paused now.
+    pub fn paused(&self) -> bool {
+        self.lock().open.is_some()
+    }
+    /// When the open pause began (None: not paused).
+    pub fn open_start(&self) -> Option<u64> {
+        self.lock().open
+    }
+    /// Pauses so far, the open one included.
+    pub fn count(&self) -> usize {
+        let g = self.lock();
+        g.closed.len() + usize::from(g.open.is_some())
+    }
+    /// Whether `t` is inside a pause.
+    pub fn contains(&self, t: u64) -> bool {
+        self.lock().contains(t)
+    }
+    /// How much pause lies before `t` (for a `t` inside a pause: up to `t`).
+    pub fn before(&self, t: u64) -> u64 {
+        self.lock().before(t)
+    }
+    /// The file time of `t` for a recording that began at `origin`: the time since `origin` less
+    /// the pauses before `t` (it stands still inside a pause; 0 before `origin`).
+    pub fn file_ns(&self, t: u64, origin: u64) -> u64 {
+        t.saturating_sub(origin).saturating_sub(self.before(t))
+    }
+    /// The file time of a sample captured at `t` (None: before `origin` or inside a pause, the
+    /// sample is left out).
+    pub fn kept_file_ns(&self, t: u64, origin: u64) -> Option<u64> {
+        let g = self.lock();
+        let rel = t.checked_sub(origin)?;
+        (!g.contains(t)).then(|| rel.saturating_sub(g.before(t)))
+    }
+    /// The end of the closed pause `t` is in (None: `t` is in no pause, or in the open one).
+    pub fn end_of(&self, t: u64) -> Option<u64> {
+        self.lock().closed.iter().find(|(s, e)| t >= *s && t < *e).map(|p| p.1)
+    }
+    /// The parts of the sample range `[a, b)` outside the pauses, in order: a pause `[s, e)`
+    /// covers the samples `[index(s), index(e))`, the open one everything from `index(s)` on.
+    /// `index` gives the first sample at or after a time (it must not decrease).
+    pub fn cut(&self, a: u64, b: u64, index: impl Fn(u64) -> u64) -> Vec<(u64, u64)> {
+        let g = self.lock();
+        let mut keep = Vec::new();
+        let mut at = a;
+        for (s, e) in g.closed.iter().map(|(s, e)| (index(*s), index(*e))).chain(g.open.map(|s| (index(s), u64::MAX))) {
+            if at >= b {
+                break;
+            }
+            if e <= at {
+                continue;
+            }
+            if s > at {
+                keep.push((at, s.min(b)));
+            }
+            at = at.max(e);
+        }
+        if at < b {
+            keep.push((at, b));
+        }
+        keep
+    }
+    /// The pauses relative to `origin`, as `[start, end]` pairs; the open one (a recording
+    /// stopped while paused) ends at `now`.
+    pub fn intervals(&self, origin: u64, now: u64) -> Vec<[u64; 2]> {
+        let g = self.lock();
+        let rel = |t: u64| t.saturating_sub(origin);
+        g.closed.iter().map(|(s, e)| [rel(*s), rel(*e)]).chain(g.open.map(|s| [rel(s), rel(now.max(s))])).collect()
     }
 }
 
@@ -816,8 +963,8 @@ fn wait_origin(origin: &AtomicU64, gone: impl Fn() -> bool) -> Option<u64> {
 
 /// What a finished source produced.
 #[derive(Clone, Debug, Default)]
-struct Finished {
-    frames: u64,
+pub(crate) struct Finished {
+    pub(crate) frames: u64,
     bytes: u64,
     encoder: String,
     width: u32,
@@ -904,6 +1051,8 @@ pub struct Active {
     system_audio: Option<AudioSource>,
     /// Set at stop: the time up to which every source records.
     stop_ns: Arc<AtomicU64>,
+    /// The pauses (`record.pause` / `record.resume`), shared with every worker.
+    pauses: Arc<PauseLedger>,
     microphones: Vec<String>,
     /// The settings it was started with (for the sidecars).
     settings: RecordingSettings,
@@ -912,6 +1061,10 @@ pub struct Active {
     /// [`now_ms`] at the start, and the Stop after limit (ms).
     started_ms: u64,
     stop_after_ms: Option<u64>,
+    /// [`now_ms`] when the open pause began, and the milliseconds paused before it: Stop after
+    /// counts recorded time.
+    paused_at_ms: Option<u64>,
+    paused_ms: u64,
 }
 
 impl Active {
@@ -928,9 +1081,30 @@ impl Active {
             v.rotation_seen = r;
             v.rotation_changes = v.rotation_changes.saturating_add(1);
             if v.rotation_changed_at_ns.is_none() {
-                v.rotation_changed_at_ns = Some(if origin == NONE { 0 } else { now.saturating_sub(origin) });
+                // where it is in the file
+                v.rotation_changed_at_ns = Some(if origin == NONE { 0 } else { self.pauses.file_ns(now, origin) });
             }
         }
+    }
+    /// Whether the recording is paused (`record.pause`).
+    pub fn paused(&self) -> bool {
+        self.pauses.paused()
+    }
+    /// The recording's pauses.
+    pub fn pauses(&self) -> &PauseLedger {
+        &self.pauses
+    }
+    /// The recorded time so far, nanoseconds: the time since the recording began less its
+    /// pauses (it stands still while paused). What the files hold.
+    pub fn elapsed_ns(&self) -> u64 {
+        match self.origin.load(Ordering::Acquire) {
+            NONE => 0,
+            origin => self.pauses.file_ns(self.raw.now_ns(), origin),
+        }
+    }
+    /// The recorded milliseconds on the countdown clock at `now_ms` (Stop after).
+    fn recorded_ms(&self, now_ms: u64) -> u64 {
+        self.paused_at_ms.unwrap_or(now_ms).saturating_sub(self.started_ms).saturating_sub(self.paused_ms)
     }
     /// The inputs of the screen sources (to refresh what they leave out).
     pub(crate) fn screen_inputs(&mut self) -> impl Iterator<Item = &mut Box<dyn VideoInput>> {
@@ -1064,13 +1238,20 @@ fn slot_of(ns: u64, rate: FrameRate) -> i64 {
 /// Encodes a video source's frames. It starts when the recording's start (`origin`) is known:
 /// frames captured before it are left out (not counted as dropped), the first frame kept is
 /// frame 0 (it stands for the instant the recording began, less than a frame earlier) and every
-/// later frame sits at its time since the start.
-fn video_worker(
+/// later frame sits at its file time: its time since the start less the pauses before it.
+///
+/// A frame captured inside a pause is left out (not counted as dropped), but the latest one is
+/// held: a source that only sends a frame when its picture changes (a still screen) may send
+/// nothing after the resume, so when no newer frame has taken its place the held one is written
+/// at the resume. The file then shows what was on screen when the recording went on, not what
+/// was there before the pause.
+pub(crate) fn video_worker(
     mut rec: filmcraft_export::recorder::MovRecorder,
     queue: Arc<FrameQueue>,
     stats: Arc<SourceStats>,
     stop_ns: Arc<AtomicU64>,
     origin: Arc<AtomicU64>,
+    pauses: Arc<PauseLedger>,
     rate: FrameRate,
 ) -> std::result::Result<Finished, String> {
     let Some(origin) = wait_origin(&origin, || queue.is_closed()) else {
@@ -1078,30 +1259,71 @@ fn video_worker(
     };
     let (w, h) = rec.size();
     let mut rgba = Vec::new();
-    loop {
-        let f = match queue.pop(std::time::Duration::from_millis(100)) {
-            None => break,
-            Some(None) => continue,
-            Some(Some(f)) => f,
+    // one frame into the file at file time `ft`; `after_last`: never in the last frame's slot
+    let mut write = |rec: &mut MovRecorder, f: &CapturedFrame, ft: u64, after_last: bool| -> std::result::Result<(), String> {
+        let slot = match rec.last_slot() {
+            None => 0,
+            Some(l) if after_last => slot_of(ft, rate).max(l.saturating_add(1)),
+            Some(_) => slot_of(ft, rate),
         };
-        let Some(rel) = f.time_ns.checked_sub(origin) else {
-            continue; // captured while the other sources were starting
-        };
-        let slot = if rec.last_slot().is_none() { 0 } else { slot_of(rel, rate) };
         if rec.last_slot().is_some_and(|l| slot <= l) {
-            continue; // two frames inside one frame period
+            return Ok(()); // two frames inside one frame period
         }
-        if !to_rgba(&f, w, h, &mut rgba) {
+        if !to_rgba(f, w, h, &mut rgba) {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
-            continue;
+            return Ok(());
         }
         rec.push(&rgba, slot).map_err(|e| e.to_string())?;
         if stats.first().is_none() {
-            stats.first_ns.store(rel, Ordering::Release);
+            stats.first_ns.store(ft, Ordering::Release);
         }
-        stats.last_ns.store(rel, Ordering::Release);
+        stats.last_ns.store(ft, Ordering::Release);
         stats.frames.fetch_add(1, Ordering::Relaxed);
         stats.bytes.store(rec.bytes(), Ordering::Relaxed);
+        Ok(())
+    };
+    // the latest frame captured inside a pause
+    let mut held: Option<CapturedFrame> = None;
+    loop {
+        let f = match queue.pop(std::time::Duration::from_millis(100)) {
+            None => break,
+            Some(f) => f,
+        };
+        let end = stop_ns.load(Ordering::Acquire);
+        let kept = match f {
+            Some(f) if f.time_ns < origin => continue, // captured while the other sources were starting
+            // captured after Stop, while the sources before this one were finishing their files
+            Some(f) if end != NONE && f.time_ns >= end => continue,
+            Some(f) if pauses.contains(f.time_ns) => {
+                held = Some(f);
+                continue;
+            }
+            f => f,
+        };
+        // the pause the held frame is from is over: it is the picture at the resume, unless the
+        // frame that just arrived falls into that same frame period (then the newer one is it)
+        if let Some(resumed) = held.as_ref().and_then(|h| pauses.end_of(h.time_ns)) {
+            let at = pauses.file_ns(resumed, origin);
+            let superseded = kept.as_ref().is_some_and(|f| slot_of(pauses.file_ns(f.time_ns, origin), rate) <= slot_of(at, rate));
+            if let Some(h) = held.take()
+                && !superseded
+            {
+                write(&mut rec, &h, at, true)?;
+            }
+        }
+        if let Some(f) = kept
+            && let Some(ft) = pauses.kept_file_ns(f.time_ns, origin)
+        {
+            write(&mut rec, &f, ft, false)?;
+        }
+    }
+    let end = stop_ns.load(Ordering::Acquire);
+    // a picture held from a pause that ended before Stop, with nothing newer after it
+    if let Some(h) = held.take()
+        && let Some(resumed) = pauses.end_of(h.time_ns)
+        && (end == NONE || resumed < end)
+    {
+        write(&mut rec, &h, pauses.file_ns(resumed, origin), true)?;
     }
     let encoder = rec.encoder_name().to_string();
     let kbps = rec.kbps();
@@ -1109,9 +1331,9 @@ fn video_worker(
     if frames == 0 {
         return Err("no frames were captured".into());
     }
-    let end = stop_ns.load(Ordering::Acquire);
+    // the end in file time; a recording stopped while paused ends where that pause began
     let last_slot = rec.last_slot().unwrap_or(0);
-    let end_slot = if end == NONE { last_slot + 1 } else { slot_of(end.saturating_sub(origin), rate).max(last_slot + 1) };
+    let end_slot = if end == NONE { last_slot + 1 } else { slot_of(pauses.file_ns(end, origin), rate).max(last_slot + 1) };
     let bytes = rec.finish(end_slot).map_err(|e| e.to_string())?;
     let fps = (rate.num.max(1) / rate.den.max(1)) as u32;
     Ok(Finished { frames, bytes, encoder, width: w, height: h, fps, kbps, ..Default::default() })
@@ -1200,6 +1422,11 @@ const MIC_LEAD_MAX_SECONDS: u64 = 2;
 /// Records a microphone. Until every source is live (`origin` known) it reads the device as it
 /// delivers and keeps the last [`MIC_LEAD_MAX_SECONDS`]; then it trims that to the sample at the
 /// recording's start and goes on writing on the recording clock.
+///
+/// The samples read since the start are counted on their own (`consumed`: sample `i` was
+/// captured `i / rate` after the start); what is written is that less the pauses, cut to the
+/// sample. During a pause the device is still read, so the meter stays live and the device's
+/// buffer never backs up.
 #[allow(clippy::too_many_arguments)]
 fn mic_worker(
     input: &mut Box<dyn AudioInput>,
@@ -1210,6 +1437,7 @@ fn mic_worker(
     stats: &SourceStats,
     stop_ns: &AtomicU64,
     origin: &AtomicU64,
+    pauses: &PauseLedger,
 ) -> std::result::Result<Finished, String> {
     let rate = u64::from(wav.rate.max(1));
     let mut gain = opts.auto_gain.then(|| AutoGain::new(wav.rate));
@@ -1278,14 +1506,24 @@ fn mic_worker(
         let _ = wav.finish();
         return Err("stopped before the recording began".into());
     };
-    let mut put = |wav: &mut WavStream, mut chans: Vec<Vec<f32>>| -> std::result::Result<(), String> {
-        // the meter shows the input as it is, never the auto gain
+    // samples read since the recording's start (the next one is sample `consumed`)
+    let mut consumed = 0u64;
+    let mut put = |wav: &mut WavStream, consumed: &mut u64, chans: Vec<Vec<f32>>| -> std::result::Result<(), String> {
+        // the meter shows the input as it is, never the auto gain, and also while paused
         let peak = chans.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
         stats.level.store(peak.to_bits(), Ordering::Relaxed);
-        if let Some(g) = gain.as_mut() {
-            g.process(&mut chans);
+        let n = chans.iter().map(Vec::len).min().unwrap_or(0) as u64;
+        let first = *consumed;
+        *consumed = first.saturating_add(n);
+        // what of this block is outside the pauses, to the sample
+        for (a, b) in pauses.cut(first, *consumed, |t| n_of(t.saturating_sub(o))) {
+            let (from, to) = ((a - first) as usize, (b - first) as usize);
+            let mut part: Vec<Vec<f32>> = chans.iter().map(|c| c.get(from..to).unwrap_or_default().to_vec()).collect();
+            if let Some(g) = gain.as_mut() {
+                g.process(&mut part);
+            }
+            wav.write(&part)?;
         }
-        wav.write(&chans)?;
         stats.bytes.store(wav.bytes(), Ordering::Relaxed);
         stats.frames.store(wav.frames, Ordering::Relaxed);
         if wav.frames > 0 {
@@ -1305,11 +1543,11 @@ fn mic_worker(
         } else {
             let pad = n_of(lead_start - o).min(rate) as usize;
             if pad > 0 {
-                put(&mut wav, vec![vec![0.0; pad]; lead.len()])?;
+                put(&mut wav, &mut consumed, vec![vec![0.0; pad]; lead.len()])?;
             }
             stats.first_ns.store(lead_start - o, Ordering::Release);
         }
-        put(&mut wav, std::mem::take(&mut lead))?;
+        put(&mut wav, &mut consumed, std::mem::take(&mut lead))?;
     } else {
         stats.first_ns.store(0, Ordering::Release);
     }
@@ -1317,7 +1555,7 @@ fn mic_worker(
     loop {
         let end = stop_ns.load(Ordering::Acquire);
         let now = if end == NONE { clock.now_ns() } else { end };
-        let want = due(now).saturating_sub(wav.frames);
+        let want = due(now).saturating_sub(consumed);
         if want > 0 {
             let got = input.read(want.min(rate * 2) as usize);
             if let Some(e) = input.error() {
@@ -1325,7 +1563,7 @@ fn mic_worker(
             }
             let chans = pick_channels(&got, channel, opts.stereo);
             if chans.iter().map(Vec::len).min().unwrap_or(0) > 0 {
-                put(&mut wav, chans)?;
+                put(&mut wav, &mut consumed, chans)?;
             }
         }
         if end != NONE {
@@ -1349,13 +1587,16 @@ fn mic_worker(
 }
 
 /// Writes the system audio blocks of a screen into a WAV from the recording's start (`origin`):
-/// what was captured before it is trimmed to the sample, and gaps (nothing played, or nothing
-/// yet at the start) are filled with silence so the file stays on the recording clock.
+/// what was captured before it is trimmed to the sample, what was captured inside a pause is cut
+/// to the sample, and gaps (nothing played, or nothing yet at the start) are filled with silence
+/// so the file stays on the recording clock. The gaps are measured in file time, so a pause is
+/// never filled.
 fn system_audio_worker(
     queue: Arc<BoundedQueue<CapturedAudio>>,
     mut wav: WavStream,
     stats: Arc<SourceStats>,
     origin: Arc<AtomicU64>,
+    pauses: Arc<PauseLedger>,
 ) -> std::result::Result<Finished, String> {
     let Some(origin) = wait_origin(&origin, || queue.is_closed()) else {
         return Err("stopped before the recording began".into());
@@ -1375,41 +1616,38 @@ fn system_audio_worker(
             wav.channels = (b.channels.len() as u16).clamp(1, 2);
         }
         let rate = u64::from(wav.rate);
-        let mut chans = b.channels;
-        let rel = match b.time_ns.checked_sub(origin) {
-            Some(r) => r,
-            None => {
-                // captured before the start: keep the part after it
-                let skip = (u128::from(origin - b.time_ns) * u128::from(rate)).div_ceil(1_000_000_000).min(usize::MAX as u128) as usize;
-                if skip >= chans.iter().map(Vec::len).min().unwrap_or(0) {
-                    continue;
-                }
-                for c in &mut chans {
-                    c.drain(..skip.min(c.len()));
-                }
-                0
+        let chans = b.channels;
+        let n = chans.iter().map(Vec::len).min().unwrap_or(0) as u64;
+        // sample `i` of the block was captured `i / rate` after `b.time_ns`: the first sample at
+        // or after a time, and a sample's time
+        let index = |t: u64| -> u64 { (u128::from(t.saturating_sub(b.time_ns)) * u128::from(rate)).div_ceil(1_000_000_000).min(u128::from(u64::MAX)) as u64 };
+        let time = |i: u64| -> u64 { b.time_ns.saturating_add((u128::from(i) * 1_000_000_000 / u128::from(rate)).min(u128::from(u64::MAX)) as u64) };
+        // what was captured before the start is left out, and what was captured inside a pause
+        let first = index(origin).min(n);
+        for (from, to) in pauses.cut(first, n, index) {
+            let rel = pauses.file_ns(time(from).max(origin), origin);
+            if stats.first().is_none() {
+                stats.first_ns.store(rel, Ordering::Release);
             }
-        };
-        if stats.first().is_none() {
-            stats.first_ns.store(rel, Ordering::Release);
-        }
-        let expected = wav.frames.saturating_mul(1_000_000_000) / rate;
-        // the first block is put exactly where it was captured; later, only real gaps are filled
-        let tolerance = if wav.frames == 0 { 0 } else { 50_000_000 };
-        if rel > expected.saturating_add(tolerance) {
-            // silence up to this block, at most a minute per gap
-            let gap = (u128::from(rel - expected) * u128::from(rate) / 1_000_000_000).min(u128::from(rate) * 60) as usize;
-            let mut left = gap;
-            while left > 0 {
-                let n = left.min(wav.rate as usize);
-                wav.write(&vec![vec![0.0; n]; usize::from(wav.channels)])?;
-                left -= n;
+            let expected = wav.frames.saturating_mul(1_000_000_000) / rate;
+            // the first block is put exactly where it was captured; later, only real gaps are filled
+            let tolerance = if wav.frames == 0 { 0 } else { 50_000_000 };
+            if rel > expected.saturating_add(tolerance) {
+                // silence up to this block, at most a minute per gap
+                let gap = (u128::from(rel - expected) * u128::from(rate) / 1_000_000_000).min(u128::from(rate) * 60) as usize;
+                let mut left = gap;
+                while left > 0 {
+                    let n = left.min(wav.rate as usize);
+                    wav.write(&vec![vec![0.0; n]; usize::from(wav.channels)])?;
+                    left -= n;
+                }
             }
+            let part: Vec<Vec<f32>> = chans.iter().map(|c| c.get(from as usize..to as usize).unwrap_or_default().to_vec()).collect();
+            wav.write(&part)?;
+            stats.frames.store(wav.frames, Ordering::Relaxed);
+            stats.bytes.store(wav.bytes(), Ordering::Relaxed);
+            stats.last_ns.store(wav.frames.saturating_mul(1_000_000_000) / rate, Ordering::Release);
         }
-        wav.write(&chans)?;
-        stats.frames.store(wav.frames, Ordering::Relaxed);
-        stats.bytes.store(wav.bytes(), Ordering::Relaxed);
-        stats.last_ns.store(wav.frames.saturating_mul(1_000_000_000) / rate, Ordering::Release);
         let peak = chans.iter().flatten().fold(0f32, |m, v| m.max(v.abs()));
         stats.level.store(peak.to_bits(), Ordering::Relaxed);
     }
@@ -1789,6 +2027,7 @@ fn start_video(
     clock: RecordClock,
     stop_ns: &Arc<AtomicU64>,
     origin: &Arc<AtomicU64>,
+    pauses: &Arc<PauseLedger>,
 ) -> std::result::Result<VideoSource, String> {
     let VideoSetup { src, req, path, device_id, device_name, mirror, rotate, enc } = setup;
     let queue = Arc::new(FrameQueue::new(4));
@@ -1830,12 +2069,12 @@ fn start_video(
     let rotate_setting = rotate;
     let rotate = if src.kind == SourceKind::Camera { rotate.effective(camera_rotation) } else { 0 };
     rec.set_rotation(u16::try_from(rotate).unwrap_or(0));
-    let (q, st, stop, o) = (queue.clone(), stats.clone(), stop_ns.clone(), origin.clone());
+    let (q, st, stop, o, p) = (queue.clone(), stats.clone(), stop_ns.clone(), origin.clone(), pauses.clone());
     let rate = FrameRate::new(i64::from(fps), 1);
     let worker = std::thread::Builder::new()
         .name(format!("filmcraft-record-{label}"))
         .spawn(move || {
-            std::panic::catch_unwind(AssertUnwindSafe(|| video_worker(rec, q, st, stop, o, rate)))
+            std::panic::catch_unwind(AssertUnwindSafe(|| video_worker(rec, q, st, stop, o, p, rate)))
                 .unwrap_or_else(|p| Err(format!("the encoder crashed: {}", panic_text(&p))))
         })
         .map_err(|e| format!("{label}: cannot start the encoder thread: {e}"));
@@ -1876,6 +2115,7 @@ fn start_system_audio(
     rs: &RecordingSettings,
     clock: RecordClock,
     origin: &Arc<AtomicU64>,
+    pauses: &Arc<PauseLedger>,
 ) -> std::result::Result<Option<AudioSource>, String> {
     let channels = if rs.stereo() { 2 } else { 1 };
     let format = WavFormat::from_id(&rs.audio_format);
@@ -1893,11 +2133,11 @@ fn start_system_audio(
         return Ok(None);
     }
     let wav = WavStream::create(path, rs.sample_rate, channels, format).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (q, st, o) = (queue.clone(), stats.clone(), origin.clone());
+    let (q, st, o, p) = (queue.clone(), stats.clone(), origin.clone(), pauses.clone());
     let worker = std::thread::Builder::new()
         .name("filmcraft-record-system-audio".into())
         .spawn(move || {
-            std::panic::catch_unwind(AssertUnwindSafe(|| system_audio_worker(q, wav, st, o)))
+            std::panic::catch_unwind(AssertUnwindSafe(|| system_audio_worker(q, wav, st, o, p)))
                 .unwrap_or_else(|p| Err(format!("the system audio recorder crashed: {}", panic_text(&p))))
         })
         .map_err(|e| format!("system audio: cannot start the recording thread: {e}"))?;
@@ -1915,6 +2155,7 @@ fn start_mic(
     clock: RecordClock,
     stop_ns: &Arc<AtomicU64>,
     origin: &Arc<AtomicU64>,
+    pauses: &Arc<PauseLedger>,
     rs: &RecordingSettings,
     input_channel: u32,
 ) -> std::result::Result<(MicSource, Option<String>), (Box<dyn AudioInput>, String)> {
@@ -1940,13 +2181,13 @@ fn start_mic(
             return Err((input, format!("{}: {e}", path.display())));
         }
     };
-    let (st, stop, o) = (stats.clone(), stop_ns.clone(), origin.clone());
+    let (st, stop, o, p) = (stats.clone(), stop_ns.clone(), origin.clone(), pauses.clone());
     // the input moves to the thread and comes back from it; if the thread cannot start, the
     // input is lost with it, so a spare is made first for the session
     let spare = input.spawn();
     let spawned = std::thread::Builder::new().name(format!("filmcraft-record-{label}")).spawn(move || {
         let mut input = input;
-        let r = std::panic::catch_unwind(AssertUnwindSafe(|| mic_worker(&mut input, wav, channel, opts, clock, &st, &stop, &o)))
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| mic_worker(&mut input, wav, channel, opts, clock, &st, &stop, &o, &p)))
             .unwrap_or_else(|p| Err(format!("the microphone recorder crashed: {}", panic_text(&p))));
         (input, r)
     });
@@ -2116,7 +2357,7 @@ fn run_start(job: StartJob) -> StartOutcome {
     let StartJob { mut active, screen, cameras, mics, input_channel, timeout, cancel } = job;
     let began = web_time::Instant::now();
     let deadline = began.checked_add(timeout).unwrap_or(began);
-    let (raw, stop_ns, origin) = (active.raw, active.stop_ns.clone(), active.origin.clone());
+    let (raw, stop_ns, origin, pauses) = (active.raw, active.stop_ns.clone(), active.origin.clone(), active.pauses.clone());
     let rs = active.settings.clone();
     let (dir, name) = (active.dir.clone(), active.name.clone());
     let fail = |a: Active, pending: Vec<MicStart>, msg: String| -> StartOutcome {
@@ -2127,13 +2368,13 @@ fn run_start(job: StartJob) -> StartOutcome {
     if let Some((mut input, setup, system_audio)) = screen {
         if system_audio {
             let path = dir.join(file_name(&name, Src::new(SourceKind::SystemAudio, 0)));
-            match start_system_audio(&mut input, &path, &rs, raw, &origin) {
+            match start_system_audio(&mut input, &path, &rs, raw, &origin, &pauses) {
                 Ok(Some(a)) => active.system_audio = Some(a),
                 Ok(None) => active.notes.push("system audio is not available for this screen".into()),
                 Err(e) => active.notes.push(format!("system audio: {e}")),
             }
         }
-        match start_video(input, setup, raw, &stop_ns, &origin) {
+        match start_video(input, setup, raw, &stop_ns, &origin, &pauses) {
             Ok(v) => active.video.push(v),
             Err(e) => return fail(active, mics, e),
         }
@@ -2142,7 +2383,7 @@ fn run_start(job: StartJob) -> StartOutcome {
         if cancel.load(Ordering::Acquire) {
             return fail(active, mics, "the recording was cancelled while it was starting".into());
         }
-        match start_video(input, setup, raw, &stop_ns, &origin) {
+        match start_video(input, setup, raw, &stop_ns, &origin, &pauses) {
             Ok(v) => active.video.push(v),
             Err(e) => return fail(active, mics, e),
         }
@@ -2151,7 +2392,7 @@ fn run_start(job: StartJob) -> StartOutcome {
     while !pending.is_empty() {
         let (input, src, device) = pending.remove(0);
         let path = dir.join(file_name(&name, src));
-        match start_mic(input, src, &device, path, raw, &stop_ns, &origin, &rs, input_channel) {
+        match start_mic(input, src, &device, path, raw, &stop_ns, &origin, &pauses, &rs, input_channel) {
             Ok((mut m, note)) => {
                 m.session_input = src.n == 0;
                 if let Some(note) = note {
@@ -2245,11 +2486,14 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
         mics: Vec::new(),
         system_audio: None,
         stop_ns: Arc::new(AtomicU64::new(NONE)),
+        pauses: Arc::default(),
         microphones: microphones.clone(),
         settings: rs.clone(),
         notes: Vec::new(),
         started_ms: 0,
         stop_after_ms: (rs.stop_after_minutes > 0).then(|| u64::from(rs.stop_after_minutes) * 60_000),
+        paused_at_ms: None,
+        paused_ms: 0,
     };
     let enc = encoding_of(&rs);
     // the inputs are opened here (permission checks, device lookups: quick, and refused at once);
@@ -2437,7 +2681,8 @@ pub fn tick(s: &mut Session) -> Option<Value> {
     if let Some(a) = s.record.active.as_mut() {
         a.watch_rotation();
     }
-    let due = s.record.active.as_ref().and_then(|a| a.stop_after_ms.map(|l| now.saturating_sub(a.started_ms) >= l)).unwrap_or(false);
+    // Stop after counts recorded time: a pause does not use it up
+    let due = s.record.active.as_ref().and_then(|a| a.stop_after_ms.map(|l| a.recorded_ms(now) >= l)).unwrap_or(false);
     if due {
         let minutes = s.record.active.as_ref().map_or(0, |a| a.settings.stop_after_minutes);
         let ev = match stop(s, &json!({})) {
@@ -2512,7 +2757,9 @@ fn status_json(s: &Session) -> Value {
     json!({
         "recording": true,
         "name": a.name,
-        "elapsed": a.clock.now_ns() as f64 / 1e9,
+        "elapsed": a.elapsed_ns() as f64 / 1e9,
+        "paused": a.pauses.paused(),
+        "pauses": a.pauses.count(),
         "sources": sources,
         "stopAfterMinutes": a.settings.stop_after_minutes,
         "notes": a.notes,
@@ -2548,7 +2795,7 @@ struct Done {
     notes: Vec<String>,
 }
 
-fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Done, offset_ms: f64) -> std::io::Result<()> {
+fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Done, offset_ms: f64, pauses: &[[u64; 2]]) -> std::io::Result<()> {
     let file = d.path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let mut v = json!({
         "version": 1,
@@ -2563,6 +2810,8 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
         "warmup_ns": d.warmup_ns,
         "dropped": d.dropped,
         "bytes": d.fin.bytes,
+        "pauses": pauses,
+        "paused_ns": pauses.iter().fold(0u64, |sum, p| sum.saturating_add(p[1].saturating_sub(p[0]))),
         "events": [],
     });
     if let Some(o) = v.as_object_mut() {
@@ -2626,12 +2875,24 @@ fn write_sidecar(name: &str, clock: &RecordClock, rs: &RecordingSettings, d: &Do
     filmcraft_format::atomic_write(&sidecar_path(&d.path), &bytes)
 }
 
-/// Stop every source and collect what each produced (`Err`: that source's failure).
-fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Result<Done, String>>) {
+/// What stopping a recording gives: the recording, what each source produced (`Err`: that
+/// source's failure), its pauses on the recording clock (`[start, end]` since the start) and
+/// the recorded time (what the files hold, nanoseconds).
+type Stopped = (Active, Vec<std::result::Result<Done, String>>, Vec<[u64; 2]>, u64);
+
+/// Stop every source and collect what each produced.
+fn finish_all(s: &mut Session, mut a: Active) -> Stopped {
     // sample times are on the start clock
     a.watch_rotation();
-    let stop = a.raw.now_ns();
+    let now = a.raw.now_ns();
+    // stopped while paused: the recording ends where that pause began. The pause stays open in
+    // the ledger, so every worker leaves out whatever its source still delivers.
+    let stop = a.pauses.open_start().unwrap_or(now);
     a.stop_ns.store(stop, Ordering::Release);
+    let origin = a.origin.load(Ordering::Acquire);
+    let origin = if origin == NONE { 0 } else { origin };
+    let pauses = a.pauses.intervals(origin, now);
+    let recorded = a.pauses.file_ns(stop, origin);
     let mut out = Vec::new();
     for v in &mut a.video {
         v.input.stop();
@@ -2726,7 +2987,7 @@ fn finish_all(s: &mut Session, mut a: Active) -> (Active, Vec<std::result::Resul
             notes: Vec::new(),
         }));
     }
-    (a, out)
+    (a, out, pauses, recorded)
 }
 
 /// Where each source starts in the new sequence, in ns (earliest = 0): first sample times, every
@@ -2812,7 +3073,7 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(v);
     }
     let a = s.record.active.take().ok_or_else(|| bad(cmd, "nothing is recording"))?;
-    let (a, results) = finish_all(s, a);
+    let (a, results, pauses, recorded) = finish_all(s, a);
     let files = a.files();
     if discard {
         remove_files(&files);
@@ -2837,7 +3098,7 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let offset_of = |src: Src| if src.kind == SourceKind::Camera { list.get(src.n).copied().unwrap_or(scalar) } else { 0.0 };
     for d in &done {
-        if let Err(e) = write_sidecar(&a.name, &a.clock, &a.settings, d, offset_of(d.src)) {
+        if let Err(e) = write_sidecar(&a.name, &a.clock, &a.settings, d, offset_of(d.src), &pauses) {
             errors.push(format!("{}: sidecar: {e}", d.src.key()));
         }
     }
@@ -2851,6 +3112,8 @@ fn stop(s: &mut Session, p: &Value) -> Result<Value> {
         o.insert("files".into(), json!(done.iter().map(|d| d.path.to_string_lossy().into_owned()).collect::<Vec<_>>()));
         o.insert("errors".into(), json!(errors));
         o.insert("notes".into(), json!(a.notes));
+        o.insert("pauses".into(), json!(pauses.len()));
+        o.insert("elapsed".into(), json!(recorded as f64 / 1e9));
         // Auto cameras that turned while recording (the files keep the start's orientation)
         let turned: Vec<Value> =
             done.iter().filter_map(|d| d.rotation_changed_at_ns.map(|at| json!({"source": d.src.key(), "atNs": at, "rotate": d.rotate}))).collect();
@@ -3023,6 +3286,57 @@ fn cancel(s: &mut Session, _p: &Value) -> Result<Value> {
     stop(s, &json!({"discard": true}))
 }
 
+fn can_pause(s: &Session) -> std::result::Result<(), String> {
+    match &s.record.active {
+        None => Err("not recording".into()),
+        Some(a) if a.pauses.paused() => Err("the recording is already paused".into()),
+        Some(_) => Ok(()),
+    }
+}
+
+fn can_resume(s: &Session) -> std::result::Result<(), String> {
+    match &s.record.active {
+        None => Err("not recording".into()),
+        Some(a) if !a.pauses.paused() => Err("the recording is not paused".into()),
+        Some(_) => Ok(()),
+    }
+}
+
+/// What `record.pause` and `record.resume` return.
+fn pause_json(a: &Active) -> Value {
+    json!({"paused": a.pauses.paused(), "elapsed": a.elapsed_ns() as f64 / 1e9, "pauses": a.pauses.count()})
+}
+
+/// `record.pause`: from now on nothing goes into the files, until `record.resume`. The sources
+/// keep running (previews, the border and the microphone level stay live).
+fn pause(s: &mut Session, _p: &Value) -> Result<Value> {
+    let cmd = "record.pause";
+    let now_ms = s.record.now_ms();
+    let a = s.record.active.as_mut().ok_or_else(|| bad(cmd, "not recording"))?;
+    if a.pauses.count() >= MAX_PAUSES {
+        return Err(bad(cmd, format!("this recording was paused {MAX_PAUSES} times: stop it and start another")));
+    }
+    if a.pauses.pause(&a.raw).is_none() {
+        return Err(bad(cmd, "the recording is already paused"));
+    }
+    a.paused_at_ms = Some(now_ms);
+    Ok(pause_json(a))
+}
+
+/// `record.resume`: the files go on from here, right after what they held at the pause.
+fn resume(s: &mut Session, _p: &Value) -> Result<Value> {
+    let cmd = "record.resume";
+    let now_ms = s.record.now_ms();
+    let a = s.record.active.as_mut().ok_or_else(|| bad(cmd, "not recording"))?;
+    if a.pauses.resume(&a.raw).is_none() {
+        return Err(bad(cmd, "the recording is not paused"));
+    }
+    if let Some(at) = a.paused_at_ms.take() {
+        a.paused_ms = a.paused_ms.saturating_add(now_ms.saturating_sub(at));
+    }
+    Ok(pause_json(a))
+}
+
 fn spec(
     id: &'static str,
     label: &'static str,
@@ -3048,6 +3362,8 @@ pub fn commands() -> Vec<CommandSpec> {
         spec("record.status", "Recording Status", "{}", crate::commands::always, status, false),
         spec("record.stop", "Stop Recording", r#"{"discard":bool?,"cameraOffsetMs":f64?,"cameraOffsetsMs":[f64]?}"#, is_recording, stop, true),
         spec("record.cancel", "Cancel Recording", "{}", is_recording, cancel, true),
+        spec("record.pause", "Pause Recording", "{}", can_pause, pause, true),
+        spec("record.resume", "Resume Recording", "{}", can_resume, resume, true),
         crate::record_preview::preview_spec(),
         spec("record.settings", "Recording Settings", r#"{"get":bool?}|{"set":{field:value}}"#, crate::commands::always, crate::record_settings::command, true),
     ]
