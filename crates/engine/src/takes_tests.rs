@@ -428,3 +428,144 @@ fn detect_finds_a_restart_in_the_middle_of_a_line() {
         cuts["cuts"].as_array().unwrap().iter().flat_map(|c| c["words"].as_array().unwrap().iter().map(|w| w["text"].as_str().unwrap().to_string())).collect();
     assert_eq!(cut_words.join(" "), "and they don't even have a");
 }
+
+/// A session of its own: one 60 s recording (bars and tone) on V1 and A1 from 0, with `words` as
+/// its transcript. For passages longer than the demo's 5 s dialogue clip.
+fn recording_with(words: Vec<Word>) -> (Session, ItemId) {
+    use filmcraft_media::MediaSource;
+    let rate = filmcraft_time::FrameRate::FPS_24;
+    let g = filmcraft_media::generators::GeneratorSource::new(filmcraft_media::Generator::BarsAndTone, 1280, 720, rate, sec(60.0));
+    let info = g.info().clone();
+    let mut p = filmcraft_project::Project::new("retake");
+    let item = p.add_item(
+        "recording",
+        filmcraft_project::Label::Iris,
+        filmcraft_project::ItemKind::Media(filmcraft_project::MediaClip {
+            media: filmcraft_project::MediaRef::Generator(g.generator.clone()),
+            info,
+            interpret: Default::default(),
+            mark_in: None,
+            mark_out: None,
+            markers: vec![],
+            offline: false,
+            proxy: None,
+            identity: None,
+        }),
+        None,
+    );
+    let seq = p.new_sequence("s", filmcraft_project::SequenceSettings { width: 1280, height: 720, frame_rate: rate, ..Default::default() }, 1, 1, None);
+    let whole = filmcraft_time::TimeRange::new(Tick::ZERO, sec(60.0));
+    let mut v = p.make_track_item(item, filmcraft_project::TrackKind::Video, Tick::ZERO, whole, rate).unwrap();
+    let mut a = p.make_track_item(item, filmcraft_project::TrackKind::Audio, Tick::ZERO, whole, rate).unwrap();
+    let link = p.alloc_id();
+    (v.link, a.link) = (Some(link), Some(link));
+    let q = p.sequence_mut(seq).unwrap();
+    q.video_tracks[0].items.push(v);
+    q.audio_tracks[0].items.push(a);
+    let mut s = Session { project: Arc::new(p), ..Default::default() };
+    s.state.active_sequence = Some(seq);
+    s.media.insert(item, Arc::new(g));
+    let t = Transcript { language: "en".into(), words, ..Default::default() };
+    s.execute("transcript.set", json!({"item": item.0, "transcript": serde_json::to_value(&t).unwrap()})).unwrap();
+    (s, item)
+}
+
+/// Words said one after the other from `t0` (media seconds): each `(pause before, text)`; a word
+/// lasts 0.18 s and the next one follows 0.02 s later.
+fn said(t0: f64, parts: &[(f64, &str)]) -> Vec<Word> {
+    let mut out = Vec::new();
+    let mut t = t0;
+    for &(pause, text) in parts {
+        t += pause;
+        for w in text.split_whitespace() {
+            out.push(Word::new(w, sec(t), sec(t + 0.18)));
+            t += 0.2;
+        }
+    }
+    out
+}
+
+/// The media word indices `transcript.cuts` lists as crossed out, in order.
+fn cut_indices(s: &mut Session) -> Vec<u64> {
+    let cuts = s.execute("transcript.cuts", json!({})).unwrap();
+    let mut v: Vec<u64> = cuts["cuts"].as_array().unwrap().iter().flat_map(|c| c["words"].as_array().unwrap().iter().filter_map(|w| w["i"].as_u64())).collect();
+    v.sort_unstable();
+    v
+}
+
+/// A sentence that runs straight into a line, the line said twice, a retake cue between the
+/// passes, with the pauses of a real recording of that shape. Words 0–6 the sentence, 7–8 its
+/// end "um Lisbon" (no pause before the line), 9–25 the line, 26–27 "uh sorry", 28 "well", 29–45
+/// the line again, 46–50 what follows.
+const LINE: &str = "nobody can read most of the signs when half of the paint has peeled off the boards";
+
+fn retake_words() -> Vec<Word> {
+    said(
+        6.0,
+        &[
+            (0.0, "these are the photos I took in"),
+            (0.82, "um"),
+            (0.34, "Lisbon"),
+            (0.2, LINE),
+            (0.86, "uh sorry"),
+            (0.53, "well"),
+            (0.0, LINE),
+            (0.58, "but the map still works"),
+        ],
+    )
+}
+
+#[test]
+fn a_retake_leaves_the_words_before_it_alone() {
+    let (mut s, item) = recording_with(retake_words());
+    let all = format!("these are the photos I took in um Lisbon {LINE} uh sorry well {LINE} but the map still works");
+    assert_eq!(live_text(&mut s), all);
+    let r = s.execute("takes.detect", json!({})).unwrap();
+    assert_eq!((r["items"][0]["item"].clone(), r["items"][0]["groups"].clone(), r["selected"].clone()), (json!(item.0), json!(1), json!(1)), "{r}");
+    let g = groups(&mut s);
+    let takes = g[0]["takes"].as_array().unwrap();
+    assert_eq!(takes.len(), 2, "{g:?}");
+    // take 1 is the line itself: not "um Lisbon" before it, not "uh sorry" after it
+    assert_eq!((takes[0]["text"].clone(), takes[0]["words"].clone()), (json!(LINE), json!([9, 26])), "{}", takes[0]);
+    assert_eq!((takes[1]["text"].clone(), takes[1]["words"].clone()), (json!(format!("well {LINE}")), json!([28, 46])), "{}", takes[1]);
+    assert_eq!(g[0]["active"], json!(1));
+    // the last take is kept: the first pass and the cue between the passes are crossed out,
+    // and the words said once before the line stay
+    assert_eq!(cut_indices(&mut s), (9..=27).collect::<Vec<u64>>());
+    assert_eq!(live_text(&mut s), format!("these are the photos I took in um Lisbon well {LINE} but the map still works"));
+    // the other take instead: the retake and its cue go, the lead-in still stays
+    let id = g[0]["id"].as_u64().unwrap();
+    s.execute("takes.select", json!({"group": id, "take": 0})).unwrap();
+    assert_eq!(cut_indices(&mut s), (26..=45).collect::<Vec<u64>>());
+    assert_eq!(live_text(&mut s), format!("these are the photos I took in um Lisbon {LINE} but the map still works"));
+    // undo both: everything is live again
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(live_text(&mut s), all);
+    assert!(cut_indices(&mut s).is_empty());
+}
+
+#[test]
+fn crossing_out_a_take_takes_the_cue_after_it_along() {
+    let (mut s, _) = recording_with(retake_words());
+    // both takes live: nothing is chosen yet
+    s.execute("takes.detect", json!({"select": "none"})).unwrap();
+    assert!(cut_indices(&mut s).is_empty());
+    let id = groups(&mut s)[0]["id"].as_u64().unwrap();
+    // cross out the first pass by hand: "uh sorry" after it goes too, in the same undo step
+    s.execute("takes.cross", json!({"group": id, "take": 0})).unwrap();
+    assert_eq!(cut_indices(&mut s), (9..=27).collect::<Vec<u64>>());
+    assert_eq!(live_text(&mut s), format!("these are the photos I took in um Lisbon well {LINE} but the map still works"));
+    assert_eq!(groups(&mut s)[0]["active"], json!(1));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(cut_indices(&mut s).is_empty());
+    // the last take has nothing after it in the group: only the take goes
+    s.execute("takes.cross", json!({"group": id, "take": 1})).unwrap();
+    assert_eq!(cut_indices(&mut s), (28..=45).collect::<Vec<u64>>());
+    assert_eq!(live_text(&mut s), format!("these are the photos I took in um Lisbon {LINE} uh sorry but the map still works"));
+    // restoring a crossed-out take brings back the take, not the cue
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("takes.cross", json!({"group": id, "take": 0})).unwrap();
+    s.execute("takes.restore", json!({"group": id, "take": 0})).unwrap();
+    assert_eq!(cut_indices(&mut s), vec![26, 27]);
+}

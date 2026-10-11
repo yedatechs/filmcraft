@@ -1,6 +1,12 @@
 //! Take editing (`takes.*`): lines the speaker recorded more than once, as take groups stored on
 //! the media transcript (`Transcript::takes`), switched on the timeline.
 //!
+//! A take is the line itself: an earlier take of a detected group starts at the first word it
+//! shares with the take after it, so words said once before the line stay in the cut, and retake
+//! cues between two takes ("uh sorry") are in neither. Crossing a take out removes those cues with
+//! it ([`filmcraft_edit::takes::cross_range`]); switching removes the whole group and puts the
+//! chosen take back, so they go either way.
+//!
 //! Nothing about *which* take is in the cut is stored. A take is **live** when the sequence's
 //! audio clips play at least half of its media ([`filmcraft_edit::transcript::live_ranges`]).
 //! Switching takes is an ordinary timeline edit: the live takes of the group are extracted and
@@ -484,9 +490,11 @@ fn cross(s: &mut Session, p: &Value) -> Result<Value> {
     if live_of(q, item, &take).is_empty() {
         return Err(EngineError::Other("that take is already crossed out".into()));
     }
+    // retake cues between this take and the next one ("uh sorry") go with it
+    let media = s.project.transcripts.get(&item).and_then(|t| tk::cross_range(t, &g, i)).unwrap_or(take.range);
     let sc = crate::scenes::prepare_active(s);
     let removed = s.edit_sequence("Cross Out Take", |q, ctx, _| {
-        let removed = extract_takes(q, ctx, item, &[&take]);
+        let removed = extract_media(q, ctx, item, &[media]);
         crate::scenes::reapply_in(q, sc.as_ref());
         Ok(removed)
     })?;

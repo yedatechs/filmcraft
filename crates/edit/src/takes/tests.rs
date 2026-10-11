@@ -248,11 +248,14 @@ fn triple_false_start_without_pause() {
 
 #[test]
 fn restart_after_cue_words() {
-    // Cue words are stripped before looking for the restart; the first part keeps them.
+    // Cue words are stripped before looking for the restart. The false start begins after them:
+    // "okay" was said once, the retake does not say it, so it is not part of the take that is
+    // crossed out (the cut reads "okay so the plan is simple").
     let t = transcript(&[(0.0, "okay so the plan so the plan is simple")]);
     let g = detect(&t, &DetectParams::default());
     assert_eq!(g.len(), 1, "{g:?}");
-    assert_eq!(starts(&g[0]), vec![s(0.0), s(4.0 * 0.35)]);
+    assert_eq!(starts(&g[0]), vec![s(0.35), s(4.0 * 0.35)]);
+    assert_eq!(take_text(&t, &g[0].takes[0]), "so the plan");
 }
 
 #[test]
@@ -445,7 +448,9 @@ fn owner_opening_six_restarts() {
     let g = detect(&t, &DetectParams::default());
     let texts: Vec<Vec<String>> = g.iter().map(|g| g.takes.iter().map(|k| take_text(&t, k)).collect()).collect();
     let expected: [&[&str]; 6] = [
-        &["yo what a", "what a time to be alive", "what a time to be a builder these last three weeks have been crazy"],
+        // The greeting "yo" is said once and no retake says it again: the first false start is
+        // "what a", and "yo" stays in the cut in front of the line that is kept.
+        &["what a", "what a time to be alive", "what a time to be a builder these last three weeks have been crazy"],
         &[
             "so now we'll get",
             "so so now we have three days",
@@ -534,5 +539,212 @@ fn restart_hostile_input_is_bounded() {
     assert_eq!(g.iter().map(|g| g.takes.len()).sum::<usize>(), MAX_RESTARTS + 1);
     for p in [DetectParams { min_words: 0, ..Default::default() }, DetectParams { min_words: 1000, ..Default::default() }] {
         let _ = detect(&t, &p);
+    }
+}
+
+/// Words said one after the other from `t0` seconds: each `(pause before, text)`; a word lasts
+/// 0.18 s and the next one follows 0.02 s later.
+fn said(t0: f64, parts: &[(f64, &str)]) -> Transcript {
+    let mut words = Vec::new();
+    let mut t = t0;
+    for &(pause, text) in parts {
+        t += pause;
+        for w in text.split_whitespace() {
+            words.push(Word::new(w, s(t), s(t + 0.18)));
+            t += 0.2;
+        }
+    }
+    Transcript { words, ..Default::default() }
+}
+
+/// The word indices a media range covers.
+fn span(t: &Transcript, r: TimeRange) -> Range<usize> {
+    t.words_within(r)
+}
+
+const LINE: &str = "nobody can read most of the signs when half of the paint has peeled off the boards";
+
+/// A sentence that runs straight into a line, the line said twice, a retake cue between the
+/// passes, with the pauses of a real recording of that shape. Words 0–6 the sentence, 7–8 its
+/// end "um Lisbon" (0.2 s before the line: the same utterance), 9–25 the line, 26–27 "uh sorry",
+/// 28 "well", 29–45 the line again, 46–50 what follows.
+fn retake() -> Transcript {
+    said(
+        6.0,
+        &[
+            (0.0, "these are the photos I took in"),
+            (0.82, "um"),
+            (0.34, "Lisbon"),
+            (0.2, LINE),
+            (0.86, "uh sorry"),
+            (0.53, "well"),
+            (0.0, LINE),
+            (0.58, "but the map still works"),
+        ],
+    )
+}
+
+#[test]
+fn lead_in_before_a_retake_is_not_taken() {
+    let t = retake();
+    let p = DetectParams::default();
+    // The sentence's end and the first pass are one utterance; the cue is one of its own.
+    assert_eq!(utterances(&t.words, p.pause), vec![0..7, 7..26, 26..28, 28..46, 46..51]);
+    let g = detect(&t, &p);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(g[0].takes.len(), 2, "{g:?}");
+    // Take 1 is the line itself: "um Lisbon" was said once, before it, and belongs to the
+    // sentence in front. Take 2, the last one, keeps its own lead-in "well".
+    assert_eq!(span(&t, g[0].takes[0].range), 9..26);
+    assert_eq!(take_text(&t, &g[0].takes[0]), LINE);
+    assert_eq!(g[0].takes[0].range, TimeRange::from_bounds(t.words[9].start, t.words[25].end));
+    assert_eq!(span(&t, g[0].takes[1].range), 28..46);
+    assert_eq!(take_text(&t, &g[0].takes[1]), format!("well {LINE}"));
+    // The takes do not overlap and "uh sorry" is in neither.
+    assert!(g[0].takes[0].range.end() <= t.words[26].start && t.words[27].end <= g[0].takes[1].range.start);
+}
+
+#[test]
+fn cues_between_takes_go_with_the_earlier_take() {
+    let t = retake();
+    let g = detect(&t, &DetectParams::default());
+    let g = &g[0];
+    // Crossing out take 1 removes it and "uh sorry" up to the retake's first word, so the cut
+    // reads "… I took in um Lisbon well nobody can read …"; the take's own range stays the line.
+    let r = cross_range(&t, g, 0).unwrap();
+    assert_eq!(r, TimeRange::from_bounds(t.words[9].start, t.words[28].start));
+    assert_eq!(span(&t, r), 9..28);
+    assert_eq!(span(&t, g.takes[0].range), 9..26);
+    // The last take has nothing after it in the group; a take that is not there has no range.
+    assert_eq!(cross_range(&t, g, 1), Some(g.takes[1].range));
+    assert_eq!(cross_range(&t, g, 2), None);
+    assert_eq!(cross_range(&t, g, usize::MAX), None);
+    // "okay again" and "one more" are cues too.
+    for cue in ["okay again", "one more", "sorry um let's redo"] {
+        let t = said(0.0, &[(0.0, "today we talk about rivers"), (0.8, cue), (0.8, "today we talk about rivers")]);
+        let g = detect(&t, &DetectParams::default());
+        assert_eq!(g.len(), 1, "{cue}: {g:?}");
+        let n = cue.split_whitespace().count();
+        assert_eq!(span(&t, cross_range(&t, &g[0], 0).unwrap()), 0..5 + n, "{cue}");
+    }
+    // Anything else between two takes is not a cue: only the take goes. So does silence alone.
+    for between in ["um the rivers wait", "seven", ""] {
+        let t = said(0.0, &[(0.0, "today we talk about rivers"), (0.8, between), (0.8, "today we talk about rivers")]);
+        let g = detect(&t, &DetectParams::default());
+        assert_eq!(g.len(), 1, "{between}: {g:?}");
+        assert_eq!(cross_range(&t, &g[0], 0), Some(g[0].takes[0].range), "{between}");
+    }
+    // Hand-made groups: takes that touch or overlap are left as they are.
+    let a = TimeRange::from_bounds(s(0.0), s(2.0));
+    for b in [TimeRange::from_bounds(s(2.0), s(3.0)), TimeRange::from_bounds(s(1.0), s(3.0)), TimeRange::from_bounds(s(0.0), s(2.0))] {
+        let g = TakeGroup { id: 1, takes: vec![Take::new(a), Take::new(b)], ..Default::default() };
+        assert_eq!(cross_range(&t, &g, 0), Some(a));
+    }
+    assert_eq!(cross_range(&Transcript::default(), &TakeGroup::default(), 0), None);
+}
+
+#[test]
+fn a_take_that_opens_with_other_words_still_groups() {
+    // The same line with another first word: still one group. Neither "well" nor "so" is said
+    // twice, so take 1 starts at the first word the two share.
+    let t = transcript(&[(0.0, "well the main reason we came here is the water."), (5.0, "so the main reason we came here is the water.")]);
+    let g = detect(&t, &DetectParams::default());
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert_eq!(starts(&g[0]), vec![s(0.35), s(5.0)]);
+    assert_eq!(take_text(&t, &g[0].takes[0]), "the main reason we came here is the water.");
+    assert_eq!(take_text(&t, &g[0].takes[1]), "so the main reason we came here is the water.");
+    // A take that differs in the middle, or at its end, keeps its range.
+    for (a, b) in [
+        ("the main reason we came here is the water.", "the main reason we drove here is the water."),
+        ("the main reason we came here is the water.", "the main reason we came here is the lake."),
+        ("the main reason we came", "the main reason we came here is the water."),
+    ] {
+        let t = transcript(&[(0.0, a), (5.0, b)]);
+        let g = detect(&t, &DetectParams::default());
+        assert_eq!(g.len(), 1, "{a}: {g:?}");
+        assert_eq!(starts(&g[0]), vec![s(0.0), s(5.0)], "{a}");
+        assert_eq!(take_text(&t, &g[0].takes[0]), a);
+    }
+    // Three passes: each earlier take is measured against the one after it, the last keeps its
+    // own lead-in.
+    let t = transcript(&[
+        (0.0, "ahem the main reason is the water."),
+        (4.0, "okay again the main reason is the water."),
+        (8.0, "right the main reason is the water."),
+    ]);
+    let g = detect(&t, &DetectParams::default());
+    assert_eq!(g.len(), 1, "{g:?}");
+    let texts: Vec<String> = g[0].takes.iter().map(|k| take_text(&t, k)).collect();
+    assert_eq!(texts, ["the main reason is the water.", "the main reason is the water.", "right the main reason is the water."]);
+    // "okay again" now sits between takes 1 and 2 and goes with take 1.
+    assert_eq!(take_text(&t, &Take::new(cross_range(&t, &g[0], 0).unwrap())), "the main reason is the water. okay again");
+}
+
+#[test]
+fn take_start_rules() {
+    let start = |a: &str, b: &str| {
+        let (a, b) = (words(a), words(b));
+        let (a, b): (Vec<&str>, Vec<&str>) = (a.iter().map(String::as_str).collect(), b.iter().map(String::as_str).collect());
+        take_start(&a, &b)
+    };
+    // A lead-in the retake does not say is left out, with the filler in front of it.
+    assert_eq!(start("um lisbon nobody can read most of the signs", "well nobody can read most of the signs"), 2);
+    // Its words may be ones the line uses elsewhere ("it", "the", "you"): the shared part
+    // accounts for those, so they are not "said again".
+    assert_eq!(start("to it nobody can read most of it", "well nobody can read most of it"), 2);
+    assert_eq!(start("the app the paint has peeled off the boards", "well the paint has peeled off the boards"), 2);
+    assert_eq!(start("for you i think you see it", "so i think you see it"), 2);
+    // A stumble on the line's opening stays one take, filler included.
+    assert_eq!(start("the uh the main reason", "the main reason we came"), 0);
+    assert_eq!(start("so so now we have three days", "so now you have three more days"), 0);
+    assert_eq!(start("i think uh i don't think you see", "so i don't think you see"), 0);
+    // … after a lead-in that is not said again, the take starts at the stumble.
+    assert_eq!(start("lisbon the uh the main reason", "the main reason we came"), 1);
+    // A reordered line keeps a first word the retake says somewhere else.
+    assert_eq!(start("today we look at the rivers of europe", "european rivers are what we look at today"), 0);
+    // Cue words in front of an earlier take are not part of it, unless the retake says them too.
+    assert_eq!(start("okay again today we talk", "today we talk"), 2);
+    assert_eq!(start("one more today we talk", "today we talk"), 2);
+    assert_eq!(start("okay today we talk", "okay again today we talk"), 0);
+    // A false start, a changed ending, a changed middle: the take starts where it started.
+    assert_eq!(start("what a", "what a time to be alive"), 0);
+    assert_eq!(start("and they also", "and they don't"), 0);
+    assert_eq!(start("the main reason we came here", "the main reason we drove here"), 0);
+    // Nothing shared, nothing said: 0. Long input is compared on its first 64 words.
+    assert_eq!(start("the weather is nice", "my cat sleeps all day"), 0);
+    assert_eq!(start("", "a b"), 0);
+    assert_eq!(start("a b", ""), 0);
+    let long: Vec<String> = (0..5000).map(|i| format!("w{i}")).collect();
+    let long: Vec<&str> = long.iter().map(String::as_str).collect();
+    assert_eq!(take_start(&long, &long), 0);
+    assert_eq!(take_start(long.get(1..).unwrap(), &long), 0);
+    let mut led = vec!["lisbon"];
+    led.extend(&long);
+    assert_eq!(take_start(&led, &long), 1);
+    assert_eq!(cue_flags(&["one", "more", "one", "um", "more"]), [true, true, false, true, false]);
+}
+
+#[test]
+fn take_start_survives_hostile_times() {
+    // Words out of order, of no length, at the ends of time: detection still answers, and every
+    // take lies inside its utterance part.
+    let mut t = retake();
+    for (i, w) in t.words.iter_mut().enumerate() {
+        if i % 5 == 0 {
+            (w.start, w.end) = (w.end, w.start);
+        }
+    }
+    t.words.insert(9, Word::new("lisbon", Tick(i64::MAX), Tick(i64::MIN)));
+    t.words.insert(3, Word::new("", Tick(i64::MIN), Tick(i64::MAX)));
+    for p in [
+        DetectParams::default(),
+        DetectParams { pause: Tick::ZERO, ..Default::default() },
+        DetectParams { min_words: 0, window: usize::MAX, ..Default::default() },
+    ] {
+        for g in detect(&t, &p) {
+            for i in 0..=g.takes.len() {
+                let _ = cross_range(&t, &g, i);
+            }
+        }
     }
 }
