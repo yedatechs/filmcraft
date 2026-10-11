@@ -1,15 +1,25 @@
-//! `cargo xtask bundle [--release|--debug] [--open] [--release-id]`: a local macOS `FilmCraft Dev.app`
-//! (`FilmCraft.app` with the release bundle id under `--release-id`).
+//! `cargo xtask bundle [--release|--debug] [--open] [--release-id] [--sign IDENTITY|--adhoc]
+//! [--reset-permissions]`: a local macOS `FilmCraft Dev.app` (`FilmCraft.app` with the release
+//! bundle id under `--release-id`).
 //!
-//! Builds the `filmcraft` binary and assembles `<target>/<profile>/FilmCraft.app` with its own
-//! Info.plist (camera / microphone usage descriptions, document types), the icon and an ad-hoc
-//! signature, so macOS attributes the camera, microphone and Screen Recording permissions to
-//! FilmCraft instead of the terminal that started it. It copies the binary and the icon only:
-//! everything else is embedded. Release packaging (universal binary, Developer ID, notarisation,
-//! DMG) is `packaging/macos/package.sh`. On other hosts it does nothing.
+//! Builds the `filmcraft` binary and assembles `<target>/<profile>/FilmCraft Dev.app` with its own
+//! Info.plist (camera / microphone usage descriptions, document types), the icon and a signature,
+//! so macOS attributes the camera, microphone and Screen Recording permissions to FilmCraft
+//! instead of the terminal that started it. It copies the binary and the icon only: everything
+//! else is embedded. Release packaging (universal binary, Developer ID, notarisation, DMG) is
+//! `packaging/macos/package.sh`. On other hosts it does nothing.
+//!
+//! The signature decides whether those permissions last ([`Signing`]): signed with the local
+//! identity of `cargo xtask dev-identity` (`identity.rs`; used whenever it exists) or with an
+//! identity of the user's keychains (`--sign`, `FILMCRAFT_SIGN_IDENTITY`), every build is the same
+//! app to macOS; signed ad hoc (no identity, or `--adhoc`) every build is a new one.
+//! `--reset-permissions` drops the app's permission records (`tccutil reset All <bundle id>`),
+//! needed once after the way it is signed changed.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::identity::{self, Identity};
 
 /// The bundle identifier, the same as the release bundle (`packaging/macos/Info.plist.in`) and the
 /// Linux app id (`packaging/linux/ai.storyteller.filmcraft.desktop`).
@@ -172,19 +182,92 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     if st.success() { Ok(()) } else { Err(format!("failed: {cmd:?}")) }
 }
 
-pub fn run_bundle(root: &Path, args: &[&str]) -> Result<(), String> {
-    let mut release = true;
-    let mut open = false;
-    let mut release_id = false;
-    for a in args {
+pub const USAGE: &str = "cargo xtask bundle [--release|--debug] [--open] [--release-id] [--sign IDENTITY|--adhoc] [--reset-permissions]";
+
+/// How the bundle is signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Signing {
+    /// `codesign --sign -`: a new code identity every build, so macOS asks for the permissions
+    /// again (and Screen Recording silently stops working) after each one.
+    AdHoc,
+    /// An identity of the user's own keychains (`--sign`, `FILMCRAFT_SIGN_IDENTITY`): a name or
+    /// SHA-1 as `security find-identity -p codesigning` lists it.
+    Named(String),
+    /// The local identity `cargo xtask dev-identity` made, in its own keychain.
+    Dev(Identity),
+}
+
+/// What signs the bundle: `--adhoc` / `--sign` first, then `FILMCRAFT_SIGN_IDENTITY` (`-` = ad
+/// hoc), then the local dev identity when there is one, else ad hoc.
+pub fn signing_for(flag: Option<Signing>, env: Option<&str>, dev: Option<Identity>) -> Signing {
+    if let Some(s) = flag {
+        return s;
+    }
+    match env.map(str::trim).filter(|e| !e.is_empty()) {
+        Some("-") => Signing::AdHoc,
+        Some(e) => Signing::Named(e.to_string()),
+        None => dev.map_or(Signing::AdHoc, Signing::Dev),
+    }
+}
+
+/// What `run_bundle` was asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Options {
+    pub release: bool,
+    pub open: bool,
+    pub release_id: bool,
+    pub sign: Option<Signing>,
+    pub reset_permissions: bool,
+}
+
+pub fn parse_args(args: &[&str]) -> Result<Options, String> {
+    let mut o = Options { release: true, open: false, release_id: false, sign: None, reset_permissions: false };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match *a {
-            "--release" => release = true,
-            "--debug" => release = false,
-            "--open" => open = true,
-            "--release-id" => release_id = true,
-            _ => return Err(format!("bundle: unknown argument `{a}` (usage: cargo xtask bundle [--release|--debug] [--open] [--release-id])")),
+            "--release" => o.release = true,
+            "--debug" => o.release = false,
+            "--open" => o.open = true,
+            "--release-id" => o.release_id = true,
+            "--adhoc" => o.sign = Some(Signing::AdHoc),
+            "--sign" => match it.next().map(|v| v.trim()).filter(|v| !v.is_empty() && !v.starts_with("--")) {
+                Some("-") => o.sign = Some(Signing::AdHoc),
+                Some(v) => o.sign = Some(Signing::Named(v.to_string())),
+                None => return Err("bundle: --sign needs an identity, a name or SHA-1 from `security find-identity -p codesigning`".into()),
+            },
+            "--reset-permissions" => o.reset_permissions = true,
+            _ => return Err(format!("bundle: unknown argument `{a}` (usage: {USAGE})")),
         }
     }
+    Ok(o)
+}
+
+/// Sign `app` and return its designated requirement (what macOS ties the app's permissions to).
+fn sign(app: &Path, signing: &Signing) -> Result<String, String> {
+    let mut cmd = Command::new("codesign");
+    cmd.args(["--force", "--deep", "--sign"]);
+    match signing {
+        Signing::AdHoc => {
+            cmd.arg("-");
+        }
+        Signing::Named(n) => {
+            cmd.arg(n);
+        }
+        Signing::Dev(id) => {
+            // a locked keychain would make codesign wait on a password window
+            identity::unlock(&identity::dir()?, id)?;
+            cmd.arg(&id.sha1).arg("--keychain").arg(&id.keychain);
+        }
+    }
+    run(cmd.arg(app))?;
+    run(Command::new("codesign").args(["--verify", "--strict"]).arg(app))?;
+    let out = Command::new("codesign").args(["-d", "-r-"]).arg(app).output().map_err(|e| format!("codesign: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text.lines().find_map(|l| l.strip_prefix("designated => ")).unwrap_or("").to_string())
+}
+
+pub fn run_bundle(root: &Path, args: &[&str]) -> Result<(), String> {
+    let Options { release, open, release_id, sign: sign_flag, reset_permissions } = parse_args(args)?;
     let (id, name) = if release_id { (BUNDLE_ID, "FilmCraft") } else { (DEV_BUNDLE_ID, DEV_NAME) };
     if !cfg!(target_os = "macos") {
         println!("bundle: a macOS app bundle; nothing to do on this host");
@@ -221,10 +304,28 @@ pub fn run_bundle(root: &Path, args: &[&str]) -> Result<(), String> {
     write(contents.join("PkgInfo"), b"APPL????")?;
 
     run(Command::new("plutil").arg("-lint").arg(contents.join("Info.plist")))?;
-    // Ad-hoc: one code identity for TCC, but a new one each build (permissions are asked again).
-    run(Command::new("codesign").args(["--force", "--deep", "--sign", "-"]).arg(&app))?;
-    run(Command::new("codesign").args(["--verify", "--strict"]).arg(&app))?;
+    let env = std::env::var("FILMCRAFT_SIGN_IDENTITY").ok();
+    let dev = identity::dir().ok().and_then(|d| identity::find(&d));
+    let signing = signing_for(sign_flag, env.as_deref(), dev);
+    let requirement = sign(&app, &signing)?;
     println!("bundle: {} ({name} {version}, {id}, {profile}, {:.1} MB)", app.display(), dir_size(&app) as f64 / 1e6);
+    match &signing {
+        Signing::AdHoc => println!(
+            "bundle: signed ad hoc: macOS treats every rebuild as a new app (Camera and Microphone are asked again, Screen Recording stops working until its entry is removed). `cargo xtask dev-identity` once makes the permissions last."
+        ),
+        Signing::Named(n) => println!("bundle: signed with \"{n}\""),
+        Signing::Dev(_) => println!("bundle: signed with \"{}\": the permissions macOS gives this app last across rebuilds", identity::NAME),
+    }
+    if !requirement.is_empty() {
+        println!("bundle: requirement: {requirement}");
+    }
+    if reset_permissions {
+        // the records of builds signed another way no longer match this one; macOS asks again
+        run(Command::new("tccutil").args(["reset", "All", id]))?;
+        println!(
+            "bundle: the privacy permissions of {id} are reset: allow Camera and Microphone when asked, and turn {name} on once under System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording"
+        );
+    }
     if open {
         run(Command::new("open").arg(&app))?;
     }
@@ -290,6 +391,29 @@ mod tests {
         assert!(!p.contains("NSScreenCaptureUsageDescription") && !p.contains("NSAppleEventsUsageDescription"));
         assert_eq!(p.matches("<dict>").count(), p.matches("</dict>").count());
         assert_eq!(p.matches("<array>").count(), p.matches("</array>").count());
+    }
+
+    #[test]
+    fn arguments_and_the_signing_order() {
+        let o = parse_args(&[]).unwrap();
+        assert_eq!(o, Options { release: true, open: false, release_id: false, sign: None, reset_permissions: false });
+        let o = parse_args(&["--debug", "--open", "--release-id", "--reset-permissions", "--sign", "Apple Development: A (B)"]).unwrap();
+        assert!(!o.release && o.open && o.release_id && o.reset_permissions);
+        assert_eq!(o.sign, Some(Signing::Named("Apple Development: A (B)".into())));
+        assert_eq!(parse_args(&["--adhoc"]).unwrap().sign, Some(Signing::AdHoc));
+        assert_eq!(parse_args(&["--sign", "-"]).unwrap().sign, Some(Signing::AdHoc));
+        for bad in [&["--sign"][..], &["--sign", ""], &["--sign", "--open"], &["--frobnicate"], &["--sign", "x", "y"]] {
+            assert!(parse_args(bad).is_err(), "{bad:?}");
+        }
+
+        let dev = Identity { keychain: PathBuf::from("/k/signing.keychain-db"), sha1: "D61A97A9F361BDE014B4AF6161AA2E8CFF0B6DF5".into() };
+        // the flag wins, then the environment, then the local identity, else ad hoc
+        assert_eq!(signing_for(Some(Signing::AdHoc), Some("X"), Some(dev.clone())), Signing::AdHoc);
+        assert_eq!(signing_for(None, Some("X"), Some(dev.clone())), Signing::Named("X".into()));
+        assert_eq!(signing_for(None, Some("-"), Some(dev.clone())), Signing::AdHoc);
+        assert_eq!(signing_for(None, Some("  "), Some(dev.clone())), Signing::Dev(dev.clone()));
+        assert_eq!(signing_for(None, None, Some(dev.clone())), Signing::Dev(dev));
+        assert_eq!(signing_for(None, None, None), Signing::AdHoc);
     }
 
     #[test]
