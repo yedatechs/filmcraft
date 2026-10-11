@@ -9,6 +9,7 @@
 //! | `record.start` | start the chosen sources; the recording begins when every one is live (its files, the clock start) |
 //! | `record.status` | elapsed time and per-source frames / dropped / bytes (and the mic level) |
 //! | `record.pause` / `record.resume` | leave a stretch out of every file: each source is cut at the same instants ([`PauseLedger`]) |
+//! | `record.monitor` | the microphone level before a recording ([`crate::record_monitor`]) |
 //! | `record.stop` | finish the files, import them and build the synced sequence (or `discard`) |
 //! | `record.cancel` | stop and delete the files |
 //!
@@ -1149,6 +1150,11 @@ pub struct Recorder {
     pub test_clock_ms: Option<Arc<AtomicU64>>,
     /// What [`tick`] did last (a delayed start, its failure, a Stop after), for the hosts.
     pub last_event: Option<Value>,
+    /// The microphones whose level is wanted before a recording (`record.monitor`; `default` or
+    /// device names). Kept while a recording or a voice-over uses the microphones.
+    pub monitor_wanted: Vec<String>,
+    /// The microphone monitors running now ([`crate::record_monitor`]).
+    pub(crate) monitors: Vec<crate::record_monitor::MicMonitor>,
 }
 
 impl Recorder {
@@ -1753,6 +1759,16 @@ fn is_recording(s: &Session) -> std::result::Result<(), String> {
     if s.record.recording() || s.record.countdown.is_some() || s.record.starting.is_some() { Ok(()) } else { Err("nothing is recording".into()) }
 }
 
+/// The microphones that can be chosen (a recording that runs or starts holds the session's
+/// input: its list is the one taken at its start).
+pub(crate) fn microphone_names(s: &mut Session) -> Vec<String> {
+    match (&s.record.active, &s.record.starting) {
+        (Some(a), _) => a.microphones.clone(),
+        (None, Some(st)) => st.microphones.clone(),
+        (None, None) => s.voiceover.input.get_or_insert_with(|| Box::new(SyntheticInput::clicks())).devices(),
+    }
+}
+
 fn devices(s: &mut Session, _p: &Value) -> Result<Value> {
     let f = factory(s);
     let (dev, error) = match f.devices() {
@@ -1762,11 +1778,7 @@ fn devices(s: &mut Session, _p: &Value) -> Result<Value> {
         }
         Err(e) => (VideoDevices::default(), Some(e.message)),
     };
-    let microphones = match (&s.record.active, &s.record.starting) {
-        (Some(a), _) => a.microphones.clone(),
-        (None, Some(st)) => st.microphones.clone(),
-        (None, None) => s.voiceover.input.get_or_insert_with(|| Box::new(SyntheticInput::clicks())).devices(),
-    };
+    let microphones = microphone_names(s);
     Ok(json!({
         "displays": dev.displays,
         "windows": dev.windows,
@@ -2431,7 +2443,15 @@ fn starting_label(plan: &Plan) -> String {
     }
 }
 
+/// `record.start`. The microphone monitors are stopped before the microphones are opened (in
+/// [`begin`]); a start that fails puts them back.
 fn start(s: &mut Session, p: &Value) -> Result<Value> {
+    let r = begin(s, p);
+    crate::record_monitor::apply(s);
+    r
+}
+
+fn begin(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "record.start";
     can_start(s).map_err(|e| bad(cmd, e))?;
     let countdown = countdown_of(p, cmd)?;
@@ -2454,6 +2474,8 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
         s.record.last_event = None;
         return Ok(json!({"recording": false, "countdown": countdown}));
     }
+    // the microphones are about to be opened: the level monitors let go of them first
+    crate::record_monitor::stop_all(&mut s.record);
     // a second microphone needs a second input of the same kind
     let mut extra_inputs: Vec<Box<dyn AudioInput>> = Vec::new();
     for _ in 1..plan.mics.len() {
@@ -2653,6 +2675,8 @@ pub fn tick(s: &mut Session) -> Option<Value> {
             Ok(v) => json!({"event": "started", "result": v}),
             Err(e) => json!({"event": "startFailed", "error": e.to_string()}),
         };
+        // a start that failed: the level monitors come back
+        crate::record_monitor::apply(s);
         s.record.last_event = Some(ev.clone());
         return Some(ev);
     }
@@ -2697,8 +2721,9 @@ pub fn tick(s: &mut Session) -> Option<Value> {
 
 fn status_json(s: &Session) -> Value {
     let preview = crate::record_preview::preview_ids(s);
+    let monitor = crate::record_monitor::status(s);
     let Some(a) = &s.record.active else {
-        let mut v = json!({"recording": false, "sources": [], "preview": preview});
+        let mut v = json!({"recording": false, "sources": [], "preview": preview, "monitor": monitor});
         if let (Some(o), Some(st)) = (v.as_object_mut(), &s.record.starting) {
             o.insert("starting".into(), json!(true));
             o.insert("label".into(), json!(st.label));
@@ -2765,6 +2790,7 @@ fn status_json(s: &Session) -> Value {
         "notes": a.notes,
         "error": (!errors.is_empty()).then(|| errors.join("; ")),
         "preview": preview,
+        "monitor": monitor,
     })
 }
 
@@ -3060,7 +3086,14 @@ fn camera_offsets(p: &Value, cmd: &str) -> Result<(f64, Vec<f64>)> {
     Ok((scalar, list))
 }
 
+/// `record.stop`. Once the microphones are free again the level monitors come back.
 fn stop(s: &mut Session, p: &Value) -> Result<Value> {
+    let r = end(s, p);
+    crate::record_monitor::apply(s);
+    r
+}
+
+fn end(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "record.stop";
     let discard = bool_p(p, "discard").unwrap_or(false);
     let (scalar, list) = camera_offsets(p, cmd)?;
@@ -3281,6 +3314,7 @@ fn cancel(s: &mut Session, _p: &Value) -> Result<Value> {
     if s.record.active.is_none()
         && let Some(v) = cancel_start(s)
     {
+        crate::record_monitor::apply(s);
         return Ok(v);
     }
     stop(s, &json!({"discard": true}))
@@ -3365,6 +3399,7 @@ pub fn commands() -> Vec<CommandSpec> {
         spec("record.pause", "Pause Recording", "{}", can_pause, pause, true),
         spec("record.resume", "Resume Recording", "{}", can_resume, resume, true),
         crate::record_preview::preview_spec(),
+        crate::record_monitor::monitor_spec(),
         spec("record.settings", "Recording Settings", r#"{"get":bool?}|{"set":{field:value}}"#, crate::commands::always, crate::record_settings::command, true),
     ]
 }

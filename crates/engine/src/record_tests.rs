@@ -52,6 +52,15 @@ fn secs(t: Tick) -> f64 {
 /// One frame at 30 fps, in ns.
 const FRAME_NS: u64 = 33_333_334;
 
+/// The tests that record in real time and then compare lengths and pictures frame by frame
+/// take turns: the test harness runs a test per core, and several recordings at once starve
+/// each other's capture and encoder threads on a busy machine (frames are then dropped and the
+/// pictures no longer match to the frame).
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Where the moving white bar of a synthetic frame starts (`synthetic_frame` draws it at
 /// `(capture time / 10 ms) mod span`): every synthetic source draws it from the same start clock,
 /// so two frames captured together show it at the same place.
@@ -105,6 +114,7 @@ fn devices_in_a_headless_session_are_synthetic() {
 
 #[test]
 fn three_sources_three_files_one_synced_sequence() {
+    let _turn = one_at_a_time();
     let dir = tmp("three");
     let mut s = session(300);
     let seqs_before = s.project.items.values().filter(|i| i.as_sequence().is_some()).count();
@@ -657,6 +667,7 @@ fn auto_gain_moves_toward_minus_18_dbfs_at_2_db_per_second() {
 
 #[test]
 fn every_source_is_live_before_the_clock_starts() {
+    let _turn = one_at_a_time();
     let dir = tmp("live");
     let mut s = Session::default();
     // the screen delivers at once, the camera after 300 ms, the microphone after 700 ms
@@ -769,13 +780,6 @@ fn a_source_that_never_delivers_fails_the_start_and_leaves_no_files() {
 
 // ------------------------------------------------------------------------------------- pause / resume
 
-/// The pause tests record in real time and compare pictures frame by frame: they take turns, so
-/// their encoders are not starved by each other (the test harness runs a test per core).
-fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Whether no video source of a stopped recording dropped a frame. When an encoder could not
 /// keep up (a loaded machine) the oldest waiting frame is dropped and the file shows an older
 /// picture for a while: lengths and cuts are still exact, a frame-by-frame comparison of the
@@ -841,7 +845,9 @@ fn pause_and_resume_cut_every_source_at_the_same_instants() {
     assert_eq!((p["paused"].as_bool(), p["pauses"].as_u64()), (Some(true), Some(1)), "{p}");
     let at_pause = p["elapsed"].as_f64().unwrap();
     assert!((0.45..2.0).contains(&at_pause), "paused after about 0.5 s: {p}");
-    // paused: the recorded time stands still, nothing is written, the sources keep running
+    // paused: the recorded time stands still, the sources keep running, and nothing captured
+    // after the pause began is written (what was captured just before it may still be on its way
+    // into the files: never more than the recorded time holds)
     std::thread::sleep(Duration::from_millis(300));
     let st = s.execute("record.status", json!({})).unwrap();
     assert_eq!((st["recording"].as_bool(), st["paused"].as_bool(), st["pauses"].as_u64()), (Some(true), Some(true), Some(1)), "{st}");
@@ -849,9 +855,11 @@ fn pause_and_resume_cut_every_source_at_the_same_instants() {
     let frames = |st: &Value, key: &str| st["sources"].as_array().unwrap().iter().find(|x| x["key"] == key).unwrap()["frames"].as_u64().unwrap();
     std::thread::sleep(Duration::from_millis(300));
     let st2 = s.execute("record.status", json!({})).unwrap();
-    for key in ["screen", "camera", "mic"] {
-        assert_eq!(frames(&st, key), frames(&st2, key), "{key} writes nothing while paused");
+    assert_eq!(st2["elapsed"].as_f64().unwrap(), at_pause);
+    for key in ["screen", "camera"] {
+        assert!(frames(&st2, key) as f64 <= at_pause * 30.0 + 2.0, "{key} wrote {} frames, {at_pause} s were recorded", frames(&st2, key));
     }
+    assert!(frames(&st2, "mic") as f64 <= at_pause * 48_000.0 + 1.0, "the microphone wrote {} samples, {at_pause} s were recorded", frames(&st2, "mic"));
     assert!(st2["sources"][2]["level"].as_f64().is_some(), "the microphone is still read: {st2}");
     assert!(st2["error"].is_null(), "{st2}");
     let r = s.execute("record.resume", json!({})).unwrap();

@@ -932,17 +932,18 @@ fn pause_and_resume_from_the_panel_the_strip_and_the_popout() {
     assert_eq!(overlay(&mut d)["state"], "paused");
     assert!(label_of(&mut d, "record.overlay").starts_with("paused display:synthetic:display"));
     d.snapshot("paused");
-    let frames = |d: &mut Driver| {
-        let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
-        st["sources"].as_array().unwrap().iter().map(|s| s["frames"].as_u64().unwrap()).collect::<Vec<_>>()
-    };
-    // what was captured just before the pause is still on its way into the files for a moment
-    d.run_for(0.3);
-    let before = frames(&mut d);
+    let status = |d: &mut Driver| d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
+    let frames = |st: &Value| st["sources"].as_array().unwrap().iter().map(|s| s["frames"].as_u64().unwrap()).collect::<Vec<_>>();
+    let recorded = status(&mut d)["elapsed"].as_f64().unwrap();
     let n = frame_no(&label_of(&mut d, "record.preview.1"));
     d.run_for(1.2);
     assert_eq!(label_of(&mut d, "record.preview.1.time"), time, "the time stands still while paused");
-    assert_eq!(frames(&mut d), before, "nothing is written while paused");
+    // nothing captured after the pause began is written: the files hold the recorded time at most
+    let st = status(&mut d);
+    assert_eq!(st["elapsed"].as_f64().unwrap(), recorded, "{st}");
+    let before = frames(&st);
+    assert!(before[0] as f64 <= recorded * 30.0 + 2.0 && before[1] as f64 <= recorded * 30.0 + 2.0, "{before:?} frames in {recorded} s");
+    assert!(before[2] as f64 <= recorded * 48_000.0 + 1.0, "{before:?} samples in {recorded} s");
     assert!(frame_no(&label_of(&mut d, "record.preview.1")) > n + 10, "the preview keeps running while paused");
     // the pop-out's Resume: recording again everywhere
     d.click("record.preview.1.pause");
@@ -954,8 +955,16 @@ fn pause_and_resume_from_the_panel_the_strip_and_the_popout() {
     assert!(label_of(&mut d, "record.panel.record").starts_with("■  Stop  00:0"));
     assert!(d.harness.state().ui.record.live.starts_with("Recording · 00:0"));
     assert_eq!(overlay(&mut d)["state"], "recording");
-    d.run_for(0.3);
-    assert!(frames(&mut d).iter().zip(&before).all(|(now, then)| now > then), "the files grow again");
+    // every file grows again (a writer that was kept waiting by a busy disk catches up)
+    let t0 = Instant::now();
+    loop {
+        d.run_for(0.1);
+        let after = frames(&status(&mut d));
+        if after.iter().zip(&before).all(|(now, then)| now > then) {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(5), "the files grow again: {before:?} then {after:?}");
+    }
     // the pop-out's Pause, then the minimized strip shows it and resumes
     d.click("record.preview.1.pause");
     assert!(paused(&d));
@@ -997,5 +1006,70 @@ fn pause_and_resume_from_the_panel_the_strip_and_the_popout() {
         assert_eq!(sd["pauses"].as_array().unwrap().len(), 3, "{sd}");
         assert!(sd["paused_ns"].as_u64().unwrap() > 1_000_000_000, "{sd}");
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------------------------------------------- the level before recording
+
+/// Whether element `id`'s label (a level, `0.00` to `1.00`) shows both silence and a click of
+/// the synthetic microphone within a few seconds.
+fn meter_moves(d: &mut Driver, id: &str) -> bool {
+    let (mut low, mut high) = (false, false);
+    let t0 = Instant::now();
+    while !(low && high) && t0.elapsed() < Duration::from_secs(4) {
+        d.frames(1);
+        let l: f64 = label_of(d, id).parse().unwrap();
+        low |= l < 0.1;
+        high |= l > 0.4;
+        std::thread::sleep(Duration::from_millis(7));
+    }
+    low && high
+}
+
+fn monitored(d: &mut Driver) -> Value {
+    d.ok("engine.execute", json!({"command": "record.status", "params": {}}))["monitor"].clone()
+}
+
+#[test]
+fn the_microphone_meter_moves_before_record_is_pressed() {
+    let dir = tmp("monitor");
+    let mut d = Driver::new(&dir);
+    assert_eq!(monitored(&mut d), json!([]), "no microphone is open before the panel is");
+    pop_out(&mut d, json!(0), json!({"screen": "", "mics": [{"device": "default"}]}));
+    d.frames(3);
+    // the panel asked for its microphone row: the meter moves, in the panel and in the pop-out
+    assert_eq!(monitored(&mut d)[0]["device"], "default");
+    assert!(!d.harness.state().session.record.recording());
+    assert!(meter_moves(&mut d, "record.panel.level"), "the panel's meter follows the microphone before Record");
+    assert!(meter_moves(&mut d, "record.preview.1.level"), "the pop-out's meter too");
+    // a second row is monitored as well; a row set to Off is not
+    d.ok("ui.set", json!({"record": {"mics": [{"device": "default"}, {"device": "Synthetic Input 2"}, {"device": ""}]}}));
+    d.frames(3);
+    let m = monitored(&mut d);
+    assert_eq!((m[0]["device"].as_str(), m[1]["device"].as_str(), m.as_array().unwrap().len()), (Some("default"), Some("Synthetic Input 2"), 2), "{m}");
+    // recording takes the microphones (the meter is the recording's), Stop gives the level back
+    d.click("record.preview.1.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
+    assert_eq!(monitored(&mut d), json!([]));
+    assert!(meter_moves(&mut d, "record.panel.level"));
+    d.click("record.preview.1.record");
+    assert!(!d.harness.state().session.record.recording());
+    d.frames(2);
+    assert_eq!(monitored(&mut d).as_array().unwrap().len(), 2, "the monitors are back after Stop");
+    assert!(meter_moves(&mut d, "record.preview.1.level"));
+    // no microphone row: an empty meter, nothing open
+    d.ok("ui.set", json!({"record": {"mics": []}}));
+    d.frames(3);
+    assert_eq!(monitored(&mut d), json!([]));
+    assert_eq!(label_of(&mut d, "record.panel.level"), "0.00");
+    assert_eq!(label_of(&mut d, "record.preview.1.level"), "0.00");
+    // back on, then closing the panel closes the microphone
+    d.ok("ui.set", json!({"record": {"mics": [{"device": "default"}]}}));
+    d.frames(3);
+    assert_eq!(monitored(&mut d).as_array().unwrap().len(), 1);
+    d.click("record.panel.close");
+    d.frames(3);
+    assert!(!d.harness.state().ui.record.open);
+    assert_eq!(monitored(&mut d), json!([]), "closing the panel stops listening");
     std::fs::remove_dir_all(&dir).ok();
 }

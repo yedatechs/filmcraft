@@ -360,7 +360,15 @@ fn settings(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(settings_json(s))
 }
 
+/// `audio.voiceover.start`. The microphone level monitors of the Record panel are stopped
+/// before the input opens (in [`begin`]); a start that fails puts them back.
 fn start(s: &mut Session, p: &Value) -> Result<Value> {
+    let r = begin(s, p);
+    crate::record_monitor::apply(s);
+    r
+}
+
+fn begin(s: &mut Session, p: &Value) -> Result<Value> {
     let track = record_track(s, p)?;
     let seq_id = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
     let seq = s.active_sequence().ok_or(EngineError::NoSequence)?;
@@ -379,6 +387,7 @@ fn start(s: &mut Session, p: &Value) -> Result<Value> {
     let capture_start = (record_start - preroll).max(Tick::ZERO);
     let punch_out = if punch { mark_out } else { None };
     let device = if vo.source.is_empty() { s.prefs.audio_hardware.default_input.clone() } else { vo.source.clone() };
+    crate::record_monitor::stop_all(&mut s.record);
     let format = s.voiceover.input().start(&device, sr).map_err(|e| EngineError::Other(format!("voice-over input: {e}")))?;
     let channel = vo.input_channel.min(format.channels.saturating_sub(1) as u32);
     s.voiceover.captured.clear();
@@ -430,7 +439,15 @@ fn record_dir(s: &Session, p: &Value) -> String {
     base.join("Voice-over Recordings").to_string_lossy().into_owned()
 }
 
+/// `audio.voiceover.stop`. Once the take is saved or discarded the Record panel's microphone
+/// level monitors come back.
 fn stop(s: &mut Session, p: &Value) -> Result<Value> {
+    let r = end(s, p);
+    crate::record_monitor::apply(s);
+    r
+}
+
+fn end(s: &mut Session, p: &Value) -> Result<Value> {
     let rec = s.voiceover.rec.clone().ok_or_else(|| bad("audio.voiceover.stop", "no voice-over is recording"))?;
     if bool_p(p, "discard").unwrap_or(false) {
         s.voiceover.input().stop();

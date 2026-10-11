@@ -140,6 +140,9 @@ pub struct RecordUi {
     pub minimized: bool,
     /// The pop-out preview windows as shown (sizes in points). Set every frame.
     pub popouts: Vec<super::record_preview::PopoutInfo>,
+    /// The microphones last asked of `record.monitor` (not saved; None: not asked yet).
+    #[serde(skip)]
+    pub monitor_asked: Option<Vec<String>>,
     /// `record.devices`, refreshed when the panel opens (not saved).
     #[serde(skip)]
     pub devices: Option<Value>,
@@ -223,6 +226,40 @@ pub(crate) fn mic_level(status: &Value) -> Option<f32> {
     mics.filter_map(|m| m["level"].as_f64()).map(|l| if l.is_finite() { l.clamp(0.0, 1.0) as f32 } else { 0.0 }).reduce(f32::max)
 }
 
+/// The microphones whose level shows before a recording: the panel's microphone rows while the
+/// panel is open or a pop-out exists (the engine lets go of them while a recording or a
+/// voice-over uses the microphones and brings them back afterwards). Asked of `record.monitor`
+/// when the list changes; closing the panel with no pop-out stops them, and with them the
+/// system's microphone indicator.
+fn sync_monitors(app: &mut FilmcraftApp, ctx: &egui::Context) {
+    let r = &app.ui.record;
+    let shown = r.open || !r.popouts.is_empty();
+    let known = |name: &str| r.devices.as_ref().and_then(|d| d["microphones"].as_array()).is_some_and(|a| a.iter().any(|m| m == name));
+    let mut want: Vec<String> = Vec::new();
+    if shown {
+        // a row whose microphone is gone (unplugged since the list was made) has no level
+        for m in r.mics.iter().filter(|m| m.device == "default" || known(&m.device)) {
+            if !want.contains(&m.device) {
+                want.push(m.device.clone());
+            }
+        }
+    }
+    if r.monitor_asked.as_ref() != Some(&want) {
+        // asked once per change (a refused list is not asked again every frame), and only when
+        // the engine does not already have it
+        if app.session.record.monitor_wanted != want
+            && let Err(e) = app.session.execute("record.monitor", json!({"mics": want}))
+        {
+            app.ui.status = e.to_string();
+        }
+        app.ui.record.monitor_asked = Some(want.clone());
+    }
+    if !want.is_empty() {
+        // the meter is read about ten times a second
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
 /// What the pop-out windows' control bars show now (`record_preview::Popout::status`): the state
 /// and time, the Record / Stop / Cancel button and the microphone level.
 pub(crate) fn popout_status(app: &FilmcraftApp) -> super::record_preview::PopoutStatus {
@@ -233,7 +270,8 @@ pub(crate) fn popout_status(app: &FilmcraftApp) -> super::record_preview::Popout
         paused: false,
         elapsed: 0.0,
         label: String::new(),
-        level: None,
+        // before a recording: the level of the microphones the panel monitors
+        level: filmcraft_engine::record_monitor::level(&app.session),
         record: ("● Record", PopoutAction::Record, true),
         pause: None,
         accent: app.tokens.accent,
@@ -565,6 +603,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     tick(app);
     // live camera previews (and their pop-out windows, which stay while recording)
     super::record_preview::sync(app, ctx);
+    // the microphone level before a recording
+    sync_monitors(app, ctx);
     // the border around what is (or will be) recorded
     super::record_overlay::show(app, ctx);
     let pending = std::mem::take(&mut app.ui.record.overlay_cache.lock().pending_start);
@@ -864,7 +904,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             };
             let l = ui.label(RichText::new(if counters.is_empty() { " ".to_string() } else { counters.clone() }).small().color(dim));
             elems.push(("record.panel.counters".into(), l.rect, counters));
-            let level = st.as_ref().and_then(mic_level).unwrap_or(0.0);
+            // the recording's microphones, or before a recording the monitored ones
+            let level = match &st {
+                Some(st) => mic_level(st),
+                None => filmcraft_engine::record_monitor::level(session),
+            }
+            .unwrap_or(0.0);
             let (rect, _) = ui.allocate_exact_size(vec2(260.0, 6.0), Sense::hover());
             level_meter(ui.painter(), rect, level, accent);
             elems.push(("record.panel.level".into(), rect, format!("{level:.2}")));
