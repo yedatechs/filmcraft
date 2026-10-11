@@ -1,7 +1,11 @@
 //! Headless UI tests of the Record panel (Window ▸ Record) with the engine's synthetic screen,
 //! camera and microphone: Record, live counters and the status-bar line, Stop → a synced
 //! sequence; Cancel → nothing left behind; several camera rows; the Settings section; the
-//! countdown.
+//! countdown; the pop-out preview window and its control bar.
+//!
+//! Set `FILMCRAFT_UI_SNAPSHOT_DIR=<dir>` to render the window offscreen with wgpu and write
+//! `<dir>/record-<name>.png` at the points the pop-out tests call `snapshot` (to look at the
+//! pop-out, which headless sessions draw inside the main window).
 
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
@@ -20,6 +24,8 @@ struct Driver {
     tx: Sender<ControlRequest>,
     /// The synthetic sources (tests turn its cameras).
     factory: SyntheticFactory,
+    /// Where `snapshot` writes PNGs (`FILMCRAFT_UI_SNAPSHOT_DIR`; None: it does nothing).
+    snapshots: Option<std::path::PathBuf>,
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -43,10 +49,30 @@ impl Driver {
         session.prefs.recording.countdown_seconds = 0;
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
-        let harness = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000).build_eframe(move |_cc| app);
-        let mut d = Driver { harness, tx, factory };
+        let snapshots = std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
+        let mut b = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000);
+        if snapshots.is_some() {
+            b = b.wgpu();
+        }
+        let harness = b.build_eframe(move |_cc| app);
+        let mut d = Driver { harness, tx, factory, snapshots };
         d.frames(4);
         d
+    }
+
+    /// Write the window as `record-<name>.png` when `FILMCRAFT_UI_SNAPSHOT_DIR` is set.
+    fn snapshot(&mut self, name: &str) {
+        let Some(dir) = self.snapshots.clone() else { return };
+        self.frames(2);
+        match self.harness.render() {
+            Ok(img) => {
+                std::fs::create_dir_all(&dir).unwrap();
+                let path = dir.join(format!("record-{name}.png"));
+                img.save(&path).unwrap();
+                eprintln!("snapshot: {}", path.display());
+            }
+            Err(e) => eprintln!("snapshot {name} skipped: {e}"),
+        }
     }
 
     fn frames(&mut self, n: usize) {
@@ -664,5 +690,312 @@ fn minimize_shrinks_the_panel_to_a_strip_and_the_choice_survives_a_recording() {
     d.frames(2);
     assert!(d.element("record.panel.camera.1.device").is_none());
     assert!(d.element("record.panel.record").is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------------------------------------------- pop-out
+
+/// Open the panel with the synthetic camera (320 × 180, its own size) popped out and `extra`
+/// merged into the panel state; returns once the pop-out shows a picture.
+fn pop_out(d: &mut Driver, rotate: Value, extra: Value) {
+    d.ok("ui.menu.invoke", json!({"id": "window.record"}));
+    let mut state = json!({"cameras": [{"device": "synthetic:camera", "quality": "native", "rotate": rotate, "popout": true}]});
+    for (k, v) in extra.as_object().unwrap() {
+        state[k] = v.clone();
+    }
+    d.ok("ui.set", json!({"record": state}));
+    wait_label(d, "record.preview.1", |l| frame_no(l) > 0);
+}
+
+fn size_of(e: &Value) -> (f64, f64) {
+    (e["rect"][2].as_f64().unwrap(), e["rect"][3].as_f64().unwrap())
+}
+
+fn popouts(d: &mut Driver) -> Value {
+    d.ok("ui.inspect", json!({}))["ui"]["record"]["popouts"].clone()
+}
+
+#[test]
+fn the_popout_is_the_size_of_the_camera_picture_with_a_bar_under_it() {
+    let dir = tmp("popout-size");
+    let mut d = Driver::new(&dir);
+    assert_eq!(popouts(&mut d), json!([]));
+    pop_out(&mut d, json!(0), json!({"screen": "", "mics": [{"device": "default"}]}));
+    // a 16:9 camera: the picture is 320 × 180, the window that plus the 28 pt bar
+    let pic = d.element("record.preview.1").unwrap();
+    assert_eq!(size_of(&pic), (320.0, 180.0), "{pic}");
+    assert_eq!(popouts(&mut d), json!([{"device": "synthetic:camera", "inner": [320.0, 208.0], "picture": [320.0, 180.0]}]));
+    // the bar is under the picture: Record and the meter; no time and no Pause when idle
+    let bottom = pic["rect"][1].as_f64().unwrap() + 180.0;
+    for id in ["record.preview.1.record", "record.preview.1.level"] {
+        let e = d.element(id).unwrap();
+        let (y, h) = (e["rect"][1].as_f64().unwrap(), e["rect"][3].as_f64().unwrap());
+        assert!(y >= bottom && y + h <= bottom + 28.0, "{id} is in the bar: {e} under {pic}");
+    }
+    assert_eq!(d.element("record.preview.1.record").unwrap()["label"], "● Record");
+    assert!(d.element("record.preview.1.time").is_none() && d.element("record.preview.1.pause").is_none());
+    let (rec, level) = (d.element("record.preview.1.record").unwrap(), d.element("record.preview.1.level").unwrap());
+    assert!(level["rect"][0].as_f64().unwrap() >= rec["rect"][0].as_f64().unwrap() + rec["rect"][2].as_f64().unwrap(), "the meter is right of the button");
+    d.snapshot("popout-idle-16x9");
+    // Rotate 90°: the picture stands upright, 180 × 320, and the window follows it
+    d.ok("ui.set", json!({"record": {"cameras": [{"device": "synthetic:camera", "quality": "native", "rotate": 90, "popout": true}]}}));
+    wait_label(&mut d, "record.preview.1", |l| l.starts_with("180×320"));
+    d.frames(2);
+    assert_eq!(size_of(&d.element("record.preview.1").unwrap()), (180.0, 320.0));
+    assert_eq!(popouts(&mut d), json!([{"device": "synthetic:camera", "inner": [180.0, 348.0], "picture": [180.0, 320.0]}]));
+    let level = d.element("record.preview.1.level").unwrap();
+    assert!(level["rect"][2].as_f64().unwrap() >= 10.0, "the meter still has room in the narrow bar: {level}");
+    d.snapshot("popout-idle-9x16");
+    // Auto follows a camera that turns itself (its own software, a gimbal)
+    d.ok("ui.set", json!({"record": {"cameras": [{"device": "synthetic:camera", "quality": "native", "rotate": "auto", "popout": true}]}}));
+    wait_label(&mut d, "record.preview.1", |l| l.starts_with("320×180"));
+    d.frames(2);
+    assert_eq!(size_of(&d.element("record.preview.1").unwrap()), (320.0, 180.0));
+    d.factory.camera_rotation.store(270, std::sync::atomic::Ordering::Release);
+    wait_label(&mut d, "record.preview.1", |l| l.starts_with("180×320"));
+    d.frames(2);
+    assert_eq!(popouts(&mut d)[0]["picture"], json!([180.0, 320.0]));
+    // Pop in: the window and its bar are gone
+    d.click("record.panel.camera.1.popout");
+    d.frames(2);
+    assert!(d.element("record.preview.1").is_none() && d.element("record.preview.1.record").is_none());
+    assert_eq!(popouts(&mut d), json!([]));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn record_and_stop_from_the_popout_build_the_sequence_like_the_panel() {
+    let dir = tmp("popout-record");
+    let mut d = Driver::new(&dir);
+    pop_out(&mut d, json!(0), json!({"screen": "display:synthetic:display", "mics": [{"device": "default"}], "name": "Popout Take"}));
+    d.ok("ui.set", json!({"record": {"cameras": [{"device": "synthetic:camera", "quality": "native", "rotate": 0, "popout": true, "offsetMs": -40}]}}));
+    d.frames(2);
+    let before = d.sequences();
+    d.click("record.preview.1.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.status);
+    d.frames(2);
+    assert_eq!(d.element("record.preview.1.record").unwrap()["label"], "Stop");
+    // the time counts up and the meter moves with the synthetic microphone (a click every 250 ms)
+    let (mut low, mut high) = (false, false);
+    let t0 = Instant::now();
+    while !(low && high) && t0.elapsed() < Duration::from_secs(4) {
+        d.frames(1);
+        let l: f64 = d.element("record.preview.1.level").unwrap()["label"].as_str().unwrap().parse().unwrap();
+        low |= l < 0.1;
+        high |= l > 0.4;
+        std::thread::sleep(Duration::from_millis(7));
+    }
+    assert!(low && high, "the meter moved between silence and the clicks: low {low} high {high}");
+    let time = wait_label(&mut d, "record.preview.1.time", |l| l.starts_with("● 00:0") && l != "● 00:00");
+    assert!(time.starts_with("● 00:0"), "{time}");
+    d.snapshot("popout-recording-16x9");
+    // the panel's own level shows the same microphone
+    assert!(d.element("record.panel.level").is_some());
+    d.click("record.preview.1.record"); // Stop
+    let s = &d.harness.state().session;
+    assert!(!s.record.recording());
+    assert_eq!(d.sequences(), before + 1);
+    let q = s.active_sequence().unwrap();
+    assert_eq!(s.project.item(s.state.active_sequence.unwrap()).unwrap().name, "Popout Take");
+    assert_eq!((q.video_tracks.len(), q.audio_tracks.len()), (2, 1));
+    assert!(q.video_tracks.iter().chain(q.audio_tracks.iter()).all(|t| t.items.len() == 1));
+    assert_eq!(q.markers[0].comment, "camera offset -40 ms", "the row's offset is applied as by the panel's Stop");
+    let last = d.harness.state().ui.record.last.clone();
+    assert!(last.starts_with("Recorded Popout Take: 3 file(s)"), "{last}");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 6, "three files and three sidecars");
+    d.frames(2);
+    // idle again: Record, no time, the pop-out still shows the camera
+    assert_eq!(d.element("record.preview.1.record").unwrap()["label"], "● Record");
+    assert!(d.element("record.preview.1.time").is_none());
+    let n = frame_no(d.element("record.preview.1").unwrap()["label"].as_str().unwrap());
+    wait_label(&mut d, "record.preview.1", |l| frame_no(l) > n + 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_popout_counts_down_like_the_panel_and_its_button_cancels() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tmp("popout-countdown");
+    let mut d = Driver::new(&dir);
+    let clock = Arc::new(AtomicU64::new(10_000));
+    d.harness.state_mut().session.record.test_clock_ms = Some(clock.clone());
+    d.ok("engine.execute", json!({"command": "record.settings", "params": {"set": {"countdownSeconds": 3}}}));
+    pop_out(&mut d, json!(0), json!({"screen": "", "mics": []}));
+    d.click("record.preview.1.record");
+    assert!(d.harness.state().session.record.countdown.is_some(), "the pop-out's Record counts down like the panel's");
+    assert_eq!(d.element("record.preview.1.time").unwrap()["label"], "Recording in 3…");
+    assert_eq!(d.element("record.preview.1.record").unwrap()["label"], "Cancel");
+    clock.store(11_500, Ordering::Release);
+    d.frames(2);
+    assert_eq!(d.element("record.preview.1.time").unwrap()["label"], "Recording in 2…");
+    d.snapshot("popout-countdown");
+    d.click("record.preview.1.record"); // Cancel
+    assert!(d.harness.state().session.record.countdown.is_none());
+    assert_eq!(d.harness.state().ui.record.last, "Countdown cancelled");
+    clock.store(30_000, Ordering::Release);
+    d.frames(2);
+    assert!(!d.harness.state().session.record.recording());
+    assert_eq!(d.element("record.preview.1.record").unwrap()["label"], "● Record");
+    // a start whose sources are still starting: "Starting…" and the same button cancels it
+    d.ok("engine.execute", json!({"command": "record.settings", "params": {"set": {"countdownSeconds": 0}}}));
+    d.harness.state_mut().session.record.factory =
+        Some(Arc::new(SyntheticFactory { display_size: (320, 180), camera_size: (320, 180), screen_delay_ms: 3000, ..Default::default() }));
+    d.ok("ui.set", json!({"record": {"screen": "display:synthetic:display"}}));
+    d.frames(3);
+    d.click("record.preview.1.record");
+    assert!(d.harness.state().session.record.starting.is_some());
+    assert_eq!(d.element("record.preview.1.time").unwrap()["label"], "Starting…");
+    assert_eq!(d.element("record.preview.1.record").unwrap()["label"], "Cancel");
+    d.click("record.preview.1.record");
+    let s = &d.harness.state().session;
+    assert!(s.record.starting.is_none() && !s.record.recording());
+    assert_eq!(d.harness.state().ui.record.last, "Start cancelled");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing is left behind");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_popout_survives_the_panel_being_minimized() {
+    let dir = tmp("popout-minimized");
+    let mut d = Driver::new(&dir);
+    pop_out(&mut d, json!(0), json!({"screen": "", "mics": [{"device": "default"}]}));
+    d.click("record.panel.minimize");
+    d.frames(3);
+    assert!(d.harness.state().ui.record.minimized);
+    assert!(d.element("record.panel.camera.1.popout").is_none(), "the row is hidden in the strip");
+    assert!(d.harness.state().ui.record.cameras[0].popout);
+    // the pop-out keeps showing the camera, with its bar
+    let n = frame_no(d.element("record.preview.1").unwrap()["label"].as_str().unwrap());
+    wait_label(&mut d, "record.preview.1", |l| frame_no(l) > n + 3);
+    assert_eq!(size_of(&d.element("record.preview.1").unwrap()), (320.0, 180.0));
+    // record and stop from the pop-out with the panel minimized
+    let before = d.sequences();
+    d.click("record.preview.1.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
+    d.run_for(0.5);
+    assert!(d.harness.state().ui.record.minimized, "the panel never restores itself");
+    assert!(d.element("record.panel.record").unwrap()["label"].as_str().unwrap().contains("Stop"), "the strip shows the same recording");
+    d.click("record.preview.1.record");
+    assert!(!d.harness.state().session.record.recording());
+    assert_eq!(d.sequences(), before + 1);
+    d.frames(2);
+    assert!(d.harness.state().ui.record.minimized);
+    assert!(d.element("record.preview.1").is_some(), "the pop-out is still there after Stop");
+    // restoring the panel keeps it too; closing the panel (nothing recording) closes it
+    d.click("record.panel.restore");
+    d.frames(2);
+    assert!(d.element("record.preview.1").is_some());
+    d.click("record.panel.close");
+    d.frames(3);
+    assert!(d.element("record.preview.1").is_none());
+    assert_eq!(popouts(&mut d), json!([]));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------------------------------------------- pause / resume
+
+fn paused(d: &Driver) -> bool {
+    d.harness.state().session.record.active.as_ref().is_some_and(|a| a.paused())
+}
+
+fn label_of(d: &mut Driver, id: &str) -> String {
+    d.element(id).unwrap_or_else(|| panic!("{id} is not on screen"))["label"].as_str().unwrap_or("").to_string()
+}
+
+#[test]
+fn pause_and_resume_from_the_panel_the_strip_and_the_popout() {
+    let dir = tmp("pause-ui");
+    let mut d = Driver::new(&dir);
+    pop_out(&mut d, json!(0), json!({"screen": "display:synthetic:display", "mics": [{"device": "default"}]}));
+    // nothing records: the panel's Pause is there (disabled), the pop-out has none
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Pause");
+    assert!(d.element("record.preview.1.pause").is_none());
+    d.click("record.panel.pause");
+    assert!(!d.harness.state().session.record.recording() && d.harness.state().ui.record.error.is_empty());
+    d.click("record.panel.record");
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.status);
+    d.run_for(0.4);
+    assert_eq!(label_of(&mut d, "record.preview.1.pause"), "Pause");
+    // the panel's Pause: every place says Paused, in amber, and the time stands still
+    d.click("record.panel.pause");
+    assert!(paused(&d), "{}", d.harness.state().ui.record.error);
+    d.frames(2);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Resume");
+    assert_eq!(label_of(&mut d, "record.preview.1.pause"), "Resume");
+    assert_eq!(label_of(&mut d, "record.preview.1.record"), "Stop");
+    let stop = label_of(&mut d, "record.panel.record");
+    assert!(stop.starts_with("■  Stop  Paused 00:0"), "{stop}");
+    let time = label_of(&mut d, "record.preview.1.time");
+    assert!(time.starts_with("Paused 00:0"), "{time}");
+    let live = d.harness.state().ui.record.live.clone();
+    assert!(live.starts_with("Paused · 00:0") && live.contains("screen ") && live.contains("camera "), "{live}");
+    assert_eq!(overlay(&mut d)["state"], "paused");
+    assert!(label_of(&mut d, "record.overlay").starts_with("paused display:synthetic:display"));
+    d.snapshot("paused");
+    let frames = |d: &mut Driver| {
+        let st = d.ok("engine.execute", json!({"command": "record.status", "params": {}}));
+        st["sources"].as_array().unwrap().iter().map(|s| s["frames"].as_u64().unwrap()).collect::<Vec<_>>()
+    };
+    // what was captured just before the pause is still on its way into the files for a moment
+    d.run_for(0.3);
+    let before = frames(&mut d);
+    let n = frame_no(&label_of(&mut d, "record.preview.1"));
+    d.run_for(1.2);
+    assert_eq!(label_of(&mut d, "record.preview.1.time"), time, "the time stands still while paused");
+    assert_eq!(frames(&mut d), before, "nothing is written while paused");
+    assert!(frame_no(&label_of(&mut d, "record.preview.1")) > n + 10, "the preview keeps running while paused");
+    // the pop-out's Resume: recording again everywhere
+    d.click("record.preview.1.pause");
+    assert!(!paused(&d), "{}", d.harness.state().ui.record.error);
+    d.frames(2);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Pause");
+    assert_eq!(label_of(&mut d, "record.preview.1.pause"), "Pause");
+    assert!(label_of(&mut d, "record.preview.1.time").starts_with("● 00:0"));
+    assert!(label_of(&mut d, "record.panel.record").starts_with("■  Stop  00:0"));
+    assert!(d.harness.state().ui.record.live.starts_with("Recording · 00:0"));
+    assert_eq!(overlay(&mut d)["state"], "recording");
+    d.run_for(0.3);
+    assert!(frames(&mut d).iter().zip(&before).all(|(now, then)| now > then), "the files grow again");
+    // the pop-out's Pause, then the minimized strip shows it and resumes
+    d.click("record.preview.1.pause");
+    assert!(paused(&d));
+    d.click("record.panel.minimize");
+    d.frames(3);
+    assert!(d.harness.state().ui.record.minimized);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Resume");
+    assert!(label_of(&mut d, "record.panel.record").starts_with("■  Stop  Paused 00:0"));
+    d.snapshot("paused-strip");
+    d.click("record.panel.pause");
+    assert!(!paused(&d));
+    d.frames(2);
+    assert_eq!(label_of(&mut d, "record.panel.pause"), "Pause");
+    d.run_for(0.3);
+    // the strip's Pause, then Stop while paused: the sequence is built from what was recorded
+    d.click("record.panel.pause");
+    assert!(paused(&d));
+    let before = d.sequences();
+    d.click("record.panel.record");
+    assert!(!d.harness.state().session.record.recording());
+    assert_eq!(d.sequences(), before + 1);
+    let last = d.harness.state().ui.record.last.clone();
+    assert!(last.starts_with("Recorded ") && last.contains("3 file(s)"), "{last}");
+    d.frames(2);
+    assert!(d.element("record.panel.pause").is_none(), "the strip has no Pause when nothing records");
+    assert!(d.element("record.preview.1.pause").is_none() && d.element("record.preview.1.time").is_none());
+    assert!(d.harness.state().ui.record.live.is_empty());
+    assert!(overlay(&mut d).is_null(), "the border goes when the recording stops");
+    // the three pauses are in every sidecar
+    let sides: Vec<Value> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".recording.json"))
+        .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+        .collect();
+    assert_eq!(sides.len(), 3);
+    for sd in &sides {
+        assert_eq!(sd["pauses"].as_array().unwrap().len(), 3, "{sd}");
+        assert!(sd["paused_ns"].as_u64().unwrap() > 1_000_000_000, "{sd}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
