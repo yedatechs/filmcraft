@@ -52,6 +52,7 @@ pub fn commands() -> Vec<CommandSpec> {
             set,
             true,
         ),
+        spec("layout.applyToSource", "Apply Layout to Source", r#"{"clips":[id]?}"#, can_apply_to_source, apply_to_source, true),
         spec("layout.inspect", "Inspect Layout", r#"{"clips":[id]?,"time":ticks?}"#, has_layout_clips, inspect, false),
         spec("layout.pick", "Pick Clip at Point", r#"{"x":px,"y":px,"time":ticks?}"#, has_seq, pick, false),
     ]
@@ -578,6 +579,169 @@ fn zoom(s: &mut Session, p: &Value) -> Result<Value> {
     })?;
     let r = |v: f64| (v * 1000.0).round() / 1000.0;
     Ok(json!({"clips": clips.iter().map(|c| c.0).collect::<Vec<_>>(), "zoom": plan.iter().map(|x| r(x.5.zoom)).collect::<Vec<_>>()}))
+}
+
+// ------------------------------------------------------------------ one layout per source
+
+/// The Motion parameters a layout owns: what `layout.place`, `layout.set`, `layout.pan` and
+/// `layout.zoom` write, and what `layout.inspect` reads through [`pose_of`].
+const MOTION_PARAMS: [&str; 6] = ["position", "scale", "scale_width", "uniform_scale", "rotation", "anchor"];
+
+/// A clip's layout as the clip stores it: the Motion parameters of [`MOTION_PARAMS`] with their
+/// keyframes (`None`: an older instance without that parameter, which reads the default), whether
+/// Motion is on, the [`LAYOUT_MASK`] of the Opacity effect (shape, pan and zoom live in its path)
+/// and Scale to Frame, which the visible box depends on.
+#[derive(Clone)]
+struct Stored {
+    motion_enabled: bool,
+    motion: Vec<Option<Param>>,
+    mask: Option<Mask>,
+    scale_to_frame: bool,
+}
+
+impl Stored {
+    fn of(it: &TrackItem, cmd: &str) -> Result<Stored> {
+        let m = it.effect("motion").ok_or_else(|| bad(cmd, format!("clip {} has no Motion effect", it.id.0)))?;
+        Ok(Stored {
+            motion_enabled: m.enabled,
+            motion: MOTION_PARAMS.iter().map(|id| m.param(id).cloned()).collect(),
+            mask: it.effect("opacity").and_then(|o| o.masks.iter().find(|m| m.name == LAYOUT_MASK).cloned()),
+            scale_to_frame: it.scale_to_frame,
+        })
+    }
+
+    /// Whether two stored layouts are the same. Compared as saved, so an unset position or anchor
+    /// (NaN: the frame or source centre) equals another unset one.
+    fn same(&self, other: &Stored) -> bool {
+        let saved = |l: &Stored| (serde_json::to_value(&l.motion).ok(), serde_json::to_value(&l.mask).ok());
+        self.motion_enabled == other.motion_enabled && self.scale_to_frame == other.scale_to_frame && saved(self) == saved(other)
+    }
+
+    /// Give `it` this layout. Its other effects, its other masks, its opacity value, speed and
+    /// audio are not touched.
+    fn write(&self, it: &mut TrackItem, cmd: &str) -> Result<()> {
+        let id = it.id;
+        let m = it.effect_mut("motion").ok_or_else(|| bad(cmd, format!("clip {} has no Motion effect", id.0)))?;
+        m.enabled = self.motion_enabled;
+        for (pid, param) in MOTION_PARAMS.iter().zip(&self.motion) {
+            match param {
+                Some(v) => {
+                    m.params.insert((*pid).to_string(), v.clone());
+                }
+                None => {
+                    m.params.remove(*pid);
+                }
+            }
+        }
+        it.scale_to_frame = self.scale_to_frame;
+        match (&self.mask, it.effect_mut("opacity")) {
+            (Some(mask), Some(o)) => {
+                let at = o.masks.iter().position(|x| x.name == LAYOUT_MASK).unwrap_or(o.masks.len());
+                o.masks.retain(|x| x.name != LAYOUT_MASK);
+                o.masks.insert(at.min(o.masks.len()), mask.clone());
+                o.enabled = true;
+            }
+            (Some(_), None) => return Err(bad(cmd, format!("clip {} has no Opacity effect", id.0))),
+            (None, Some(o)) => o.masks.retain(|x| x.name != LAYOUT_MASK),
+            (None, None) => {}
+        }
+        Ok(())
+    }
+}
+
+/// The other clips that play `clip`'s media item on `clip`'s track of the active sequence, in
+/// track order: the clips `layout.applyToSource` copies `clip`'s layout to. `Err` says why there
+/// are none: the clip is not a video clip of a media file, or it is the only one of its source on
+/// the track.
+pub fn source_siblings(s: &Session, clip: ClipId) -> std::result::Result<Vec<ClipId>, String> {
+    let q = s.active_sequence().ok_or("no sequence is open")?;
+    let (tid, it) = q.find_item(clip).ok_or_else(|| format!("no clip {} in the active sequence", clip.0))?;
+    let tr = q.track(tid).filter(|t| t.kind == TrackKind::Video).ok_or_else(|| format!("clip {} is not a video clip", clip.0))?;
+    if !s.project.item(it.item).is_some_and(|i| matches!(i.kind, ItemKind::Media(_) | ItemKind::Subclip { .. })) {
+        return Err(format!("clip {} is not a clip of a media file: only those share a layout", clip.0));
+    }
+    let siblings: Vec<ClipId> = tr.items.iter().filter(|x| x.id != clip && x.item == it.item).map(|x| x.id).collect();
+    if siblings.is_empty() {
+        return Err("no other clip of this source on the track".into());
+    }
+    Ok(siblings)
+}
+
+/// How `clip`'s layout compares with those of its [`source_siblings`]: (how many siblings there
+/// are, how many of them have a different layout). `None` when the clip has no sibling, or when a
+/// scene arranges them (`layout.applyToSource` leaves those alone). The UI's "Layout set on this
+/// clip only" hint reads it.
+pub fn sibling_layouts(s: &Session, clip: ClipId) -> Option<(usize, usize)> {
+    const CMD: &str = "layout.applyToSource";
+    let siblings = source_siblings(s, clip).ok()?;
+    let q = s.active_sequence()?;
+    if !q.scenes.is_empty() && crate::scenes::scene_owning(s, clip).is_some() {
+        return None;
+    }
+    let mine = Stored::of(q.find_item(clip)?.1, CMD).ok()?;
+    let differ = siblings.iter().filter(|c| q.find_item(**c).and_then(|(_, it)| Stored::of(it, CMD).ok()).is_none_or(|l| !l.same(&mine))).count();
+    Some((siblings.len(), differ))
+}
+
+/// Each given clip with its siblings. Two given clips of one source on one track are refused:
+/// each would overwrite the other.
+fn apply_plan(s: &Session, clips: &[ClipId]) -> std::result::Result<Vec<(ClipId, Vec<ClipId>)>, String> {
+    let mut plan: Vec<(ClipId, Vec<ClipId>)> = Vec::new();
+    for c in clips {
+        if let Some((other, _)) = plan.iter().find(|(_, siblings)| siblings.contains(c)) {
+            return Err(format!("clips {} and {} are the same source on one track: name the one whose layout the others get", other.0, c.0));
+        }
+        plan.push((*c, source_siblings(s, *c)?));
+    }
+    Ok(plan)
+}
+
+/// Enabled: a video clip is selected (no graphic) and it has a sibling to copy its layout to.
+fn can_apply_to_source(s: &Session) -> std::result::Result<(), String> {
+    has_layout_clips(s)?;
+    let q = s.active_sequence().ok_or("no sequence is open")?;
+    let video: Vec<ClipId> = s.state.selection.iter().copied().filter(|c| is_video(q, *c)).collect();
+    apply_plan(s, &video).map(|_| ())
+}
+
+/// `layout.applyToSource`: copy the layout of each given clip (default: the selected video clip)
+/// to every other clip of the same media item on the same track of the active sequence, so a
+/// camera that a text edit cut into pieces sits in the same circle in the same corner throughout.
+/// The layout is what the `layout.*` commands write: the Motion parameters position, scale, scale
+/// width, uniform scale, rotation and anchor with their keyframes as they are (keyframes are in
+/// media time, so an animation runs on across the pieces), whether Motion is on, the `Layout
+/// shape` mask (shape, pan and zoom) and Scale to Frame. Other effects and masks, the opacity
+/// value, speed and audio are not touched. Clips arranged by a scene are skipped. One undo step.
+fn apply_to_source(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "layout.applyToSource";
+    let clips = target_clips(s, p, CMD)?;
+    let plan = apply_plan(s, &clips).map_err(|why| bad(CMD, why))?;
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let scenes = !q.scenes.is_empty();
+    let mut writes: Vec<(ClipId, Stored)> = Vec::new();
+    let mut skipped = 0usize;
+    for (source, siblings) in &plan {
+        let (_, it) = q.find_item(*source).ok_or_else(|| bad(CMD, format!("no clip {} in the active sequence", source.0)))?;
+        let layout = Stored::of(it, CMD)?;
+        for c in siblings {
+            // a scene would overwrite the copy the next time it re-applies
+            if scenes && crate::scenes::scene_owning(s, *c).is_some() {
+                skipped += 1;
+            } else {
+                writes.push((*c, layout.clone()));
+            }
+        }
+    }
+    if !writes.is_empty() {
+        s.edit_sequence("Apply Layout to Source", |q, _, _| {
+            for (c, layout) in &writes {
+                let (_, it) = q.find_item_mut(*c).ok_or_else(|| bad(CMD, "the clip is gone"))?;
+                layout.write(it, CMD)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(json!({"applied": writes.len(), "clips": writes.iter().map(|w| w.0.0).collect::<Vec<_>>(), "skipped": skipped}))
 }
 
 fn inspect(s: &mut Session, p: &Value) -> Result<Value> {

@@ -5,6 +5,14 @@
 //! cues, and bundle similar passes into `TakeGroup`s (media time). The engine (`takes.*`
 //! commands) assigns group ids, stores the groups on the transcript and switches takes on the
 //! timeline. See `openspec/changes/take-editing/design.md` §4.
+//!
+//! A take is the line itself. An earlier take leaves out the words before the part it shares with
+//! the take that follows it when the retake does not say them ([`take_start`]): in "… the photos
+//! I took in um Lisbon nobody can read the signs … uh sorry well nobody can read the signs …" the
+//! first take starts at "nobody", so crossing it out keeps "um Lisbon", which was said once and
+//! belongs to the sentence before. What sits between two takes and is only retake cues ("uh
+//! sorry") is not part of either take; [`cross_range`] gives the media to remove with the earlier
+//! one.
 
 use std::collections::BTreeSet;
 use std::ops::Range;
@@ -225,6 +233,100 @@ struct Utt {
     cue: bool,
     /// This part is a false start of the next part (a restart without a pause, [`restarts`]).
     link: bool,
+    /// The part as it was said: every word (normalised; cue words and stutters included, at most
+    /// [`MAX_COMPARE_WORDS`]) with its start. [`take_start`] aligns it with the take that follows.
+    spoken: Vec<(String, Tick)>,
+}
+
+/// Which of `words` are retake cues or fillers: the words of [`CUES`], and "one more".
+fn cue_flags(words: &[&str]) -> Vec<bool> {
+    let mut flags = vec![false; words.len()];
+    for (i, w) in words.iter().enumerate() {
+        let pair = *w == "one" && words.get(i.saturating_add(1)) == Some(&"more");
+        if (CUES.contains(w) || pair)
+            && let Some(f) = flags.get_mut(i)
+        {
+            *f = true;
+        }
+        if pair && let Some(f) = flags.get_mut(i.saturating_add(1)) {
+            *f = true;
+        }
+    }
+    flags
+}
+
+/// Where an earlier take starts, as an index into its words `a`, given the words `b` of the take
+/// that follows it (both as said, cue words included; compared on their first
+/// [`MAX_COMPARE_WORDS`] words).
+///
+/// The two takes share their longest common subsequence; the shared part of `a` starts as late
+/// as it can without losing a shared word, and the words before it are `a`'s lead-in. A lead-in
+/// the retake does not say is not part of the take: "um Lisbon | nobody can read the signs"
+/// followed by "well nobody can read the signs" starts at "nobody" (index 2). Walking back from
+/// the shared part, two things move the start to a lead-in word, because the retake says it again:
+///
+/// - it is the first word of the shared part, the line begun once already (a stumble: "the uh |
+///   the main reason", "I think uh | I don't think you see"); the words between it and the shared
+///   part are then cues or among the shared part's first [`OPENING_WORDS`] words;
+/// - `b` says it more often than the shared part of `a` does (a reordered line: "today | we look
+///   at the rivers" before "the rivers we look at today").
+///
+/// The walk ends at the first word that is none of these: not a cue or filler, not one of the
+/// opening words. A lead-in of cue words alone is left out ("okay again | today we talk"). 0 (the
+/// take keeps its range) when nothing is shared or there is no lead-in.
+fn take_start(a: &[&str], b: &[&str]) -> usize {
+    let a = a.get(..a.len().min(MAX_COMPARE_WORDS)).unwrap_or(&[]);
+    let b = b.get(..b.len().min(MAX_COMPARE_WORDS)).unwrap_or(&[]);
+    let (n, m) = (a.len(), b.len());
+    // lcs[i * width + j]: the longest common subsequence of a[i..] and b[j..]
+    let width = m.saturating_add(1);
+    let mut lcs = vec![0usize; n.saturating_add(1).saturating_mul(width)];
+    let at = |lcs: &[usize], i: usize, j: usize| lcs.get(i.saturating_mul(width).saturating_add(j)).copied().unwrap_or(0);
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let v = if a.get(i) == b.get(j) { at(&lcs, i + 1, j + 1).saturating_add(1) } else { at(&lcs, i + 1, j).max(at(&lcs, i, j + 1)) };
+            if let Some(c) = lcs.get_mut(i.saturating_mul(width).saturating_add(j)) {
+                *c = v;
+            }
+        }
+    }
+    let total = at(&lcs, 0, 0);
+    if total == 0 {
+        return 0;
+    }
+    let shared = (0..n).rev().find(|&i| at(&lcs, i, 0) == total).unwrap_or(0);
+    let lead = a.get(..shared).unwrap_or(&[]);
+    let rest = a.get(shared..).unwrap_or(&[]);
+    let opening = rest.get(..rest.len().min(OPENING_WORDS)).unwrap_or(&[]);
+    let cues = cue_flags(lead);
+    let count = |ws: &[&str], w: &str| ws.iter().filter(|x| **x == w).count();
+    let mut start = shared;
+    for (k, w) in lead.iter().enumerate().rev() {
+        let begun_again = rest.first() == Some(w);
+        let said_elsewhere = count(b, w) > count(rest, w);
+        if begun_again || said_elsewhere {
+            start = k;
+        } else if !(cues.get(k).copied().unwrap_or(false) || opening.contains(w)) {
+            break;
+        }
+    }
+    start
+}
+
+/// The range of take `u` when `next` is the take that follows it in the group: from the word
+/// [`take_start`] finds to the take's end.
+fn trimmed_range(u: &Utt, next: &Utt) -> TimeRange {
+    let a: Vec<&str> = u.spoken.iter().map(|w| w.0.as_str()).collect();
+    let b: Vec<&str> = next.spoken.iter().map(|w| w.0.as_str()).collect();
+    let end = u.range.end();
+    match take_start(&a, &b) {
+        0 => u.range,
+        k => match u.spoken.get(k) {
+            // hostile word times: never before the part's start or after its end
+            Some(w) => TimeRange::from_bounds(w.1.max(u.range.start).min(end), end),
+            None => u.range,
+        },
+    }
 }
 
 /// `words` with each run of one repeated word kept once ("so so now" reads "so now"), and for each
@@ -319,7 +421,8 @@ fn restarts(words: &[String], min_words: usize) -> Vec<(usize, usize)> {
 /// leading retake cues stripped and stutters collapsed, split where the utterance restarts a phrase
 /// ([`restarts`]): before the first occurrence and before the repeat. Each part spans from its first
 /// word's start to its last word's end; the first part keeps the cue words and the cue flag; a part
-/// that is a false start of the next one is `link`ed to it.
+/// that is a false start of the next one is `link`ed to it. Each part also keeps its words as said
+/// (`spoken`).
 fn utterance_parts(words: &[Word], r: Range<usize>, min_words: usize) -> Vec<Utt> {
     let mut norm: Vec<String> = Vec::new();
     let mut index: Vec<usize> = Vec::new();
@@ -353,7 +456,9 @@ fn utterance_parts(words: &[Word], r: Range<usize>, min_words: usize) -> Vec<Utt
             let ws = words.get(wa..wb)?;
             let (first, last) = (ws.first()?, ws.last()?);
             let part: Vec<String> = content.get(ca..cb)?.iter().take(MAX_COMPARE_WORDS).cloned().collect();
-            Some(Utt { range: TimeRange::from_bounds(first.start, last.end.max(first.start)), words: part, cue: cue && k == 0, link })
+            let spoken: Vec<(String, Tick)> =
+                ws.iter().map(|w| (normalize_word(&w.text), w.start)).filter(|w| !w.0.is_empty()).take(MAX_COMPARE_WORDS).collect();
+            Some(Utt { range: TimeRange::from_bounds(first.start, last.end.max(first.start)), words: part, cue: cue && k == 0, link, spoken })
         })
         .collect()
 }
@@ -366,7 +471,9 @@ fn utterance_parts(words: &[Word], r: Range<usize>, min_words: usize) -> Vec<Utt
 /// unit's first and last parts. The first one similar enough (`similarity >= threshold`, the
 /// threshold lowered by 0.15 when the later unit opens with a retake cue such as "okay", "again" or
 /// "one more") joins its group and the chain continues from it. Groups have at least two takes; ids
-/// are 0 (the engine assigns them) and `manual` is false. Deterministic, and
+/// are 0 (the engine assigns them) and `manual` is false. Every take but the last of its group
+/// starts where [`take_start`] says, so a lead-in the retake does not say again ("um Lisbon"
+/// before the line) is not part of the take; the last take keeps its range. Deterministic, and
 /// `O(utterances × window)`.
 pub fn detect(t: &Transcript, p: &DetectParams) -> Vec<TakeGroup> {
     let min_words = p.min_words.max(1);
@@ -422,7 +529,9 @@ pub fn detect(t: &Transcript, p: &DetectParams) -> Vec<TakeGroup> {
                     *u = true;
                 }
             }
-            let mut takes: Vec<Take> = parts.iter().map(|u| Take::new(u.range)).collect();
+            // an earlier take leaves out a lead-in the take after it does not say again
+            let mut takes: Vec<Take> =
+                parts.iter().enumerate().map(|(k, u)| Take::new(parts.get(k + 1).map_or(u.range, |next| trimmed_range(u, next)))).collect();
             takes.sort_by_key(|t| (t.range.start, t.range.duration));
             groups.push(TakeGroup { id: 0, takes, ..Default::default() });
         }
@@ -489,6 +598,28 @@ pub fn split(groups: &mut Vec<TakeGroup>, id: u64, at_take: usize, new_id: u64) 
     let new = TakeGroup { id: new_id, takes: tail, manual: true, ..Default::default() };
     groups.insert(pos.saturating_add(1).min(groups.len()), new);
     true
+}
+
+/// The media to remove when take `take` of `g` is crossed out on its own: the take, and with it
+/// what the speaker said between it and the next take of the group when that is nothing but
+/// retake cues and fillers (words of [`CUES`] and "one more": "uh sorry", "okay again"). The range
+/// then reaches to the next take's start, so the cut does not keep "uh sorry" in front of the
+/// retake. Anything else between the two takes (or nothing at all) leaves the take's own range.
+/// `None` when the group has no such take.
+pub fn cross_range(t: &Transcript, g: &TakeGroup, take: usize) -> Option<TimeRange> {
+    let cur = g.takes.get(take)?;
+    let Some(next) = g.takes.get(take.saturating_add(1)) else { return Some(cur.range) };
+    let end = cur.range.end();
+    if next.range.start <= end {
+        return Some(cur.range);
+    }
+    let gap = TimeRange::from_bounds(end, next.range.start);
+    let between: Vec<String> = t.words.get(t.words_within(gap)).unwrap_or(&[]).iter().map(|w| normalize_word(&w.text)).filter(|w| !w.is_empty()).collect();
+    let said: Vec<&str> = between.iter().map(String::as_str).collect();
+    if said.is_empty() || cue_flags(&said).contains(&false) {
+        return Some(cur.range);
+    }
+    Some(TimeRange::from_bounds(cur.range.start, next.range.start))
 }
 
 /// The fraction (0..=1) of `take`'s duration covered by the union of `live` (the media ranges the

@@ -642,3 +642,255 @@ fn zoom_grows_the_picture_not_the_box() {
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(zoom_of(&inspect(&mut s, v2)), 1.0);
 }
+
+// ---------------------------------------------------------------- one layout per source
+
+/// The demo with its V2 overlay (6 s to 10 s) cut at 7, 8 and 9 s, like a camera a text edit cut
+/// into pieces, and a clip of another media item behind them on V2 (11 s to 12 s). Returns the
+/// session (playhead at 7 s), the four pieces in track order and the other clip.
+fn four_pieces() -> (Session, [ClipId; 4], ClipId) {
+    let (mut s, _, v2) = session();
+    for t in [7.0, 8.0, 9.0] {
+        s.execute("timeline.razor", json!({"seconds": t, "track": "V2"})).unwrap();
+    }
+    let seq = s.state.active_sequence.unwrap();
+    let source = s.active_sequence().unwrap().find_item(v2).unwrap().1.item;
+    let other_item = *s.project.items.iter().find(|(id, i)| **id != source && i.name == "Bars and Tone").unwrap().0;
+    let sec = |x: f64| Tick((x * filmcraft_time::TICKS_PER_SECOND as f64).round() as i64);
+    let other = s
+        .edit("test: another source on V2", |p, _| {
+            let rate = p.sequence(seq).unwrap().settings.frame_rate;
+            let it = p
+                .make_track_item(other_item, filmcraft_project::TrackKind::Video, sec(11.0), filmcraft_time::TimeRange::new(Tick::ZERO, sec(1.0)), rate)
+                .unwrap();
+            let id = it.id;
+            p.sequence_mut(seq).unwrap().video_tracks[1].items.push(it);
+            Ok(id)
+        })
+        .unwrap();
+    let q = s.active_sequence().unwrap();
+    let pieces: Vec<ClipId> = q.video_tracks[1].items.iter().filter(|i| i.item == source).map(|i| i.id).collect();
+    assert_eq!(pieces.len(), 4, "the overlay is four clips of one media item now");
+    assert_eq!(q.video_tracks[1].items.len(), 5);
+    (s, [pieces[0], pieces[1], pieces[2], pieces[3]], other)
+}
+
+/// What `layout.inspect` says about where a clip is and what it shows (not which clip or track).
+fn look(s: &mut Session, c: ClipId) -> Value {
+    let mut v = inspect(s, c);
+    let o = v.as_object_mut().unwrap();
+    o.remove("clip");
+    o.remove("track");
+    v
+}
+
+/// A clip as it is saved.
+fn saved(s: &Session, c: ClipId) -> Value {
+    serde_json::to_value(s.active_sequence().unwrap().find_item(c).unwrap().1).unwrap()
+}
+
+/// The Motion parameters of a clip as they are saved (keyframes included).
+fn motion_saved(s: &Session, c: ClipId) -> Value {
+    let (_, it) = s.active_sequence().unwrap().find_item(c).unwrap();
+    serde_json::to_value(&it.effect("motion").unwrap().params).unwrap()
+}
+
+#[test]
+fn apply_to_source_gives_every_clip_of_the_source_on_the_track_the_layout() {
+    let (mut s, [a, b, c, d], other) = four_pieces();
+    // the second piece (under the playhead) becomes a face in a circle, bottom right, panned and
+    // zoomed, turned a little
+    s.execute("layout.shape", json!({"clips": [b.0], "shape": "circle"})).unwrap();
+    s.execute("layout.place", json!({"clips": [b.0], "at": "bottomRight", "size": 20, "margin": 4})).unwrap();
+    s.execute("layout.zoom", json!({"clips": [b.0], "zoom": 1.5})).unwrap();
+    s.execute("layout.pan", json!({"clips": [b.0], "dx": -200, "dy": 40})).unwrap();
+    s.execute("effects.setParam", json!({"clip": b.0, "effect": "motion", "param": "rotation", "value": 10.0})).unwrap();
+    // a sibling with things of its own that are not layout: an effect, an opacity value, a mask
+    s.execute("effects.apply", json!({"clips": [c.0], "effect": "Gaussian Blur"})).unwrap();
+    s.execute("effects.setParam", json!({"clip": c.0, "effect": "opacity", "param": "opacity", "value": 50.0})).unwrap();
+    s.execute("masks.add", json!({"clip": c.0, "shape": "ellipse"})).unwrap();
+    let want = look(&mut s, b);
+    assert_eq!(
+        (want["at"].clone(), want["shape"].clone(), want["pan"].clone(), want["zoom"].clone()),
+        (json!("bottomRight"), json!("circle"), json!([-200.0, 40.0]), json!(1.5))
+    );
+    for x in [a, c, d] {
+        assert_ne!(look(&mut s, x), want, "the siblings do not have the layout yet");
+    }
+    assert_eq!(crate::layout::sibling_layouts(&s, b), Some((3, 3)));
+    assert_eq!(crate::layout::source_siblings(&s, b).unwrap(), vec![a, c, d]);
+    let before = s.project.clone();
+    let untouched = |s: &Session| {
+        let q = s.active_sequence().unwrap();
+        (serde_json::to_value(&q.video_tracks[0]).unwrap(), serde_json::to_value(&q.audio_tracks).unwrap(), saved(s, other), saved(s, b))
+    };
+    let kept = untouched(&s);
+    let opacity_value =
+        |s: &Session| serde_json::to_value(s.active_sequence().unwrap().find_item(c).unwrap().1.effect("opacity").unwrap().param("opacity")).unwrap();
+    let opacity_before = opacity_value(&s);
+    assert!(opacity_before.to_string().contains("50.0"), "{opacity_before}");
+    let steps = s.history.undo.len();
+
+    let r = s.execute("layout.applyToSource", json!({"clips": [b.0]})).unwrap();
+    assert_eq!(r, json!({"applied": 3, "clips": [a.0, c.0, d.0], "skipped": 0}));
+    assert_eq!(s.history.undo.len(), steps + 1, "one undo step");
+    assert_eq!(s.history.undo.last().unwrap().0, "Apply Layout to Source");
+    // every sibling reads back like the source: place, box, shape, radius, pan, zoom
+    for x in [a, c, d] {
+        assert_eq!(look(&mut s, x), want, "clip {x:?}");
+        assert_eq!(motion_saved(&s, x)["rotation"], motion_saved(&s, b)["rotation"]);
+    }
+    // also at a time inside each sibling
+    for (x, t) in [(a, 6.5), (c, 8.5), (d, 9.5)] {
+        let mut v = s.execute("layout.inspect", json!({"clips": [x.0], "seconds": t})).unwrap()["clips"][0].clone();
+        v.as_object_mut().unwrap().retain(|k, _| k != "clip" && k != "track");
+        assert_eq!(v, want);
+    }
+    assert_eq!(crate::layout::sibling_layouts(&s, b), Some((3, 0)), "nothing differs any more");
+    // the source, the other source's clip, V1 and the audio are as they were
+    assert_eq!(untouched(&s), kept);
+    // what is not layout stays on the sibling: its effect, its opacity value, its own mask
+    let (_, it) = s.active_sequence().unwrap().find_item(c).unwrap();
+    assert!(it.effects.iter().any(|e| e.effect == "gaussian_blur"));
+    let o = it.effect("opacity").unwrap();
+    assert_eq!(opacity_value(&s), opacity_before);
+    assert_eq!(o.masks.iter().filter(|m| m.name == LAYOUT_MASK).count(), 1);
+    assert_eq!(o.masks.iter().filter(|m| m.name != LAYOUT_MASK).count(), 1, "the user's mask stays");
+    // start, duration, source in and speed of the pieces did not move
+    let q = s.active_sequence().unwrap();
+    let was = before.sequence(s.state.active_sequence.unwrap()).unwrap();
+    for x in [a, b, c, d] {
+        let (now, then) = (q.find_item(x).unwrap().1, was.find_item(x).unwrap().1);
+        assert_eq!((now.start, now.duration, now.source_in, now.speed), (then.start, then.duration, then.source_in, then.speed));
+    }
+
+    // one undo restores all three
+    assert_eq!(s.undo().as_deref(), Some("Apply Layout to Source"));
+    assert_eq!(serde_json::to_value(&*s.project).unwrap(), serde_json::to_value(&*before).unwrap());
+    assert_eq!(s.redo().as_deref(), Some("Apply Layout to Source"));
+    assert_eq!(look(&mut s, d), want);
+
+    // free again on the source: the siblings lose the shape too, the user's mask still stays
+    s.execute("layout.shape", json!({"clips": [b.0], "shape": "free"})).unwrap();
+    s.execute("layout.place", json!({"clips": [b.0], "at": "full"})).unwrap();
+    assert_eq!(crate::layout::sibling_layouts(&s, b), Some((3, 3)));
+    s.execute("layout.applyToSource", json!({"clips": [b.0]})).unwrap();
+    let full = look(&mut s, b);
+    assert_eq!((full["at"].clone(), full["shape"].clone()), (json!("full"), json!("free")));
+    for x in [a, c, d] {
+        assert_eq!(look(&mut s, x), full);
+    }
+    let (_, it) = s.active_sequence().unwrap().find_item(c).unwrap();
+    let names: Vec<&str> = it.effect("opacity").unwrap().masks.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert_ne!(names[0], LAYOUT_MASK);
+}
+
+#[test]
+fn apply_to_source_uses_the_selection_and_refuses_what_has_no_sibling() {
+    let (mut s, [a, b, _, _], other) = four_pieces();
+    s.execute("layout.shape", json!({"clips": [a.0], "shape": "square"})).unwrap();
+    // the selected video clip is the default
+    s.state.selection = vec![a];
+    assert!(s.is_enabled("layout.applyToSource"));
+    let r = s.execute("layout.applyToSource", json!({})).unwrap();
+    assert_eq!(r["applied"], 3, "{r}");
+    assert_eq!(look(&mut s, b)["shape"], json!("square"));
+    let steps = s.history.undo.len();
+    let before = serde_json::to_value(&*s.project).unwrap();
+    // the only clip of its source on the track: refused with the reason, as a disabled command
+    s.state.selection = vec![other];
+    assert!(!s.is_enabled("layout.applyToSource"));
+    let e = s.execute("layout.applyToSource", json!({})).unwrap_err();
+    assert!(e.to_string().contains("no other clip of this source on the track"), "{e}");
+    assert_eq!(crate::layout::source_siblings(&s, other).unwrap_err(), "no other clip of this source on the track");
+    assert_eq!(crate::layout::sibling_layouts(&s, other), None);
+    // naming a clip that has siblings works whatever is selected
+    assert_eq!(s.execute("layout.applyToSource", json!({"clips": [a.0]})).unwrap()["applied"], 3);
+    s.undo();
+    // the overlay's media is also a shot on V1: only clips on the same track are siblings, so
+    // that shot, the only clip of its media on V1, has none
+    let q = s.active_sequence().unwrap();
+    let item = q.find_item(a).unwrap().1.item;
+    let on_v1: Vec<ClipId> = q.video_tracks[0].items.iter().filter(|i| i.item == item).map(|i| i.id).collect();
+    assert_eq!(on_v1.len(), 1, "the demo plays the overlay's media once on V1");
+    let e = s.execute("layout.applyToSource", json!({"clips": [on_v1[0].0]})).unwrap_err();
+    assert!(e.to_string().contains("no other clip of this source on the track"), "{e}");
+    // hostile ids: an unknown clip, an audio clip, a graphic, junk, nothing, two pieces at once
+    let audio = s.active_sequence().unwrap().audio_tracks[0].items[0].id;
+    let graphic = s.execute("graphics.newText", json!({"text": "Hello"})).unwrap()["clip"].as_u64().unwrap();
+    let steps = steps + 1; // the graphic
+    let before_graphic = serde_json::to_value(&*s.project).unwrap();
+    assert_ne!(before, before_graphic);
+    for p in [
+        json!({"clips": [999_999]}),
+        json!({"clips": [audio.0]}),
+        json!({"clips": [graphic]}),
+        json!({"clips": [a.0, graphic]}),
+        json!({"clips": "x"}),
+        json!({"clips": []}),
+        json!({"clips": [-1]}),
+        json!({"clips": [1e300]}),
+        json!({"clips": [null]}),
+        json!({"clip": {"id": 1}}),
+        json!({"clips": [a.0, b.0]}),
+    ] {
+        let r = s.execute("layout.applyToSource", p.clone());
+        assert!(r.is_err(), "{p}: {r:?}");
+    }
+    let e = s.execute("layout.applyToSource", json!({"clips": [a.0, b.0]})).unwrap_err();
+    assert!(e.to_string().contains("same source on one track"), "{e}");
+    let e = s.execute("layout.applyToSource", json!({"clips": [graphic]})).unwrap_err();
+    assert!(e.to_string().contains("graphic"), "{e}");
+    assert!(crate::layout::source_siblings(&s, ClipId(graphic)).is_err());
+    assert!(crate::layout::source_siblings(&s, audio).is_err());
+    assert!(crate::layout::source_siblings(&s, ClipId(999_999)).is_err());
+    assert_eq!(s.history.undo.len(), steps, "a refused call adds no undo step");
+    assert_eq!(serde_json::to_value(&*s.project).unwrap(), before_graphic, "and changes nothing");
+}
+
+#[test]
+fn apply_to_source_copies_keyframed_motion_as_it_is() {
+    let (mut s, [a, b, c, d], _) = four_pieces();
+    // the second piece slides from the top left to the bottom right over its second
+    s.execute("playhead.set", json!({"seconds": 7.1})).unwrap();
+    s.execute("effects.toggleAnimation", json!({"clip": b.0, "param": "position"})).unwrap();
+    s.execute("layout.place", json!({"clips": [b.0], "at": "topLeft"})).unwrap();
+    s.execute("playhead.set", json!({"seconds": 7.9})).unwrap();
+    s.execute("layout.place", json!({"clips": [b.0], "at": "bottomRight"})).unwrap();
+    s.execute("layout.shape", json!({"clips": [b.0], "shape": "rounded", "radius": 20})).unwrap();
+    let (pos, _) = motion(&s, b);
+    assert_eq!(pos.keyframes.len(), 2, "{pos:?}");
+    let r = s.execute("layout.applyToSource", json!({"clips": [b.0]})).unwrap();
+    assert_eq!(r["applied"], 3);
+    let want = motion_saved(&s, b);
+    assert_eq!(want["position"]["keyframes"].as_array().unwrap().len(), 2, "{want}");
+    for x in [a, c, d] {
+        assert_eq!(motion_saved(&s, x), want, "clip {x:?}: the same parameters and keyframes at the same media times");
+        assert_eq!(layout_masks(&s, x), layout_masks(&s, b));
+    }
+    // keyframes are in media time: the piece before the animation holds its first key, the
+    // pieces after it its last one
+    let i = look(&mut s, a);
+    assert_eq!((i["at"].clone(), i["shape"].clone(), i["radius"].clone()), (json!("topLeft"), json!("rounded"), json!(20.0)), "{i}");
+    for x in [c, d] {
+        let i = look(&mut s, x);
+        assert_eq!((i["at"].clone(), i["shape"].clone()), (json!("bottomRight"), json!("rounded")), "{i}");
+    }
+    assert_eq!(crate::layout::sibling_layouts(&s, b), Some((3, 0)));
+}
+
+#[test]
+fn apply_to_source_skips_clips_a_scene_arranges() {
+    let (mut s, [a, b, _, _], _) = four_pieces();
+    let item = s.active_sequence().unwrap().find_item(b).unwrap().1.item;
+    s.execute("scenes.add", json!({"name": "Mine", "slots": [{"item": item.0, "place": "topLeft", "shape": "square"}]})).unwrap();
+    assert_eq!(crate::scenes::scene_owning(&s, a).as_deref(), Some("Mine"));
+    let steps = s.history.undo.len();
+    let before = s.project.clone();
+    let r = s.execute("layout.applyToSource", json!({"clips": [b.0]})).unwrap();
+    assert_eq!(r, json!({"applied": 0, "clips": [], "skipped": 3}));
+    assert_eq!(s.history.undo.len(), steps, "nothing to undo");
+    assert!(std::sync::Arc::ptr_eq(&before, &s.project), "nothing changed");
+    assert_eq!(crate::layout::sibling_layouts(&s, b), None, "no hint for clips a scene arranges");
+}

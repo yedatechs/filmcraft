@@ -1,7 +1,9 @@
 //! Headless UI test of clip layouts in the Program monitor: click the picture to select the top
 //! clip (a second click cycles), the box and its handles, the right-click Layout menu, a drag of
 //! the box (one undo step), the Effect Controls shape buttons and Clip ▸ Layout; Alt-drag pans and
-//! Alt-scroll / Alt-corner drag zoom the picture inside a shape.
+//! Alt-scroll / Alt-corner drag zoom the picture inside a shape; Apply to All Clips of This Source
+//! copies a layout to the other clips of the same media on the track, and the status bar points
+//! to it after a layout change on one of them.
 //!
 //! Set `FILMCRAFT_UI_SNAPSHOT_DIR=<dir>` to also render the window offscreen with wgpu and write
 //! `layout-*.png` there; without it no GPU is needed.
@@ -99,6 +101,27 @@ impl Driver {
 
     fn inspect(&mut self) -> Value {
         self.exec("layout.inspect", json!({}))["clips"][0].clone()
+    }
+
+    /// Where a clip is and what it shows (`layout.inspect` without the clip id and track).
+    fn look(&mut self, clip: u64) -> Value {
+        let mut v = self.exec("layout.inspect", json!({"clips": [clip]}))["clips"][0].clone();
+        v.as_object_mut().unwrap().retain(|k, _| k != "clip" && k != "track");
+        v
+    }
+
+    fn status(&mut self) -> String {
+        self.ok("ui.inspect", json!({}))["ui"]["status"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// One entry of the menu bar (`ui.menu.list`).
+    fn menu_item(&mut self, id: &str) -> Value {
+        let items = self.ok("ui.menu.list", json!({}));
+        items.as_array().unwrap().iter().find(|it| it["id"] == json!(id)).cloned().unwrap_or_else(|| panic!("no {id} in the menus"))
+    }
+
+    fn undo_steps(&mut self) -> usize {
+        self.exec("history.list", json!({}))["undo"].as_array().unwrap().len()
     }
 
     fn snapshot(&mut self, name: &str) {
@@ -376,4 +399,124 @@ fn program_monitor_zoom() {
     let items = d.ok("ui.menu.list", json!({}));
     let z = items.as_array().unwrap().iter().find(|it| it["id"] == json!("layout.menu.zoom.in")).cloned().unwrap();
     assert_eq!(z["enabled"], json!(false), "{z}");
+}
+
+#[test]
+fn apply_to_all_clips_of_this_source() {
+    const HINT: &str = "Layout set on this clip only. Layout ▸ Apply to All Clips of This Source copies it to the other 3.";
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"tool": "selection"}));
+    // the V2 overlay (6 s to 10 s) cut into four clips, like a camera a text edit cut up
+    for t in [7.0, 8.0, 9.0] {
+        d.exec("timeline.razor", json!({"seconds": t, "track": "V2"}));
+    }
+    d.exec("playhead.set", json!({"seconds": 7.5}));
+    d.frames(4);
+    let (pieces, name): (Vec<u64>, String) = {
+        let q = d.harness.state().session.active_sequence().unwrap();
+        (q.video_tracks[1].items.iter().map(|i| i.id.0).collect(), q.video_tracks[1].items[1].name.clone())
+    };
+    assert_eq!(pieces.len(), 4);
+    let seq = d.exec("sequence.inspect", json!({}));
+    let frame = (seq["settings"]["width"].as_f64().unwrap_or(1920.0), seq["settings"]["height"].as_f64().unwrap_or(1080.0));
+    // click the overlay: the piece under the playhead
+    d.ok("ui.click", json!({"id": "program.picture", "fx": 1540.0 / frame.0, "fy": 820.0 / frame.1}));
+    d.frames(3);
+    let me = pieces[1];
+    assert_eq!(d.selection(), vec![me]);
+    let others = [pieces[0], pieces[2], pieces[3]];
+
+    // Clip ▸ Layout has the entry, enabled: the clip has siblings
+    let it = d.menu_item("layout.menu.applyToSource");
+    assert_eq!(
+        (it["path"].clone(), it["label"].clone(), it["enabled"].clone()),
+        (json!(["Clip", "Layout"]), json!("Apply to All Clips of This Source"), json!(true)),
+        "{it}"
+    );
+    assert!(it.get("reason").is_none(), "{it}");
+
+    // a layout change on this clip only: the status bar says so and names the entry
+    d.ok("ui.click", json!({"id": "program.layout.box", "button": "right"}));
+    d.frames(3);
+    d.click("layout.menu.shape");
+    d.click("layout.menu.shape.circle");
+    assert_eq!(d.look(me)["shape"], json!("circle"));
+    assert_eq!(d.status(), HINT);
+    for c in others {
+        assert_eq!(d.look(c)["shape"], json!("free"), "the other clips are not changed yet");
+    }
+    // the menu-bar command and a drag of the box end with the same hint
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.place.bottomRight"}));
+    assert_eq!(d.status(), HINT);
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.pan.left"}));
+    assert_eq!(d.status(), HINT);
+    let b = d.rect("program.layout.box");
+    let (cx, cy) = (b[0] + b[2] / 2.0, b[1] + b[3] / 2.0);
+    d.ok("ui.drag", json!({"from": {"x": cx, "y": cy}, "to": {"x": cx - 30.0, "y": cy - 20.0}, "modifiers": {"command": true}}));
+    d.frames(4);
+    assert_eq!(d.status(), HINT, "after the drag");
+    let want = d.look(me);
+    assert_eq!((want["shape"].clone(), want["pan"].clone(), want["at"].clone()), (json!("circle"), json!([-320.0, 0.0]), json!("custom")), "{want}");
+
+    // right-click the box ▸ Apply to All Clips of This Source: the three others get the layout
+    let steps = d.undo_steps();
+    d.ok("ui.click", json!({"id": "program.layout.box", "button": "right"}));
+    d.frames(3);
+    assert!(d.ids("layout.menu.").contains(&"layout.menu.applyToSource".to_string()));
+    d.snapshot("apply-to-source-menu");
+    d.click("layout.menu.applyToSource");
+    for c in others {
+        assert_eq!(d.look(c), want, "clip {c}");
+    }
+    assert_eq!(d.look(me), want, "the clip itself is as it was");
+    assert_eq!(d.status(), format!("Layout applied to the other 3 clips of {name}"));
+    assert_eq!(d.undo_steps(), steps + 1, "one undo step");
+    assert_eq!(d.selection(), vec![me]);
+    d.snapshot("apply-to-source");
+    // now they all match: a change that changes nothing shows no hint
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.shape.circle"}));
+    assert_ne!(d.status(), HINT);
+    // one undo takes the layout off the three again
+    d.exec("edit.undo", json!({}));
+    d.exec("edit.undo", json!({}));
+    d.frames(2);
+    for c in others {
+        assert_eq!(d.look(c)["shape"], json!("free"));
+    }
+    assert_eq!(d.look(me), want);
+
+    // the Effect Controls row hints too; the command with `clips` works without a selection
+    d.ok("ui.panel.show", json!({"panel": "Effect Controls"}));
+    d.frames(4);
+    d.click("effectControls.layout.shape.square");
+    assert_eq!(d.look(me)["shape"], json!("square"));
+    assert_eq!(d.status(), HINT);
+    d.exec("timeline.select", json!({"clips": []}));
+    d.frames(2);
+    let it = d.menu_item("layout.menu.applyToSource");
+    assert_eq!((it["enabled"].clone(), it["reason"].clone()), (json!(false), json!("select a video clip")), "{it}");
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.applyToSource", "params": {"clips": [me]}}));
+    let want = d.look(me);
+    for c in others {
+        assert_eq!(d.look(c), want);
+    }
+
+    // a clip that is the only one of its source on its track: disabled, with the reason
+    let lone = {
+        let q = d.harness.state().session.active_sequence().unwrap();
+        let v1 = &q.video_tracks[0].items;
+        v1.iter().find(|i| v1.iter().filter(|x| x.item == i.item).count() == 1).map(|i| i.id.0).unwrap()
+    };
+    d.exec("timeline.select", json!({"clips": [lone]}));
+    d.frames(2);
+    let it = d.menu_item("layout.menu.applyToSource");
+    assert_eq!((it["enabled"].clone(), it["reason"].clone()), (json!(false), json!("no other clip of this source on the track")), "{it}");
+    let steps = d.undo_steps();
+    let v = d.request("ui.menu.invoke", json!({"id": "layout.menu.applyToSource"}));
+    assert_ne!(v["ok"], json!(true), "{v}");
+    assert!(d.status().contains("no other clip of this source on the track"), "{}", d.status());
+    assert_eq!(d.undo_steps(), steps);
+    // and a layout change on it shows no hint
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.place.topLeft"}));
+    assert!(!d.status().contains("this clip only"), "{}", d.status());
 }

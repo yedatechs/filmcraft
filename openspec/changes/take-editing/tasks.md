@@ -16,7 +16,7 @@
 - [x] 3.2 `restore_media` / `restore_cut` (grow, lengthen-or-split, shift, insert fallback, captions, re-grow clips Extract split) with tests incl. an extract/restore round-trip property
 - [x] 3.3 `crates/edit/src/takes.rs`: `utterances`, `similarity`, `detect`, `merge`, `split`, `live_fraction` with tests
 - [ ] 3.4 Follow-up: restore does not grow back a clip that lost only its head or only its tail to Extract (a clip starting or ending inside the extracted range); needs a grow-left rule
-- [ ] 3.5 Follow-up: a take's range includes its retake cue words ("okay again, …"); consider starting the take after the stripped cue
+- [x] 3.5 An earlier take of a detected group starts at the first word it shares with the take after it (`take_start`): a lead-in the retake does not say again, cue words included, is not part of the take, and cues between two takes go with the earlier one when it is crossed out (`cross_range`); the last take of a group still keeps its own lead-in ("okay again, …" stays in the cut when that take is kept)
 
 ## 4. Engine commands
 
