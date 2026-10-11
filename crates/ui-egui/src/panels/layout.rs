@@ -13,8 +13,8 @@
 //!   notches less than 400 ms apart) is one undo step.
 //! - **Menus.** Right-click on the box, the timeline clip menu (Layout ▸) and Clip ▸ Layout share
 //!   one table of entries: Place ▸, Size ▸, Shape ▸, Pan ▸, Zoom ▸, Swap With Clip Below, Redact
-//!   Area ▸ (Static / Tracked Mosaic, Blur, Fill…), with the current place, size, shape, pan and
-//!   zoom checked.
+//!   Area ▸ (Static / Tracked Mosaic, Blur, Fill…, then one Remove entry per redaction of the
+//!   selected clip), with the current place, size, shape, pan and zoom checked.
 //! - **Effect Controls.** One row of nine place buttons and four shape buttons under Motion.
 //!
 //! Automation ids: `program.layout.box`, `program.layout.handle.{nw|n|ne|e|se|s|sw|w}`,
@@ -23,6 +23,8 @@
 //! `layout.menu.pan` (the submenu), `layout.menu.pan.{left|center|right}`,
 //! `layout.menu.zoom` (the submenu), `layout.menu.zoom.{100|125|150|200|in|out}`,
 //! `layout.menu.swap`, `layout.menu.redact` (the submenu), `layout.menu.redact.{static|tracked}.{mosaic|blur|fill}`,
+//! `layout.menu.redact.remove.{n}`, `layout.menu.redact.removeAll`, `layout.menu.redact.removeLast`
+//! (Clip ▸ Layout only), `layout.menu.redact.none` (the disabled "No redactions on this clip"),
 //! `effectControls.layout.place.{at}`,
 //! `effectControls.layout.shape.{s}` (and `properties.layout.*` in the Properties panel).
 
@@ -71,6 +73,10 @@ pub const WHEEL_ZOOM_STEP: f64 = 1.05;
 const WHEEL_NOTCH_POINTS: f64 = 40.0;
 /// Scroll notches closer together than this (seconds) are one undo step.
 const WHEEL_MERGE_SECONDS: f64 = 0.4;
+
+/// The disabled Redact Area ▸ entry of a clip without redactions (also the reason the Remove
+/// entries of Clip ▸ Layout give).
+pub const NO_REDACTIONS: &str = "No redactions on this clip";
 
 const HINT: &str = "Drag to move, corners to scale, Alt-drag to pan and Alt-scroll to zoom inside a shape, right-click for layouts";
 /// Handles in automation-id order, with their position on the box (0, ½, 1 of width and height).
@@ -172,6 +178,23 @@ fn target(app: &FilmcraftApp) -> Option<ClipId> {
         .find(|c| q.video_tracks.iter().any(|t| t.items.iter().any(|it| it.id == *c)) && !crate::panels::graphics::is_graphic_clip(app, *c))
 }
 
+/// The clip the Redact Area ▸ Remove entries act on: the first selected clip on a video track
+/// (a redaction can sit on any clip with a picture, graphics included).
+fn redact_target(app: &FilmcraftApp) -> Option<ClipId> {
+    let q = app.session.active_sequence()?;
+    app.session.state.selection.iter().copied().find(|c| q.video_tracks.iter().any(|t| t.items.iter().any(|it| it.id == *c)))
+}
+
+/// Label of the Redact Area ▸ entry that removes redaction `n`: "Remove Redaction 1 (Mosaic)".
+pub fn remove_redaction_label(n: u64, style: &str) -> String {
+    let style = match style {
+        "blur" => "Blur",
+        "fill" => "Fill",
+        _ => "Mosaic",
+    };
+    format!("Remove Redaction {n} ({style})")
+}
+
 /// Bring the cached `layout.inspect` of the selected video clip up to date (the project, the
 /// selection, the playhead or the sequence changed). Kept as is while playing.
 pub fn refresh(app: &mut FilmcraftApp) {
@@ -227,15 +250,46 @@ pub fn checked(app: &FilmcraftApp, id: &str) -> Option<bool> {
 
 /// Whether a `layout.menu.*` entry can run now.
 pub fn enabled(app: &FilmcraftApp, id: &str) -> bool {
+    disabled_reason(app, id).is_none()
+}
+
+/// Why an engine command cannot run on the selection (None: it can).
+fn engine_reason(app: &FilmcraftApp, cmd: &str) -> Option<String> {
+    match filmcraft_engine::find_command(cmd) {
+        Some(c) => (c.enabled)(&app.session).err(),
+        None => Some(format!("unknown command `{cmd}`")),
+    }
+}
+
+/// Why a `layout.menu.*` entry cannot run now (None: it can): the menus show it as the disabled
+/// entry's tooltip and `ui.menu.list` as `reason`.
+pub fn disabled_reason(app: &FilmcraftApp, id: &str) -> Option<String> {
+    const NEEDS_SHAPE: &str = "Give the clip a circle, square or rounded shape first (Layout ▸ Shape)";
+    if matches!(id, "layout.menu.redact.removeAll" | "layout.menu.redact.removeLast" | "layout.menu.redact.none")
+        || id.starts_with("layout.menu.redact.remove.")
+    {
+        let Some(clip) = redact_target(app) else { return Some("Select a video clip".into()) };
+        let on_clip = filmcraft_engine::redact::summary(&app.session, clip);
+        let n = id.strip_prefix("layout.menu.redact.remove.").map(|n| n.parse::<u64>().ok());
+        return match n {
+            _ if on_clip.is_empty() || id == "layout.menu.redact.none" => Some(NO_REDACTIONS.into()),
+            Some(n) if !on_clip.iter().any(|r| Some(r.0) == n) => Some("This clip has no redaction of that number".into()),
+            _ => None,
+        };
+    }
     if id == "layout.menu.redact" || id.starts_with("layout.menu.redact.") {
-        return true;
+        return None;
     }
     match id {
-        "layout.menu.swap" => app.session.is_enabled("layout.swap"),
+        "layout.menu.swap" => engine_reason(app, "layout.swap"),
         // a pan or zoom needs a circle, square or rounded shape to move inside the source
-        id if id.starts_with("layout.menu.pan.") => app.session.is_enabled("layout.pan") && info(app).is_some_and(Info::croppable),
-        id if id.starts_with("layout.menu.zoom.") => app.session.is_enabled("layout.zoom") && info(app).is_some_and(Info::croppable),
-        _ => app.session.is_enabled("layout.place"),
+        id if id.starts_with("layout.menu.pan.") => {
+            engine_reason(app, "layout.pan").or_else(|| (!info(app).is_some_and(Info::croppable)).then(|| NEEDS_SHAPE.into()))
+        }
+        id if id.starts_with("layout.menu.zoom.") => {
+            engine_reason(app, "layout.zoom").or_else(|| (!info(app).is_some_and(Info::croppable)).then(|| NEEDS_SHAPE.into()))
+        }
+        _ => engine_reason(app, "layout.place"),
     }
 }
 
@@ -291,6 +345,9 @@ fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, Stri
     if rest == "redact" {
         // the old single entry: an alias of Static Mosaic… (`style` / `track` params still apply)
         return crate::panels::redact::start(app, params);
+    }
+    if rest == "redact.removeAll" || rest == "redact.removeLast" || rest.starts_with("redact.remove.") {
+        return remove_redactions(app, rest, params);
     }
     if let Some(mode) = rest.strip_prefix("redact.") {
         // Redact Area ▸ …: the Program picture becomes a draw surface (`panels::redact`)
@@ -383,6 +440,33 @@ fn run(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, Stri
     Err(format!("unknown layout command `layout.menu.{rest}`"))
 }
 
+/// Redact Area ▸ Remove Redaction N / Remove All Redactions / Remove Last Redaction (`rest` is
+/// `redact.remove.{n}`, `redact.removeAll` or `redact.removeLast`): `redact.remove` on the selected
+/// clip (or `params.clips` / `params.clip`), one undo step, and the status bar says what went.
+fn remove_redactions(app: &mut FilmcraftApp, rest: &str, params: &Value) -> Result<Value, String> {
+    let named = params.get("clips").and_then(Value::as_array).and_then(|a| a.first()).or(params.get("clip")).and_then(Value::as_u64).map(ClipId);
+    let clip = named.or_else(|| redact_target(app)).ok_or("Select a video clip")?;
+    let on_clip = filmcraft_engine::redact::summary(&app.session, clip);
+    let which = match rest {
+        "redact.removeAll" => json!("all"),
+        "redact.removeLast" => json!(on_clip.iter().map(|r| r.0).max().ok_or(NO_REDACTIONS)?),
+        _ => json!(
+            rest.strip_prefix("redact.remove.").and_then(|n| n.parse::<u64>().ok()).ok_or_else(|| format!("unknown layout command `layout.menu.{rest}`"))?
+        ),
+    };
+    if on_clip.is_empty() {
+        return Err(NO_REDACTIONS.into());
+    }
+    let r = app.session.execute("redact.remove", json!({"clip": clip.0, "redaction": which})).map_err(|e| e.to_string())?;
+    let name = r["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("the clip");
+    app.ui.status = match &r["removed"] {
+        Value::Array(a) if a.len() == 1 => format!("Removed Redaction {} from {name}", a.first().and_then(Value::as_u64).unwrap_or(0)),
+        Value::Array(a) => format!("Removed {} redactions from {name}", a.len()),
+        n => format!("Removed Redaction {} from {name}", n.as_u64().unwrap_or(0)),
+    };
+    Ok(r)
+}
+
 fn media_time(it: &filmcraft_project::TrackItem, t: Tick) -> Tick {
     it.source_time_at(t.clamp(it.start, (it.end() - Tick(1)).max(it.start)))
 }
@@ -395,16 +479,22 @@ fn menu_entry(app: &mut FilmcraftApp, ui: &mut egui::Ui, id: &str, label: &str, 
         Some(false) => format!("    {label}"),
         None => label.to_string(),
     };
-    let r = ui.add_enabled(enabled(app, id), egui::Button::new(text));
+    let why = disabled_reason(app, id);
+    let r = ui.add_enabled(why.is_none(), egui::Button::new(text));
     app.auto.add(id, r.rect, label);
     if r.clicked() {
         *run = Some(id.to_string());
         ui.close();
     }
+    if let Some(why) = why {
+        r.on_disabled_hover_text(why);
+    }
 }
 
 /// The Layout entries (Place ▸, Size ▸, Shape ▸, Pan ▸, Zoom ▸, Swap With Clip Below, Redact Area ▸), shared by
-/// the monitor right-click menu and the timeline clip menu.
+/// the monitor right-click menu and the timeline clip menu. Redact Area ▸ ends with one Remove
+/// entry per redaction of the selected clip (and Remove All Redactions when it has several), or
+/// the disabled "No redactions on this clip".
 pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
     refresh(app);
     let mut run: Option<String> = None;
@@ -452,6 +542,18 @@ pub fn menu_body(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
                 ui.separator();
             }
             menu_entry(app, ui, &format!("layout.menu.redact.{mode}"), label, &mut run);
+        }
+        // the redactions of the selected clip, to remove (the numbers `redact.list` gives)
+        ui.separator();
+        let on_clip = redact_target(app).map(|c| filmcraft_engine::redact::summary(&app.session, c)).unwrap_or_default();
+        for (n, style) in &on_clip {
+            menu_entry(app, ui, &format!("layout.menu.redact.remove.{n}"), &remove_redaction_label(*n, style), &mut run);
+        }
+        if on_clip.len() > 1 {
+            menu_entry(app, ui, "layout.menu.redact.removeAll", "Remove All Redactions", &mut run);
+        }
+        if on_clip.is_empty() {
+            menu_entry(app, ui, "layout.menu.redact.none", NO_REDACTIONS, &mut run);
         }
     });
     app.auto.add("layout.menu.redact", r.response.rect, "Redact Area");

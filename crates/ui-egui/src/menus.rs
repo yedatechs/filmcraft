@@ -180,6 +180,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("layout.menu.redact.tracked.mosaic", "Tracked Mosaic…", ["Clip", "Layout", "Redact Area"], None),
     uic!("layout.menu.redact.tracked.blur", "Tracked Blur…", ["Clip", "Layout", "Redact Area"], None),
     uic!("layout.menu.redact.tracked.fill", "Tracked Fill…", ["Clip", "Layout", "Redact Area"], None),
+    uic!("layout.menu.redact.removeLast", "Remove Last Redaction", ["Clip", "Layout", "Redact Area"], None),
+    uic!("layout.menu.redact.removeAll", "Remove All Redactions", ["Clip", "Layout", "Redact Area"], None),
 ];
 
 pub fn panel_command_id(p: PanelKind) -> String {
@@ -485,6 +487,9 @@ pub struct MenuItem {
     /// Checkmark state of toggle / radio items (None = not checkable).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked: Option<bool>,
+    /// Why a disabled item cannot run now, when the menu knows (shown as its tooltip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 pub const MENUS: [&str; 9] = ["File", "Edit", "Clip", "Sequence", "Markers", "Graphics and Titles", "View", "Window", "Help"];
@@ -502,7 +507,8 @@ pub fn menu_items(app: &FilmcraftApp) -> Vec<MenuItem> {
         }
         if it.id.starts_with("layout.menu.") {
             it.checked = crate::panels::layout::checked(app, &it.id);
-            it.enabled = crate::panels::layout::enabled(app, &it.id);
+            it.reason = crate::panels::layout::disabled_reason(app, &it.id);
+            it.enabled = it.reason.is_none();
         }
         if it.id.starts_with("view.") {
             it.checked = crate::panels::monitor_view::checked(app, &it.id).or(crate::panels::menu_dialogs::checked(app, &it.id));
@@ -532,6 +538,7 @@ pub fn menu_items_for(session: &filmcraft_engine::Session) -> Vec<MenuItem> {
             shortcut: session.shortcuts.primary(c.id),
             enabled: session.is_enabled(c.id),
             checked: None,
+            reason: None,
         });
     }
     for c in UI_COMMANDS.iter().chain(crate::panels::keyboard::COMMANDS) {
@@ -545,6 +552,7 @@ pub fn menu_items_for(session: &filmcraft_engine::Session) -> Vec<MenuItem> {
             shortcut: session.shortcuts.primary(c.id),
             enabled: true,
             checked: None,
+            reason: None,
         });
     }
     for p in PanelKind::ALL {
@@ -555,6 +563,7 @@ pub fn menu_items_for(session: &filmcraft_engine::Session) -> Vec<MenuItem> {
             shortcut: session.shortcuts.primary(&panel_command_id(p)),
             enabled: true,
             checked: None,
+            reason: None,
         });
     }
     out
@@ -695,6 +704,10 @@ fn menu_entry(ui: &mut egui::Ui, it: &MenuItem) -> bool {
         b = b.shortcut_text(shortcut_text(s));
     }
     let r = ui.add_enabled(it.enabled, b);
+    let r = match &it.reason {
+        Some(why) => r.on_disabled_hover_text(why),
+        None => r,
+    };
     if it.checked == Some(true) {
         let c = r.rect.left_center() + egui::vec2(10.0, 0.0);
         let col = ui.visuals().text_color();

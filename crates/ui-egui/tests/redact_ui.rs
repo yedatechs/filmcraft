@@ -2,6 +2,8 @@
 //! Fill… (`layout.menu.redact.*`, which run `redact.start`) enter the Program monitor draw mode, a
 //! drag on `program.redact.draw` runs `redact.add` on the top-most video clip with the box in clip
 //! pixels (tracking only for the Tracked entries), and Esc leaves the mode without adding anything.
+//! Redact Area ▸ then lists the selected clip's redactions to remove (`layout.menu.redact.remove.{n}`,
+//! `layout.menu.redact.removeAll`; Clip ▸ Layout has Remove Last / Remove All Redactions).
 
 use std::sync::mpsc::{Sender, channel};
 
@@ -92,6 +94,38 @@ impl Driver {
 
     fn status(&mut self) -> String {
         self.ui_state()["status"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// The label of the on-screen element `id`.
+    fn label(&mut self, id: &str) -> String {
+        let v = self.ok("ui.elements", json!({"prefix": id}));
+        let e = v.as_array().unwrap().iter().find(|e| e["id"] == id).unwrap_or_else(|| panic!("no element {id}")).clone();
+        e["label"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// The numbers of the clip's redactions, as `redact.list` gives them.
+    fn numbers(&mut self, clip: u64) -> Vec<u64> {
+        self.redactions(clip).iter().filter_map(|r| r["redaction"].as_u64()).collect()
+    }
+
+    fn undo_steps(&mut self) -> usize {
+        self.exec("history.list", json!({}))["undo"].as_array().unwrap().len()
+    }
+
+    /// One entry of the menu bar (`ui.menu.list`).
+    fn menu_item(&mut self, id: &str) -> Value {
+        let menu = self.ok("ui.menu.list", json!({}));
+        menu.as_array().unwrap().iter().find(|m| m["id"] == id).unwrap_or_else(|| panic!("{id} in the menus")).clone()
+    }
+
+    /// Right-click the selected clip's box in the Program monitor and open Redact Area ▸; returns
+    /// the ids of its entries.
+    fn open_redact_menu(&mut self) -> Vec<String> {
+        self.ok("ui.click", json!({"id": "program.layout.box", "button": "right"}));
+        self.frames(3);
+        self.ok("ui.click", json!({"id": "layout.menu.redact"}));
+        self.frames(3);
+        self.ids("layout.menu.redact.")
     }
 
     /// Drag a box over the Program picture between two picture fractions.
@@ -325,4 +359,132 @@ fn a_click_outside_the_new_mask_hands_the_picture_back() {
     assert_eq!(d.harness.state().session.state.selection, vec![filmcraft_project::ClipId(clip)], "and selects the clip under the pointer");
     assert_eq!(d.ids("program.layout.box"), ["program.layout.box"], "the layout box is back");
     assert_eq!(d.redactions(clip).len(), 1, "the redaction itself stays");
+}
+
+#[test]
+fn redact_area_lists_the_clips_redactions_to_remove() {
+    let mut d = Driver::demo();
+    d.exec("playhead.set", json!({"seconds": 2.5}));
+    let clip = first_clip();
+    let (name, other, other_at) = {
+        let q = d.harness.state().session.active_sequence().unwrap();
+        let v1 = &q.video_tracks[0].items;
+        (v1[0].name.clone(), v1[1].id.0, v1[1].start.seconds() + 0.5)
+    };
+    assert!(!name.is_empty());
+
+    // draw three boxes side by side: Redaction 1 (fill), 2 (blur), 3 (mosaic)
+    for (mode, x) in [("static.fill", 0.1), ("static.blur", 0.4), ("static.mosaic", 0.7)] {
+        d.ok("ui.menu.invoke", json!({"id": format!("layout.menu.redact.{mode}")}));
+        d.frames(3);
+        d.draw((x, 0.1), (x + 0.15, 0.3));
+    }
+    assert_eq!(d.numbers(clip), [1, 2, 3]);
+    assert_eq!(d.harness.state().session.state.selection, vec![filmcraft_project::ClipId(clip)], "the clip that got the boxes is the selected clip");
+
+    // Clip ▸ Layout ▸ Redact Area: Remove Last / Remove All Redactions, enabled now
+    for (id, label) in [("layout.menu.redact.removeLast", "Remove Last Redaction"), ("layout.menu.redact.removeAll", "Remove All Redactions")] {
+        let it = d.menu_item(id);
+        assert_eq!(
+            (it["path"].clone(), it["label"].clone(), it["enabled"].clone()),
+            (json!(["Clip", "Layout", "Redact Area"]), json!(label), json!(true)),
+            "{it}"
+        );
+        assert!(it.get("reason").is_none(), "{it}");
+    }
+
+    // hand the picture back (a click away from the new mask), then right-click the box: under the
+    // six draw entries, one Remove entry per redaction and Remove All Redactions
+    d.ok("ui.click", json!({"id": "program.picture", "fx": 0.5, "fy": 0.8}));
+    d.frames(3);
+    let ids = d.open_redact_menu();
+    for (mode, _) in MODES {
+        assert!(ids.contains(&format!("layout.menu.redact.{mode}")), "{ids:?}");
+    }
+    assert_eq!(d.label("layout.menu.redact.remove.1"), "Remove Redaction 1 (Fill)");
+    assert_eq!(d.label("layout.menu.redact.remove.2"), "Remove Redaction 2 (Blur)");
+    assert_eq!(d.label("layout.menu.redact.remove.3"), "Remove Redaction 3 (Mosaic)");
+    assert_eq!(d.label("layout.menu.redact.removeAll"), "Remove All Redactions");
+    assert!(!ids.contains(&"layout.menu.redact.none".to_string()), "{ids:?}");
+
+    // clicking one removes exactly that one, in one undo step, and the status bar says so
+    let steps = d.undo_steps();
+    d.ok("ui.click", json!({"id": "layout.menu.redact.remove.2"}));
+    d.frames(3);
+    assert_eq!(d.numbers(clip), [1, 3], "the others keep their numbers");
+    assert_eq!(d.status(), format!("Removed Redaction 2 from {name}"));
+    assert_eq!(d.undo_steps(), steps + 1);
+    assert!(d.ids("layout.menu.redact.").is_empty(), "the menu closed");
+
+    // the menu follows: 1 and 3 are left; Remove All Redactions removes the rest in one step
+    let ids = d.open_redact_menu();
+    assert!(ids.contains(&"layout.menu.redact.remove.1".to_string()) && ids.contains(&"layout.menu.redact.remove.3".to_string()), "{ids:?}");
+    assert!(!ids.contains(&"layout.menu.redact.remove.2".to_string()), "{ids:?}");
+    d.ok("ui.click", json!({"id": "layout.menu.redact.removeAll"}));
+    d.frames(3);
+    assert!(d.numbers(clip).is_empty());
+    assert_eq!(d.status(), format!("Removed 2 redactions from {name}"));
+    assert_eq!(d.undo_steps(), steps + 2);
+
+    // a clip without redactions: one disabled entry, and the menu-bar entries say why
+    let ids = d.open_redact_menu();
+    assert_eq!(d.label("layout.menu.redact.none"), "No redactions on this clip");
+    assert!(!ids.iter().any(|i| i.starts_with("layout.menu.redact.remove")), "{ids:?}");
+    d.ok("ui.click", json!({"id": "layout.menu.redact.none"}));
+    d.frames(3);
+    assert_eq!(d.status(), format!("Removed 2 redactions from {name}"), "the disabled entry does nothing");
+    d.ok("ui.key", json!({"key": "Escape"}));
+    d.frames(3);
+    for id in ["layout.menu.redact.removeLast", "layout.menu.redact.removeAll"] {
+        let it = d.menu_item(id);
+        assert_eq!((it["enabled"].clone(), it["reason"].clone()), (json!(false), json!("No redactions on this clip")), "{it}");
+        let v = d.call("ui.menu.invoke", json!({"id": id}));
+        assert_ne!(v["ok"], json!(true), "{v}");
+        assert!(v.to_string().contains("No redactions on this clip"), "{v}");
+    }
+    assert_eq!(d.status(), "No redactions on this clip");
+    assert_eq!(d.undo_steps(), steps + 2, "a refused remove adds no undo step");
+
+    // undo restores: first the two, then the one
+    d.exec("edit.undo", json!({}));
+    assert_eq!(d.numbers(clip), [1, 3]);
+    d.exec("edit.undo", json!({}));
+    assert_eq!(d.numbers(clip), [1, 2, 3]);
+    let styles: Vec<String> = d.redactions(clip).iter().map(|r| r["style"].as_str().unwrap().to_string()).collect();
+    assert_eq!(styles, ["fill", "blur", "mosaic"]);
+
+    // Clip ▸ Layout ▸ Redact Area ▸ Remove Last Redaction takes the highest number; an entry by
+    // number works as a command too, and a number the clip does not have is refused
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.redact.removeLast"}));
+    assert_eq!(d.numbers(clip), [1, 2]);
+    assert_eq!(d.status(), format!("Removed Redaction 3 from {name}"));
+    let v = d.call("ui.menu.invoke", json!({"id": "layout.menu.redact.remove.7"}));
+    assert_ne!(v["ok"], json!(true), "{v}");
+    let v = d.call("ui.menu.invoke", json!({"id": "layout.menu.redact.remove.x"}));
+    assert_ne!(v["ok"], json!(true), "{v}");
+    assert_eq!(d.numbers(clip), [1, 2]);
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.redact.remove.1"}));
+    assert_eq!(d.numbers(clip), [2]);
+
+    // another clip, which has none: its menu shows the disabled entry while the first keeps its own
+    d.exec("playhead.set", json!({"seconds": other_at}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": "program.picture", "fx": 0.2, "fy": 0.2}));
+    d.frames(3);
+    assert_eq!(d.harness.state().session.state.selection, vec![filmcraft_project::ClipId(other)]);
+    let ids = d.open_redact_menu();
+    assert_eq!(d.label("layout.menu.redact.none"), "No redactions on this clip");
+    assert!(!ids.iter().any(|i| i.starts_with("layout.menu.redact.remove")), "{ids:?}");
+    d.ok("ui.key", json!({"key": "Escape"}));
+    d.frames(3);
+    assert_eq!(d.menu_item("layout.menu.redact.removeAll")["enabled"], false);
+    // `clips` names the clip in place of the selection
+    d.ok("ui.menu.invoke", json!({"id": "layout.menu.redact.removeAll", "params": {"clips": [clip]}}));
+    assert!(d.numbers(clip).is_empty());
+    assert_eq!(d.status(), format!("Removed Redaction 2 from {name}"));
+    // nothing selected: the entries ask for a clip
+    d.exec("timeline.select", json!({"clips": []}));
+    d.frames(2);
+    let it = d.menu_item("layout.menu.redact.removeLast");
+    assert_eq!((it["enabled"].clone(), it["reason"].clone()), (json!(false), json!("Select a video clip")), "{it}");
 }

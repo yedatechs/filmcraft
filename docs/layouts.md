@@ -109,7 +109,8 @@ above, so it is one undo step.
   Size ▸ (20 / 25 / 33 / 50 %), Shape ▸ (Circle, Rounded, Square, Free), Pan ▸ (Centre on Left
   Third, Centre, Centre on Right Third), Zoom ▸ (100 %, 125 %, 150 %, 200 %, Zoom In, Zoom Out),
   Swap With Clip Below, Redact Area ▸ (Static Mosaic…,
-  Static Blur…, Static Fill…, Tracked Mosaic…, Tracked Blur…, Tracked Fill…). The current place,
+  Static Blur…, Static Fill…, Tracked Mosaic…, Tracked Blur…, Tracked Fill…, then the clip's
+  redactions to remove). The current place,
   size and shape of the selected clip are checked, and so are the Pan ▸ entry whose x-centre the
   shape is at (within 1 % of the source width) and the Zoom ▸ preset it is at. Pan ▸ centres the
   shape on x = ⅓, ½ or ⅔ of the source width, keeping the vertical pan (`layout.pan {dx}`). Zoom ▸
@@ -125,8 +126,12 @@ above, so it is one undo step.
   nothing moves), a **Tracked** entry makes it follow what is under it (forward, then backward
   tracking jobs; slow on long clips). The submenu's tooltip says so, and the status line names the
   choice ("Drag a box over what to hide · static mosaic (Esc cancels)"). The old id
-  `layout.menu.redact` still works as Static Mosaic…. The menu-bar entries are UI commands (`ui.menu.invoke {id: "layout.menu.place.topLeft"}`);
-  they take an optional `clips` param in place of the selection.
+  `layout.menu.redact` still works as Static Mosaic…. Under those six entries Redact Area ▸ lists
+  the redactions of the selected clip, to [remove](#removing-a-redaction) them. The menu-bar
+  entries are UI commands (`ui.menu.invoke {id: "layout.menu.place.topLeft"}`);
+  they take an optional `clips` param in place of the selection. `ui.menu.list` gives a disabled
+  Layout entry a `reason` ("select a video clip", "No redactions on this clip"); the menus show
+  it as the entry's tooltip.
 - **Effect Controls.** Under Motion (Effect Controls) and in the Transform section of the
   Properties panel, a **Layout** row has nine place buttons (a 3 × 3 dot grid; the clip's place is
   outlined) and four shape buttons; the tooltips name the command (`layout.place`,
@@ -139,6 +144,8 @@ above, so it is one undo step.
 | `program.layout.handle.{nw\|n\|ne\|e\|se\|s\|sw\|w}` | scale handles (Alt-drag of a corner zooms) |
 | `layout.menu.place`, `layout.menu.size`, `layout.menu.shape`, `layout.menu.pan`, `layout.menu.zoom`, `layout.menu.redact` | the submenus (right-click menu and timeline clip menu) |
 | `layout.menu.place.{at}`, `layout.menu.size.{20\|25\|33\|50}`, `layout.menu.shape.{circle\|rounded\|square\|free}`, `layout.menu.pan.{left\|center\|right}`, `layout.menu.zoom.{100\|125\|150\|200\|in\|out}`, `layout.menu.swap`, `layout.menu.redact.{static\|tracked}.{mosaic\|blur\|fill}` | menu entries; also the UI command ids of Clip ▸ Layout (`layout.menu.redact` as a command: an alias of `layout.menu.redact.static.mosaic`) |
+| `layout.menu.redact.remove.{n}`, `layout.menu.redact.removeAll`, `layout.menu.redact.none` | Redact Area ▸ Remove Redaction N (one per redaction of the selected clip), Remove All Redactions (with more than one), and the disabled "No redactions on this clip"; `remove.{n}` and `removeAll` are UI commands too |
+| `layout.menu.redact.removeLast`, `layout.menu.redact.removeAll` | Clip ▸ Layout ▸ Redact Area ▸ Remove Last Redaction / Remove All Redactions (UI commands) |
 | `timeline.clipMenu.layout` | the Layout submenu of the timeline clip menu |
 | `effectControls.layout.place.{at}`, `effectControls.layout.shape.{s}` | the Effect Controls row (nine places, no Full) |
 | `properties.layout.place.{at}`, `properties.layout.shape.{s}` | the same row in the Properties panel |
@@ -246,7 +253,7 @@ method `Position`. The new mask is selected, so its on-monitor handles show.
 |---|---|---|
 | `redact.add` | `clip?` (default: the top-most enabled video clip under the playhead), `rect: [x, y, w, h]` (clip pixels; clamped to the picture, an empty box is refused), `style: mosaic\|blur\|fill` (default mosaic), `track: bool` (default true), `frames: n?` (cap per direction), `wait: bool?` (track synchronously) | `{clip, effect, mask, name, style, rect, jobs, trackError?}` |
 | `redact.list` | `clip?` | `{clip, redactions: [{redaction: N, name, effect, mask, style, rect, tracked, tracking}]}`; `rect` is the mask's bounding box at the playhead, `tracked` = the mask path has keyframes, `tracking` = a job is running or queued |
-| `redact.remove` | `clip?`, `redaction: N` | removes that effect and its mask (one undo step) and stops its tracking |
+| `redact.remove` | `clip?`, `redaction: N \| "all"` | removes that redaction, or with `"all"` every redaction of the clip: effect and mask, one undo step (`Remove Redaction` / `Remove All Redactions`), after cancelling its tracking job and dropping its queued backward run → `{clip, name, removed: N}` (`removed: [N…]` for `"all"`; `name` is the clip's name). The redactions that stay keep their numbers: removing Redaction 1 of two leaves Redaction 2, and the next one added is Redaction 3. Refused when the clip has no such redaction (none at all for `"all"`), or while a mask of a later effect on the clip is being tracked. |
 
 With `track`, `masks.track` runs forward from the playhead (method `position`) and, when that job
 finishes, backward from the same frame: two jobs, each one undo step (`Track Mask`), shown in the
@@ -269,6 +276,27 @@ runs with the chosen `track`. A static box starts no job ("Redaction N added (st
 one starts the forward job, which the status bar shows by its own label ("Track Redaction 1
 (forward)… 23% · 1:34:48 left", the time left `jobs.list` reports as `etaSeconds`; only export
 jobs say "Exporting"). One box per entry; a click without a drag keeps the mode; Esc cancels.
+The clip that got the box becomes the selected clip, so Effect Controls shows the new effect and
+the Layout menus act on it.
+
+### Removing a redaction
+
+A redaction is removed from the same submenu that made it. Select the clip (drawing a box selects
+it; otherwise click it in the timeline or the Program picture), then:
+
+- **Right-click menu and timeline clip menu:** Layout ▸ Redact Area ▸ lists, under the six draw
+  entries and a separator, one entry per redaction of the clip with the number `redact.list` gives
+  and its style: "Remove Redaction 1 (Mosaic)", "Remove Redaction 2 (Blur)", … and, when the clip
+  has more than one, "Remove All Redactions". A clip without redactions shows the disabled entry
+  "No redactions on this clip".
+- **Menu bar:** Clip ▸ Layout ▸ Redact Area ▸ Remove Last Redaction (the highest number: the one
+  drawn last) and Remove All Redactions, disabled with the reason "No redactions on this clip"
+  (or "Select a video clip") when there is nothing to remove.
+
+Each is `redact.remove` on that clip (`redaction: N` or `"all"`): one undo step, so Undo brings
+the redaction back; a tracking job of the removed redaction is cancelled first. The status bar
+says what went: "Removed Redaction 1 from Recording 2 - Screen.mov", "Removed 2 redactions from
+…".
 
 Tracking already works on frames decoded at most 960 px wide (`masks.track`, `TRACK_MAX_WIDTH`;
 positions are scaled back to clip pixels), so on 4K footage its speed is bound by decoding the
