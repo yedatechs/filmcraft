@@ -116,6 +116,22 @@ numbers ("twenty dollar, hundred dollar, two hundred dollar") is left alone. Lea
 words at the start of an utterance (`yo`, `um`, `uh`, `alright`, `right`, `okay`, `again`, …) are
 ignored when comparing.
 
+**Where a take starts and ends.** A take is the line itself. Detect Takes compares each take
+with the take after it (their longest common subsequence, on the words as said) and starts the
+earlier take at the first word the two share: words in front of it that the retake does not say
+again are not part of the take, so they stay in the cut when the take is crossed out. In "… the
+photos I took in um Lisbon nobody can read the signs … uh sorry well nobody can read the signs …"
+take 1 is "nobody can read the signs", not "um Lisbon nobody …". Two cases keep their first
+words: a stumble on the line's first word ("the uh the main reason") and a reordered line whose
+first word the retake says somewhere else. A take that differs in the middle or at the end keeps
+its range, and the last take of a group keeps its own lead-in ("well", "okay again"), which is in
+the cut when that take is kept. Retake cues and fillers between two takes ("uh sorry", "okay
+again", "one more"; the cue words are okay, ok, again, sorry, let, let's, take, redo, wait, yo,
+alright, right, um, uh) belong to neither take: switching takes removes the whole group and puts
+the chosen take back, and `takes.cross` on the earlier take removes them with it, up to the next
+take's first word; `takes.restore` brings back the take only. Other words between two takes stay
+when one take is crossed out, but a switch still removes them with the group.
+
 | Command | What it does |
 |---|---|
 | `takes.detect` | Find groups (`sensitivity` 0..1, default 0.5; `maxGapSeconds`); hand-made groups are kept; `select` (`last` by default, `first`, `none`) puts that take of each new group in the cut, in the same undo step. |
