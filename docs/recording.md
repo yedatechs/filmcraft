@@ -1,8 +1,9 @@
 # Recording (screen, cameras, microphones, system audio)
 
 Status: macOS screen, window, camera, microphone and system-audio recording, several cameras and
-microphones at once, recording settings, live camera previews, the recording border and areas of
-a display, per-camera rotate, headless synthetic sources, the Record panel
+microphones at once, pause and resume, recording settings, live camera previews with a pop-out
+window that has its own controls, the microphone level before a recording, the recording border
+and areas of a display, per-camera rotate, headless synthetic sources, the Record panel
 (`openspec/changes/recording/`). Windows and Linux record microphones only.
 
 Record your screen, up to four cameras and up to four microphones without leaving FilmCraft, in
@@ -20,17 +21,21 @@ Window ▸ Record, or the red dot at the right end of the Program monitor's tran
 |---|---|
 | Screen | Off, a display (name and pixel size), Area of <display>… (drag a part of it: see Border and areas), or a window (app — title); with an area: "Area 1280×720" and Edit… |
 | Camera rows | per camera: its live picture (see Preview), the camera (or Off), Quality 720p / 1080p / 4K / Native (the camera's best), `−` (remove the row), Mirror, Rotate Auto / 0° / 90° / 180° / 270°, Offset … ms (see Sync), Pop out |
-| Microphone rows | per microphone: Off, Default Input (Settings ▸ Audio Hardware, or the Voice-Over source), or a device; `−` |
+| Microphone rows | per microphone: Off, Default Input (Settings ▸ Audio Hardware, or the Voice-Over source), or a device; `−`. The level meter under the buttons follows the chosen microphones as soon as the panel is open, before Record is pressed |
 | + Camera / + Microphone | add a row (at most four of each); a new camera row takes the next camera not chosen yet and the camera defaults of the settings |
 | Name | the recording's name (empty: `Recording <n>`) |
-| ● Record / ■ Stop 00:12 | starts (after the countdown); reads `Starting screen capture…` (disabled) until every source is live, then becomes Stop with the elapsed time |
+| ● Record / ■ Stop 00:12 | starts (after the countdown); reads `Starting screen capture…` (disabled) until every source is live, then becomes Stop with the recorded time; while paused it is amber and reads `■ Stop Paused 00:12` |
+| Pause / Resume | while recording: Pause leaves what follows out of every file until Resume (see Pause and resume); the previews, the border and the level meter stay live |
 | Cancel | stops and deletes the files (or cancels the countdown) |
 | Refresh | lists the devices again (a camera plugged in, a window opened, a display woken) |
 | Settings ▸ | the recording settings below, the same values as Settings ▸ Recording |
-| – / + / × (title row) | – minimizes the panel to a strip: the title, Record / Stop with the elapsed time, the camera thumbnails at their recording size and `+` to restore it; × closes it (not while recording). The panel never minimizes by itself; the choice is kept (`ui.record.minimized`), also across recordings |
+| – / + / × (title row) | – minimizes the panel to a strip: the title, Record / Stop with the recorded time, Pause / Resume while recording, the camera thumbnails at their recording size and `+` to restore it; × closes it (not while recording). The panel never minimizes by itself; the choice is kept (`ui.record.minimized`), also across recordings |
 
 While recording the panel stays open, shows frames and dropped frames per video source and the
-microphone level, and the status bar reads `Recording · 00:12 · screen 360 f / camera 358 f`.
+microphone level (the loudest microphone), and the status bar reads `Recording · 00:12 · screen
+360 f / camera 358 f` (`Paused · 00:12 · …` while paused). Before a recording the same meter shows
+the microphones of the panel's rows: FilmCraft listens to them while the panel is open (macOS shows
+its microphone indicator) and stops when the panel closes.
 During the countdown the button and the status bar read `Recording in 3…`; the button or Esc
 cancels it. After it (or at once without one) the sources start, and until every one of them
 delivers, the button (disabled) and the status bar read `Starting screen capture…` (`Starting the
@@ -101,7 +106,7 @@ directory (the same rule as voice-over):
   "version": 1, "recording": "Recording 3", "source": "screen", "index": 1, "file": "Recording 3 - Screen.mov",
   "device": {"id": "1", "name": "Built-in Display"},
   "clock_start_ns": 1791631234567890123, "first_sample_ns": 12000000, "last_sample_ns": 3012000000,
-  "warmup_ns": 410000000,
+  "warmup_ns": 410000000, "pauses": [], "paused_ns": 0,
   "dropped": 0, "bytes": 5123456, "frames": 90, "width": 1920, "height": 1080, "fps": 30,
   "encoder": "VideoToolbox H.264", "bitrate_kbps": 20000, "quality": "high", "keyframe_seconds": 2,
   "hardware_encoder": true, "show_cursor": true, "resolution": "native", "events": []
@@ -111,7 +116,11 @@ directory (the same rule as voice-over):
 `clock_start_ns` is the wall-clock time when the recording began, the instant every source was
 live (the same in every sidecar of one recording, and `clockStartNs` of `record.start`);
 `first_sample_ns` / `last_sample_ns` are on the recording clock, relative to it, so
-`first_sample_ns` is under one frame for every source. `warmup_ns` is how long the source took
+`first_sample_ns` is under one frame for every source; in a recording that was paused they are
+file times (the pauses before them taken out), so `last_sample_ns` is about the file's length.
+`pauses` lists the pauses as `[start_ns, end_ns]` on the recording clock (wall time since the
+start; the same list in every sidecar of a recording) and `paused_ns` is their sum: a moment
+`t` of the file was captured `t` plus the pauses before it after the start. `warmup_ns` is how long the source took
 from its start to its first frame or audio block (a microphone typically 0.5–0.7 s, the screen
 0.2–0.9 s, more the first time).
 `source` is `screen`, `camera`, `mic` or `systemAudio`, `index` its number among the sources of that
@@ -119,7 +128,7 @@ kind (Camera 2 has `2`). A screen's sidecar has `area` (`[x, y, w, h]` in displa
 only an area was recorded. A camera's sidecar also has `camera_offset_ms`, `rotate` (the file's turn, degrees clockwise; +
 `rotate_note`), `rotate_setting` (`"auto"` or the degrees chosen), `camera_rotation` (what the camera
 reported at the start, `null` when it reports nothing), with Auto and a camera that turned during
-the recording `rotation_changed_at_ns` (when it was first noticed, after the start),
+the recording `rotation_changed_at_ns` (where in the file it was first noticed),
 `rotation_changes` and `rotation_note`, and `mirror` (+
 `mirror_note`); audio sidecars have `sample_rate`, `requested_sample_rate`, `channels`, `format`
 (`s16` / `s24` / `f32`), `samples` (and `auto_gain` for microphones) instead of the picture fields.
@@ -169,6 +178,33 @@ The imported items carry metadata `Recording`, `Recording Source` (`screen`, `ca
 `mic`, `mic2`, `systemAudio`…) and `Recording Offset`, and go to a `Recordings` bin. Undo removes the
 sequence, the clips, the bin entries and the items in one step; the files stay on disk.
 
+## Pause and resume
+
+Pause (the panel, its minimized strip, the pop-out's bar, or `record.pause`) leaves what follows
+out of every file until Resume (`record.resume`). The files have no gap and no silence where the
+recording was paused: each one simply goes on, and they still line up, because every source is cut
+at the same two instants on the one clock.
+
+- **Pictures.** A frame captured during a pause is left out (it is not a dropped frame). The
+  latest one is held: if nothing newer arrives with the resume (a screen that stands still sends
+  no frames), the held picture is written at the resume, so the file shows what the screen looked
+  like when the recording went on, not what it showed before the pause.
+- **Microphones.** The device keeps being read during a pause (the level meter stays live) and
+  the paused samples are cut out by their index, to the sample.
+- **System audio.** Cut to the sample on the blocks' own times; a pause is never filled with
+  silence (only real gaps in what the system played are).
+
+The time shown everywhere is the recorded time, which stands still during a pause: `Paused 00:12`
+in amber on the Stop button, in the strip and in the pop-out, `Paused · 00:12 · …` in the status
+bar, and the border turns amber with a `❙❙ PAUSED 00:12` pill. The camera previews, the border
+and the pop-outs keep running.
+
+**Stop while paused** ends the recording where that pause began: nothing after it is in the
+files. **Stop after** counts recorded time: 2 minutes with a 1 minute pause stop after 3 minutes
+on the wall. Cancel while paused deletes the files as always. Every sidecar lists the pauses
+(`pauses`, `paused_ns`), and `record.stop` returns their number and the recorded seconds
+(`pauses`, `elapsed`). A recording takes at most 10 000 pauses.
+
 ## Rotate
 
 A camera mounted on its side or upside down, or one that turns its picture itself (a gimbal webcam
@@ -209,10 +245,25 @@ own choice (a Horizontal Flip effect on the clip; the file stays as the camera s
 While the Record panel is open, each camera row shows its camera live in a 16:9 box about
 240 px wide (letterboxed; 120 px while recording, a glance rather than a monitor), at the camera's frame rate, mirrored like its clip and turned like its file will be (with Auto: as the camera reports now)
 ("is something in my teeth, is the angle bad"). Pop out opens it in a small preview window
-(320 pt wide, resizable, always on top, moved by its title bar; its close box puts it back in the
-panel) that keeps showing the camera during the recording even when the panel is closed. A
-preview stops when its row is removed or set to Off, and when the panel closes with nothing
-recording.
+(resizable, always on top, moved by its title bar; its close box puts it back in the panel) that
+keeps showing the camera during the recording, also with the panel minimized. A preview stops
+when its row is removed or set to Off, and when the panel closes with nothing recording.
+
+**The pop-out is the size of the camera picture.** Its long side is 320 pt and the other side
+follows the picture as shown (after Mirror and Rotate): 320 × 180 for a 16:9 camera, 180 × 320 for
+one on its side, with no black bars; under the picture sits a 28 pt control bar. The window opens
+once the camera has said what it delivers. When the picture's shape changes later (Rotate, a
+camera that turns itself, another quality) the window is resized around the picture's current
+long side; a size you dragged is otherwise kept (the picture letterboxed in it), down to
+160 × 118 pt.
+
+**Its control bar** has, left to right: the state and time (`● 00:12` in red while recording,
+`Paused 00:12` in amber, `Recording in 3…` or `Starting…` before the recording begins, nothing
+when idle), the buttons, and the microphone level at the right end (in a bar too narrow for it, a
+portrait picture's while paused, a thin strip along the bar's top edge). The buttons do exactly
+what the panel's do: `● Record` (countdown included) when idle, `Stop` and `Pause` / `Resume`
+while recording, `Cancel` during the countdown or while the sources start. So the panel can stay
+minimized, or behind other windows, while you record from the pop-out.
 
 Under the hood the panel asks `record.preview` for the cameras of its rows, at the size and rate
 each row records at. The camera then runs without writing anything; its latest picture
@@ -227,7 +278,8 @@ preview asked for during a recording shares the recording's session at the recor
 
 Descript-style, a border shows what is recorded: while the panel is open with a screen chosen, a
 3 pt grey frame hugs the display's edges (or the window's, following it every 0.5 s as it moves,
-or the area's); recording turns it red with a small `● REC 00:12` pill at the top. It is a
+or the area's); recording turns it red with a small `● REC 00:12` pill at the top, a pause
+amber with `❙❙ PAUSED 00:12`. It is a
 borderless, transparent, always-on-top window that lets every click through (titled
 `FilmCraft Recording Overlay`). It goes away when the screen is set to Off, when the panel
 closes with nothing recording, and when the recording stops (it comes back when a screen is
@@ -300,9 +352,12 @@ also says so when macOS lists no display because the display is asleep or the sc
 | `record.devices` | – | `{displays: [{id, name, width, height}], windows: [{id, title, app}], cameras: [{id, name, formats: [{width, height, fps}]}], microphones: [name], factory, permissions: {screen, camera, microphone}, systemAudio, error?}` |
 | `record.start` | `screen?: {display: id, area?: [x, y, w, h]} \| {window: id}` (+ `fps?` 1–60, `resolution?`, `cursor?`, `systemAudio?`), `cameras?: [{device: id, quality?, width?, height?, fps?, mirror?, rotate?: "auto" \| 0 \| 90 \| 180 \| 270}]` (or `camera: {…}`), `mics?: [{device?: name}]` (or `mic: {…}`), `name?`, `dir?`, `countdown?` (0–10 s), `wait?` (default true), `settings?` (any of the settings fields, for this recording only) | once every source is live: `{recording, name, clockStartNs, dir, files: [{kind, key, path, sidecar}], warmupNs: {key: ns}, notes}`; with a countdown `{recording: false, countdown}`; with `wait: false` at once `{recording: false, starting: true, label}` (the outcome comes as a `started` / `startFailed` event of `record.status`) |
 | `record.preview` | `camera: {device, quality?, width?, height?, fps?} \| null`, or `cameras: [{…}]` (at most four); `{}` only reports | the listed cameras run live, the others stop: `{preview: [ids], cameras: [{device, width, height, fps, frames, recording, error}]}` |
-| `record.status` | – | `{recording, name?, elapsed, sources: [{kind, key, device, frames, dropped, bytes, level?}], stopAfterMinutes, notes, error?, preview: [camera ids]}`; during a countdown `{recording: false, countdown: {seconds, remaining}}`; while the sources start `{recording: false, starting: true, label: "Starting screen capture…"}`; also runs what is due (a finished start, the countdown's start, Stop after) and reports it as `event` |
-| `record.stop` | `discard?`, `cameraOffsetMs?` (−5000…5000), `cameraOffsetsMs?: [..]` | `{placed, name, sequence, opened, items: {screen?, camera?, camera2?, mic?, mic2?, systemAudio?}, clips: {key: {clip, start}}, offsets: {key: ticks}, cameras, mics, cameraOffsetsMs, files, errors, notes, rotationChanged: [{source, atNs, rotate}]}`; during a countdown `{placed: false, cancelled: true}` |
+| `record.status` | – | `{recording, name?, elapsed, paused, pauses, sources: [{kind, key, device, frames, dropped, bytes, level?}], stopAfterMinutes, notes, error?, preview: [camera ids], monitor: [{device, level, error?}]}` (`elapsed` is the recorded time in seconds: it stands still while `paused`; `pauses` counts them); during a countdown `{recording: false, countdown: {seconds, remaining}}`; while the sources start `{recording: false, starting: true, label: "Starting screen capture…"}`; also runs what is due (a finished start, the countdown's start, Stop after) and reports it as `event` |
+| `record.pause` | – | `{paused: true, elapsed, pauses}`; from now on nothing goes into the files |
+| `record.resume` | – | `{paused: false, elapsed, pauses}`; the files go on right after what they held at the pause |
+| `record.stop` | `discard?`, `cameraOffsetMs?` (−5000…5000), `cameraOffsetsMs?: [..]` | `{placed, name, sequence, opened, items: {screen?, camera?, camera2?, mic?, mic2?, systemAudio?}, clips: {key: {clip, start}}, offsets: {key: ticks}, cameras, mics, cameraOffsetsMs, files, errors, notes, pauses, elapsed, rotationChanged: [{source, atNs, rotate}]}` (`pauses`: how many, `elapsed`: the recorded seconds, what every file holds); during a countdown `{placed: false, cancelled: true}` |
 | `record.cancel` | – | `{placed: false, discarded: true}` (`cancelled: true` for a countdown or a start whose sources are starting) |
+| `record.monitor` | `mics: [name, …]` (`""` or `"default"` = the default input; `[]` or `null` stops; at most four); without `mics` it only reports | `{wanted: [..], monitor: [{device, level, error?}]}`: the level of exactly these microphones is read (nothing is written) |
 | `record.settings` | `{get: true}` or `{set: {field: value, …}}` (merged) | `{settings: {…}, hevcAvailable, systemAudioAvailable}` |
 
 `record.start` is refused while recording, starting or counting down, during a voice-over, with no source,
@@ -316,7 +371,19 @@ control channel). `record.start` counts down only when given `countdown`: the pa
 setting, agents start at once. Without `wait: false`, `record.start` returns when every source
 is live (or the start failed), usually within a second and at most 20 s; the panel and a
 counted-down start use `wait: false`, so the app never waits for the sources. `record.cancel` /
-`record.stop` while the sources start stop them and delete the files. In headless sessions (CLI, MCP, tests) the sources are synthetic:
+`record.stop` while the sources start stop them and delete the files.
+
+`record.pause` is refused with "not recording" (also during a countdown and while the sources are
+still starting) or "the recording is already paused"; `record.resume` with "not recording" or "the
+recording is not paused". Both ignore their parameters.
+
+`record.monitor` shows a microphone's level before a recording. Each listed microphone is opened
+on an input of its own (never the one the voice-over uses; where a second input cannot be opened
+there is simply no monitor) and read about every 30 ms: the peak is kept as `level` (0 to 1), the
+samples are dropped. An unknown device is refused by name. `record.start` stops the monitors
+before it opens the microphones, a voice-over too, and they come back by themselves after Stop,
+Cancel or a failed start while the list is still wanted. The Record panel asks for the
+microphones of its rows while it is open. In headless sessions (CLI, MCP, tests) the sources are synthetic:
 `synthetic:display` (1280 × 720, with a 440 Hz tone as system audio), `synthetic:window`,
 `synthetic:camera` and `synthetic:camera2` (640 × 360) and the `Synthetic Input` and
 `Synthetic Input 2` microphones; their frames carry the frame index in the top row so tests check
@@ -331,15 +398,16 @@ sync by pixel. A second microphone opens its own input (`AudioInput::spawn`).
 | `record.panel.camera.<n>.device`, `.device.<i>` | camera row `n` (1-based): its picker (0 = Off) |
 | `record.panel.camera.<n>.quality` (+ `.<i>`), `.mirror`, `.rotate` (+ `.<i>`: 0 Auto, 1 0°, 2 90°, 3 180°, 4 270°), `.offset`, `.remove` | its quality, Mirror, Rotate, offset, `−` |
 | `record.panel.camera.<n>.preview`, `.popout` | its live picture (label `1280×720 @ 30 fps · frame 42`, the turned size), Pop out / Pop in |
-| `record.preview.<n>` | the pop-out window's picture (headless sessions; natively it is its own window) |
+| `record.preview.<n>` | the pop-out window's picture (label as the thumbnail's) |
+| `record.preview.<n>.time`, `.record`, `.pause`, `.level` | the pop-out's bar: the state and time (absent when idle), Record / Stop / Cancel (its label says which), Pause / Resume (while recording), the microphone level (`0.00` to `1.00`). Headless sessions draw the pop-out inside the main window. Natively it is its own window: `ui.elements` lists these with `window: "record.preview.<n>"` and rects in that window's own coordinates, `ui.click` / `ui.move` by id go to that window, and `ui.screenshot {id: "record.preview.<n>"}` captures it |
 | `record.panel.screen.area.<display>`, `record.panel.screen.area`, `record.panel.screen.area.edit` | Area of <display>… (in the Screen list), "Area W×H" (or `drawing`), Edit… |
-| `record.overlay` | the border (label `idle display:1 0,0 3024×1964`: state, target, the framed rectangle in pixels; natively its rect is in desktop points) |
+| `record.overlay` | the border (label `idle display:1 0,0 3024×1964`: state (`idle`, `recording`, `paused`, `drawing`), target, the framed rectangle in pixels; natively its rect is in desktop points) |
 | `record.panel.mic.<n>.device` (+ `.<i>`), `record.panel.mic.<n>.remove` | microphone row `n` |
 | `record.panel.camera.add`, `record.panel.mic.add` | + Camera, + Microphone |
 | `record.panel.name` | Name |
-| `record.panel.record`, `record.panel.cancel`, `record.panel.refresh`, `record.panel.close` | buttons |
+| `record.panel.record`, `record.panel.pause`, `record.panel.cancel`, `record.panel.refresh`, `record.panel.close` | buttons (`.pause` is Pause / Resume: its label says which; in the strip only while recording) |
 | `record.panel.minimize`, `record.panel.restore`, `record.panel.titleClose` | the title row's – (minimize), + (restore, while minimized) and × |
-| `record.panel.counters`, `record.panel.level`, `record.panel.error` | live counters (or the last result), mic level, error |
+| `record.panel.counters`, `record.panel.level`, `record.panel.error` | live counters (or the last result), mic level (`0.00` to `1.00`: the recording's loudest microphone, before a recording the monitored ones), error |
 | `record.panel.settings` | the Settings section header |
 | `record.panel.settings.<key>` (+ `.<i>` for choices), `record.panel.settings.outputFolder.choose` | its fields (`screenFps`, `screenResolution`, `showCursor`, `systemAudio`, `cameraQuality`, `cameraFps`, `cameraMirror`, `cameraRotate`, `codec`, `quality`, `keyframeSeconds`, `hardwareEncoder`, `sampleRate`, `channels`, `audioFormat`, `autoGain`, `countdownSeconds`, `stopAfterMinutes`, `openSequence`, `outputFolder`) |
 | `settings.recording.<key>`, `settings.category.recording` | the same fields in Settings ▸ Recording |
@@ -350,9 +418,22 @@ UI command `window.record` opens the panel. `ui.set {"record": {...}}` merges in
 `null`, `drawing`, `cameras: [{device, quality` = `720p` / `1080p` / `4k` / `native`, `mirror,
 rotate, offsetMs, popout}]`, `mics: [{device}]` (`""` / `default` / name), `name`,
 `settingsOpen`, `overlayDismissed`, `minimized`; a camera's `rotate` is `"auto"` or the degrees); `ui.inspect` shows it under `ui.record`, with `live` (the
-status line or the countdown), `last` (the last result) and `overlay` (the border as shown:
-`{state: idle | recording | drawing, target, rect: [x, y, w, h] pixels, frame: [x, y, w, h]
-desktop points}`, `null` when hidden).
+status line or the countdown), `last` (the last result), `overlay` (the border as shown:
+`{state: idle | recording | paused | drawing, target, rect: [x, y, w, h] pixels, frame: [x, y, w,
+h] desktop points}`, `null` when hidden) and `popouts` (the pop-out windows as shown: `[{device,
+inner: [w, h], picture: [w, h]}]` in points, `inner` the window's inner size as the system reports
+it, picture and bar, and `picture` the picture as drawn; `null` until the window drew its first
+frame).
+
+## Testing without devices
+
+`FILMCRAFT_CAPTURE=synthetic filmcraft --control 9876` starts the desktop app with the synthetic
+sources of the headless sessions instead of the real devices: `synthetic:display`,
+`synthetic:window`, the two synthetic cameras and the `Synthetic Input` microphones (a click every
+250 ms). Nothing asks for a permission, so the Record panel, the previews, the pop-out and a whole
+recording can be driven on a machine without camera access (a terminal that cannot show the
+camera prompt, a build machine). It is a developer aid: only the exact value `synthetic` does
+anything, and without the variable nothing changes.
 
 ## Not there yet
 
@@ -360,9 +441,7 @@ desktop points}`, `null` when hidden).
   9:16 (portrait) mode, visibly also in the Insta360 Link Controller. Set Rotate in the Record
   panel rather than turning the camera back in the vendor app, which then records wrongly. Tracked
   in `openspec/changes/recording/tasks.md` § 8.1.
-- Pop-out preview: Pause / Resume / Stop, a microphone level meter, and a window the size of the
-  camera picture (§ 8.2).
-- Several screens at once, pause / resume, a teleprompter.
+- Several screens at once, a teleprompter.
 - Click tracking and auto zoom (the sidecar's `events` list is ready for a click log).
 - Camera audio (a camera's microphone can be picked as a microphone).
 - Windows (Windows.Graphics.Capture) and Linux (PipeWire) screen and camera capture.

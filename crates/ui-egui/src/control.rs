@@ -16,7 +16,8 @@
 //! - `ui.timeline.hit {x, y}`: what the timeline shows at a point (track, clip, edge, time)
 //! - `ui.timeline.locate {clip, edge?}`: screen point of a clip body/edge (for drags)
 //! - `ui.playback {action: play|stop|toggle, speed?}`
-//! - `ui.screenshot {path?, panel?}`: PNG of the window (or one panel)
+//! - `ui.screenshot {path?, panel?, id?}`: PNG of the window (or one panel, or one element; an
+//!   element of a pop-out window gives that window)
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit`
 
 use std::sync::mpsc::Sender;
@@ -52,6 +53,9 @@ pub enum Outcome {
     Screenshot {
         path: Option<String>,
         crop: Option<[f32; 4]>,
+        /// The window to capture (None: the main one; a pop-out when `id` named one of its
+        /// elements).
+        viewport: Option<egui::ViewportId>,
     },
 }
 
@@ -68,17 +72,36 @@ fn modifiers(p: &Value) -> egui::Modifiers {
     egui::Modifiers { alt: b("alt"), ctrl: b("ctrl"), shift: b("shift"), mac_cmd: cfg!(target_os = "macos") && b("command"), command: b("command") }
 }
 
-/// Resolve a point from `{id}` (element centre) or `{x, y}`.
-fn point(app: &FilmcraftApp, p: &Value) -> Result<egui::Pos2, String> {
+/// Resolve a point from `{id}` (element centre) or `{x, y}`, and the window it is in: the main
+/// one, or the pop-out an element belongs to (the point is then in that window's coordinates).
+fn point_in(app: &FilmcraftApp, p: &Value) -> Result<(egui::Pos2, egui::ViewportId), String> {
     if let Some(id) = p.get("id").and_then(Value::as_str) {
         let e = app.auto.find(id).ok_or_else(|| format!("{RETRY}no element `{id}` (see ui.elements)"))?;
         let fx = p.get("fx").and_then(Value::as_f64).unwrap_or(0.5) as f32;
         let fy = p.get("fy").and_then(Value::as_f64).unwrap_or(0.5) as f32;
-        return Ok(egui::pos2(e.rect[0] + e.rect[2] * fx, e.rect[1] + e.rect[3] * fy));
+        return Ok((egui::pos2(e.rect[0] + e.rect[2] * fx, e.rect[1] + e.rect[3] * fy), e.viewport.unwrap_or(egui::ViewportId::ROOT)));
     }
     let x = p.get("x").and_then(Value::as_f64).ok_or("need `id` or `x`,`y`")?;
     let y = p.get("y").and_then(Value::as_f64).ok_or("need `y`")?;
-    Ok(egui::pos2(x as f32, y as f32))
+    Ok((egui::pos2(x as f32, y as f32), egui::ViewportId::ROOT))
+}
+
+/// Resolve a point of the main window from `{id}` (element centre) or `{x, y}`.
+fn point(app: &FilmcraftApp, p: &Value) -> Result<egui::Pos2, String> {
+    match point_in(app, p)? {
+        (pos, egui::ViewportId::ROOT) => Ok(pos),
+        _ => Err("this element is in a pop-out window: only ui.click and ui.move reach it".into()),
+    }
+}
+
+/// Queue synthetic input for window `viewport`. Input still queued for another window is taken
+/// by that window first (`Err`: try again on a later frame).
+fn aim(app: &mut FilmcraftApp, viewport: egui::ViewportId) -> Result<(), Outcome> {
+    if !app.synthetic.is_empty() && app.synthetic_viewport != viewport {
+        return Err(Outcome::Retry("input for another window is still being processed".into()));
+    }
+    app.synthetic_viewport = viewport;
+    Ok(())
 }
 
 pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
@@ -312,11 +335,14 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             ok(Value::Null)
         }
         "ui.click" | "ui.move" => {
-            let pos = match point(app, p) {
+            let (pos, viewport) = match point_in(app, p) {
                 Ok(p) => p,
                 Err(e) if e.starts_with(RETRY) => return Outcome::Retry(e.trim_start_matches(RETRY).to_string()),
                 Err(e) => return err(e),
             };
+            if let Err(wait) = aim(app, viewport) {
+                return wait;
+            }
             let m = modifiers(p);
             app.synthetic.push(egui::Event::PointerMoved(pos));
             if req.method == "ui.click" {
@@ -342,6 +368,9 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             };
             let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(12).max(2);
             let m = modifiers(p);
+            if let Err(wait) = aim(app, egui::ViewportId::ROOT) {
+                return wait;
+            }
             app.synthetic.push(egui::Event::PointerMoved(a));
             app.synthetic.push(egui::Event::PointerButton { pos: a, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
             for i in 1..=steps {
@@ -358,6 +387,9 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             };
             let dx = p.get("dx").and_then(Value::as_f64).unwrap_or(0.0) as f32;
             let dy = p.get("dy").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            if let Err(wait) = aim(app, egui::ViewportId::ROOT) {
+                return wait;
+            }
             app.synthetic.push(egui::Event::PointerMoved(pos));
             app.synthetic.push(egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
@@ -378,12 +410,18 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             let Some((mut m, key)) = crate::menus::parse_shortcut(name) else { return err(format!("unknown key `{name}`")) };
             let extra = modifiers(p);
             m |= extra;
+            if let Err(wait) = aim(app, egui::ViewportId::ROOT) {
+                return wait;
+            }
             app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m });
             app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m });
             Outcome::AfterInput
         }
         "ui.type" => {
             let Some(text) = s("text") else { return err("missing `text`") };
+            if let Err(wait) = aim(app, egui::ViewportId::ROOT) {
+                return wait;
+            }
             app.synthetic.push(egui::Event::Text(text.to_string()));
             app.synthetic.push(egui::Event::Key { key: egui::Key::F35, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() });
             Outcome::AfterInput
@@ -412,10 +450,16 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
         }
         "ui.screenshot" => {
             let crop = s("panel").and_then(PanelKind::from_name).and_then(|pk| app.auto.find(&format!("panel.{}", pk.id())).map(|e| e.rect));
+            // an element of a pop-out window: that window is captured (all of it for the window's
+            // own element, else the element's part of it)
+            if let Some(e) = s("id").and_then(|id| app.auto.find(id)).filter(|e| e.viewport.is_some()) {
+                let crop = (e.window.as_deref() != Some(e.id.as_str())).then_some(e.rect);
+                return Outcome::Screenshot { path: s("path").map(str::to_string), crop, viewport: e.viewport };
+            }
             let crop = crop.or_else(|| s("id").and_then(|id| app.auto.find(id).map(|e| e.rect)));
             // Bring the window on screen so a frame is presented, without taking keyboard focus.
             app.raise_for_control(ctx);
-            Outcome::Screenshot { path: s("path").map(str::to_string), crop }
+            Outcome::Screenshot { path: s("path").map(str::to_string), crop, viewport: None }
         }
         "ui.resize" => {
             let w = p.get("width").and_then(Value::as_f64).unwrap_or(1600.0) as f32;
@@ -468,6 +512,21 @@ pub fn inspect(app: &FilmcraftApp, ctx: &egui::Context) -> Value {
         "elements": app.auto.previous.len(),
         "dialog": app.dialog.map(|d| format!("{d:?}")),
     })
+}
+
+/// The screenshots among a pass's input events that a control request asked for: (its token,
+/// the picture). eframe hands a finished screenshot to whichever window draws next.
+pub fn screenshots_in(events: &[egui::Event]) -> Vec<(u64, std::sync::Arc<egui::ColorImage>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            egui::Event::Screenshot { user_data, image, .. } => {
+                let token = user_data.data.as_ref().and_then(|d| d.downcast_ref::<u64>()).copied()?;
+                Some((token, image.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Save a screenshot (optionally cropped to a rect in points) as PNG; returns the reply JSON.

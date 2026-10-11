@@ -734,6 +734,8 @@ fn the_popout_is_the_size_of_the_camera_picture_with_a_bar_under_it() {
     }
     assert_eq!(d.element("record.preview.1.record").unwrap()["label"], "● Record");
     assert!(d.element("record.preview.1.time").is_none() && d.element("record.preview.1.pause").is_none());
+    // drawn inside the main window here: its elements are main-window elements
+    assert!(d.element("record.preview.1.record").unwrap().get("window").is_none());
     let (rec, level) = (d.element("record.preview.1.record").unwrap(), d.element("record.preview.1.level").unwrap());
     assert!(level["rect"][0].as_f64().unwrap() >= rec["rect"][0].as_f64().unwrap() + rec["rect"][2].as_f64().unwrap(), "the meter is right of the button");
     d.snapshot("popout-idle-16x9");
@@ -744,7 +746,7 @@ fn the_popout_is_the_size_of_the_camera_picture_with_a_bar_under_it() {
     assert_eq!(size_of(&d.element("record.preview.1").unwrap()), (180.0, 320.0));
     assert_eq!(popouts(&mut d), json!([{"device": "synthetic:camera", "inner": [180.0, 348.0], "picture": [180.0, 320.0]}]));
     let level = d.element("record.preview.1.level").unwrap();
-    assert!(level["rect"][2].as_f64().unwrap() >= 10.0, "the meter still has room in the narrow bar: {level}");
+    assert!(level["rect"][2].as_f64().unwrap() >= 24.0, "the meter still has room in the narrow bar: {level}");
     d.snapshot("popout-idle-9x16");
     // Auto follows a camera that turns itself (its own software, a gimbal)
     d.ok("ui.set", json!({"record": {"cameras": [{"device": "synthetic:camera", "quality": "native", "rotate": "auto", "popout": true}]}}));
@@ -1071,5 +1073,62 @@ fn the_microphone_meter_moves_before_record_is_pressed() {
     d.frames(3);
     assert!(!d.harness.state().ui.record.open);
     assert_eq!(monitored(&mut d), json!([]), "closing the panel stops listening");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Every element of the pop-out's bar lies inside the bar: under the picture, within its width.
+fn bar_fits(d: &mut Driver, state: &str) {
+    let pic = d.element("record.preview.1").unwrap()["rect"].clone();
+    let (x0, w, bottom) = (pic[0].as_f64().unwrap(), pic[2].as_f64().unwrap(), pic[1].as_f64().unwrap() + pic[3].as_f64().unwrap());
+    let elems = d.ok("ui.elements", json!({"prefix": "record.preview.1."}));
+    assert!(elems.as_array().unwrap().len() >= 2, "{state}: {elems}");
+    for e in elems.as_array().unwrap() {
+        let r = &e["rect"];
+        let (x, y, ew, eh) = (r[0].as_f64().unwrap(), r[1].as_f64().unwrap(), r[2].as_f64().unwrap(), r[3].as_f64().unwrap());
+        assert!(x >= x0 && x + ew <= x0 + w + 0.5, "{state}: {} is cut off by the {w} pt wide window: {e}", e["id"]);
+        assert!(y >= bottom && y + eh <= bottom + 28.0 + 0.5, "{state}: {} is not in the bar: {e}", e["id"]);
+        assert!(ew > 0.0 && eh > 0.0, "{state}: {e}");
+    }
+}
+
+#[test]
+fn the_bar_of_a_portrait_popout_fits_in_every_state() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tmp("popout-portrait-bar");
+    let mut d = Driver::new(&dir);
+    let clock = Arc::new(AtomicU64::new(10_000));
+    d.harness.state_mut().session.record.test_clock_ms = Some(clock.clone());
+    d.ok("engine.execute", json!({"command": "record.settings", "params": {"set": {"countdownSeconds": 3}}}));
+    // a camera on its side: the window is 180 points wide
+    pop_out(&mut d, json!(90), json!({"screen": "display:synthetic:display", "mics": [{"device": "default"}]}));
+    wait_label(&mut d, "record.preview.1", |l| l.starts_with("180×320"));
+    d.frames(2);
+    assert_eq!(size_of(&d.element("record.preview.1").unwrap()), (180.0, 320.0));
+    bar_fits(&mut d, "idle");
+    d.click("record.preview.1.record");
+    assert_eq!(label_of(&mut d, "record.preview.1.time"), "Recording in 3…");
+    bar_fits(&mut d, "counting down");
+    clock.store(13_000, Ordering::Release);
+    d.frames(2);
+    assert!(d.wait_recording(), "{}", d.harness.state().ui.record.error);
+    d.frames(2);
+    assert!(label_of(&mut d, "record.preview.1.time").starts_with("● 00:0"));
+    bar_fits(&mut d, "recording");
+    assert!(size_of(&d.element("record.preview.1.level").unwrap()).0 >= 24.0, "while recording the meter is at the right end of the bar");
+    d.click("record.preview.1.pause");
+    assert!(paused(&d));
+    d.frames(2);
+    assert!(label_of(&mut d, "record.preview.1.time").starts_with("Paused 00:0"));
+    assert_eq!(label_of(&mut d, "record.preview.1.pause"), "Resume");
+    bar_fits(&mut d, "paused");
+    d.snapshot("popout-paused-9x16");
+    // the longest state leaves no room at the right end: the meter is a strip along the bar's top
+    let level = d.element("record.preview.1.level").unwrap();
+    assert_eq!(size_of(&level), (180.0, 3.0), "{level}");
+    assert!(meter_moves(&mut d, "record.preview.1.level"), "and it still follows the microphone");
+    d.click("record.preview.1.pause");
+    assert!(!paused(&d));
+    d.click("record.preview.1.record");
+    assert!(!d.harness.state().session.record.recording());
     std::fs::remove_dir_all(&dir).ok();
 }

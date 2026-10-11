@@ -15,9 +15,11 @@
 //!
 //! Automation ids: `record.panel.camera.<n>.preview` (the thumbnail; its label is
 //! `<w>×<h> @ <fps> fps · frame <k>`, or `No picture yet`), `record.panel.camera.<n>.popout`
-//! (Pop out / Pop in) and, in headless sessions (the pop-out is drawn inside the main window),
-//! `record.preview.<n>` (the pop-out's picture) with `.time`, `.record`, `.pause` and `.level`
-//! (its bar). `ui.inspect` lists the windows in `ui.record.popouts` ([`PopoutInfo`]).
+//! (Pop out / Pop in), and for the pop-out `record.preview.<n>` (its picture) with `.time`,
+//! `.record`, `.pause` and `.level` (its bar). Headless sessions draw the pop-out inside the main
+//! window; natively it is its own window, and its elements are listed with `window:
+//! "record.preview.<n>"` and rects in that window's coordinates (`ui.click` by id presses its
+//! buttons there). `ui.inspect` lists the windows in `ui.record.popouts` ([`PopoutInfo`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -135,7 +137,8 @@ pub struct PopoutInfo {
 struct Drawn {
     inner: Option<egui::Vec2>,
     picture: Option<egui::Vec2>,
-    /// Embedded (headless) only: the automation elements (id suffix, rect, label).
+    /// The automation elements (id suffix, rect, label); natively the rects are in the pop-out
+    /// window's own coordinates.
     elems: Vec<(&'static str, Rect, String)>,
 }
 
@@ -160,6 +163,9 @@ pub struct Popout {
     /// Clicks on the bar's buttons, waiting for [`sync`].
     pub actions: Mutex<Vec<PopoutAction>>,
     drawn: Mutex<Drawn>,
+    /// Screenshots (`ui.screenshot`) that arrived in this window's input: eframe hands a
+    /// finished screenshot to whichever window draws next. The main window collects them.
+    shots: Mutex<Vec<(u64, Arc<egui::ColorImage>)>>,
 }
 
 impl Popout {
@@ -177,6 +183,7 @@ impl Popout {
             status: Mutex::new(PopoutStatus::default()),
             actions: Mutex::new(Vec::new()),
             drawn: Mutex::new(Drawn::default()),
+            shots: Mutex::new(Vec::new()),
         }
     }
 }
@@ -209,6 +216,11 @@ impl PreviewCache {
     fn lock(&self) -> std::sync::MutexGuard<'_, PreviewState> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The screenshots the pop-out windows received for the main window (see [`Popout::shots`]).
+pub(crate) fn take_screenshots(cache: &PreviewCache) -> Vec<(u64, Arc<egui::ColorImage>)> {
+    cache.lock().popouts.values().flat_map(|p| std::mem::take(&mut *p.shots.lock().unwrap_or_else(PoisonError::into_inner))).collect()
 }
 
 /// Upload `f` (mirrored / rotated) into `slot` unless it already holds that frame.
@@ -361,6 +373,7 @@ pub fn sync(app: &mut FilmcraftApp, ctx: &egui::Context) {
         st.popouts.retain(|d, _| rows_out.iter().any(|(_, c)| &c.device == d));
     }
     let status = if rows_out.is_empty() { PopoutStatus::default() } else { super::record::popout_status(app) };
+    let embedded = ctx.embed_viewports();
     let mut shown: Vec<PopoutInfo> = Vec::new();
     for (i, c) in &rows_out {
         let Some(tap) = filmcraft_engine::record_preview::preview_of(&app.session, &c.device) else { continue };
@@ -387,8 +400,15 @@ pub fn sync(app: &mut FilmcraftApp, ctx: &egui::Context) {
         *pop.status.lock().unwrap_or_else(PoisonError::into_inner) = status.clone();
         show_popout(ctx, &pop, i + 1);
         let mut drawn = pop.drawn.lock().unwrap_or_else(PoisonError::into_inner);
-        for (suffix, rect, label) in drawn.elems.drain(..) {
-            app.auto.add(&format!("record.preview.{}{suffix}", i + 1), rect, &label);
+        let window = format!("record.preview.{}", i + 1);
+        // natively the pop-out draws on its own passes: its elements stay until it draws again
+        let elems: Vec<(&'static str, Rect, String)> = if embedded { std::mem::take(&mut drawn.elems) } else { drawn.elems.clone() };
+        for (suffix, rect, label) in elems {
+            if embedded {
+                app.auto.add(&format!("{window}{suffix}"), rect, &label);
+            } else {
+                app.auto.add_in(&format!("{window}{suffix}"), rect, &label, &window, viewport_id(&c.device));
+            }
         }
         shown.push(PopoutInfo { device: c.device.clone(), inner: drawn.inner.map(|s| [s.x, s.y]), picture: drawn.picture.map(|s| [s.x, s.y]) });
     }
@@ -420,6 +440,10 @@ fn viewport_id(device: &str) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("record-camera-preview", device))
 }
 
+/// The narrowest microphone meter drawn at the right end of the bar; with less room left (a
+/// portrait picture's bar while paused) the meter is a thin strip along the bar's top edge.
+const METER_MIN: f32 = 24.0;
+
 /// The control bar under the pop-out's picture, left to right: the state and time, Record / Stop
 /// / Cancel, Pause / Resume, and the microphone level in what is left. A click is queued for
 /// [`sync`]; returns the automation elements (id suffix, rect, label).
@@ -429,7 +453,9 @@ fn bar(ui: &mut egui::Ui, rect: Rect, st: &PopoutStatus, actions: &Mutex<Vec<Pop
     let mut clicked: Option<PopoutAction> = None;
     let inner = rect.shrink2(vec2(6.0, 2.0));
     ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        // compact: the bar of a portrait picture is 180 points wide
+        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.spacing_mut().button_padding = vec2(5.0, 1.0);
         if !st.label.is_empty() {
             let color = if st.paused {
                 AMBER
@@ -455,8 +481,9 @@ fn bar(ui: &mut egui::Ui, rect: Rect, st: &PopoutStatus, actions: &Mutex<Vec<Pop
             }
         }
         // the meter takes what is left of the bar
-        let w = ui.available_width().max(10.0);
-        let (r, _) = ui.allocate_exact_size(vec2(w, 6.0), Sense::hover());
+        let left = ui.available_width();
+        let r =
+            if left >= METER_MIN { ui.allocate_exact_size(vec2(left, 6.0), Sense::hover()).0 } else { Rect::from_min_size(rect.min, vec2(rect.width(), 3.0)) };
         let level = st.level.unwrap_or(0.0);
         super::record::level_meter(ui.painter(), r, level, st.accent);
         elems.push((".level", r, format!("{level:.2}")));
@@ -491,6 +518,18 @@ fn show_popout(ctx: &egui::Context, pop: &Arc<Popout>, n: usize) {
             p.closed.store(true, Ordering::Release);
         }
         let embedded = class == egui::ViewportClass::EmbeddedWindow;
+        if !embedded {
+            let shots = ui.input(|i| crate::control::screenshots_in(&i.raw.events));
+            if !shots.is_empty() {
+                let mut kept = p.shots.lock().unwrap_or_else(PoisonError::into_inner);
+                // a few at most wait for the main window
+                if kept.len() < 8 {
+                    kept.extend(shots);
+                }
+                drop(kept);
+                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+            }
+        }
         let orient = *p.orient.lock().unwrap_or_else(PoisonError::into_inner);
         // the picture at the default long side, for the aspect shown now
         let want = shown_size(&p.tap, orient.1).map(|s| (s, popout_picture(s, POPOUT_LONG_SIDE)));
@@ -527,11 +566,8 @@ fn show_popout(ctx: &egui::Context, pop: &Arc<Popout>, n: usize) {
         let mut drawn = p.drawn.lock().unwrap_or_else(PoisonError::into_inner);
         drawn.inner = Some(inner);
         drawn.picture = Some(picture.size());
-        drawn.elems.clear();
-        if embedded {
-            elems.insert(0, ("", picture, label));
-            drawn.elems = elems;
-        }
+        elems.insert(0, ("", picture, label));
+        drawn.elems = elems;
         drop(drawn);
         let fps = p.tap.format().map_or(30, |f| f.fps).clamp(1, 60);
         ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(1.0 / f64::from(fps)));

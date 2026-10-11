@@ -16,6 +16,10 @@
 //! with unsaved changes the app asks to recover them; `--recover` recovers the newest without
 //! asking, `--no-recover` starts without asking (the changes stay available via File ▸ Recover
 //! Unsaved Changes…).
+//!
+//! `FILMCRAFT_CAPTURE=synthetic` (a developer aid) makes Window ▸ Record use the engine's
+//! generated screen, cameras and microphone instead of the real devices, to drive the Record
+//! panel on a machine without camera permission (docs/recording.md, "Testing without devices").
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -131,6 +135,14 @@ fn main() -> eframe::Result {
             if filmcraft_engine::record::registered_video_factory().is_none() {
                 session.record.factory = Some(std::sync::Arc::new(filmcraft_engine::record::UnavailableFactory));
             }
+            if synthetic_capture(std::env::var_os("FILMCRAFT_CAPTURE").as_deref()) {
+                // a developer aid: generated pictures and sound instead of the real devices
+                eprintln!(
+                    "filmcraft: FILMCRAFT_CAPTURE=synthetic: Window ▸ Record uses generated sources, not this computer's screen, cameras and microphones"
+                );
+                session.record.factory = Some(std::sync::Arc::new(filmcraft_engine::record::SyntheticFactory::default()));
+                session.voiceover.input = Some(Box::new(filmcraft_engine::voiceover::SyntheticInput::clicks()));
+            }
             let project = files.iter().find(|f| f.ends_with(".fcproj")).cloned();
             if let Some(p) = project {
                 if let Err(e) = session.execute("file.open", json!({"path": p})) {
@@ -225,6 +237,12 @@ fn main() -> eframe::Result {
     started
 }
 
+/// Whether `FILMCRAFT_CAPTURE` asks for the engine's generated screen, cameras and microphone
+/// (`synthetic`) instead of the real devices. Any other value, or none, changes nothing.
+fn synthetic_capture(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "synthetic")
+}
+
 /// Open a file in its default application, or reveal it in the file manager (Edit Original,
 /// Reveal Log Files).
 fn open_path(path: &str, reveal: bool) -> Result<(), String> {
@@ -289,5 +307,16 @@ mod tests {
         assert!(!log::log_enabled!(log::Level::Info));
         let hardware = super::register_hardware_decoders();
         assert_eq!(filmcraft_platform::registered(), cfg!(any(target_os = "macos", target_os = "windows")), "{hardware:?}");
+    }
+
+    /// Only `FILMCRAFT_CAPTURE=synthetic` swaps the recording sources; without it nothing changes.
+    #[test]
+    fn only_the_exact_value_asks_for_synthetic_capture() {
+        use std::ffi::OsStr;
+        assert!(super::synthetic_capture(Some(OsStr::new("synthetic"))));
+        for other in ["", "Synthetic", "synthetic ", "1", "real", "true"] {
+            assert!(!super::synthetic_capture(Some(OsStr::new(other))), "{other:?}");
+        }
+        assert!(!super::synthetic_capture(None));
     }
 }

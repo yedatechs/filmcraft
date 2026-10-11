@@ -194,13 +194,17 @@ pub struct FilmcraftApp {
     deferred: Vec<(ControlRequest, f64)>,
     last_ui_time: f64,
     pub(crate) synthetic: Vec<egui::Event>,
+    /// The window the queued synthetic input is for: the main one, or a pop-out a control
+    /// request named an element of.
+    pub(crate) synthetic_viewport: egui::ViewportId,
     /// BS.1770 loudness of the programme as it plays, and the next sample position to feed.
     pub(crate) loudness: Option<(filmcraft_audio_dsp::LoudnessMeter, i64)>,
     /// Status message last shown and when it first appeared (messages expire after a few seconds).
     status_seen: (String, f64),
     /// Screenshots waiting for their frame: (token, path, crop, reply, give-up time).
     pending_screenshots: Vec<(u64, Option<String>, Option<[f32; 4]>, Sender<Value>, f64)>,
-    queued_screenshots: Vec<(u64, f64, u32)>,
+    /// Screenshots to ask for: (token, not before, frames waited, the window when not the main one).
+    queued_screenshots: Vec<(u64, f64, u32, Option<egui::ViewportId>)>,
     /// A paused monitor drew a stand-in (nearest cached) picture last frame: its exact frame is
     /// still decoding.
     pub(crate) monitor_inexact: bool,
@@ -402,6 +406,7 @@ impl FilmcraftApp {
             deferred: Vec::new(),
             last_ui_time: 0.0,
             synthetic: Vec::new(),
+            synthetic_viewport: egui::ViewportId::ROOT,
             loudness: None,
             status_seen: (String::new(), 0.0),
             pending_screenshots: Vec::new(),
@@ -1148,11 +1153,11 @@ impl FilmcraftApp {
                     }
                 }
                 control::Outcome::AfterInput => self.input_waiters.push(reply),
-                control::Outcome::Screenshot { path, crop } => {
+                control::Outcome::Screenshot { path, crop, viewport } => {
                     let token = self.next_token;
                     self.next_token += 1;
                     let settle = ctx.input(|i| i.time) + 0.25;
-                    self.queued_screenshots.push((token, settle, 0));
+                    self.queued_screenshots.push((token, settle, 0, viewport));
                     self.pending_screenshots.push((token, path, crop, reply, settle + SCREENSHOT_TIMEOUT_S));
                 }
             }
@@ -1166,11 +1171,15 @@ impl FilmcraftApp {
     fn issue_screenshots(&mut self, ctx: &egui::Context, settled: bool) {
         let now = ctx.input(|i| i.time);
         let mut any = false;
-        self.queued_screenshots.retain_mut(|(token, at, frames)| {
+        self.queued_screenshots.retain_mut(|(token, at, frames, viewport)| {
             *frames += 1;
             any = true;
             if now >= *at && *frames >= 3 && (settled || now >= *at + SCREENSHOT_SETTLE_MAX_S) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(*token)));
+                let shot = egui::ViewportCommand::Screenshot(egui::UserData::new(*token));
+                match viewport {
+                    Some(v) => ctx.send_viewport_cmd_to(*v, shot),
+                    None => ctx.send_viewport_cmd(shot),
+                }
                 false
             } else {
                 true
@@ -1197,19 +1206,9 @@ impl FilmcraftApp {
         if self.pending_screenshots.is_empty() {
             return;
         }
-        let events: Vec<_> = ctx.input(|i| {
-            i.raw
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Screenshot { user_data, image, .. } => {
-                        let token = user_data.data.as_ref().and_then(|d| d.downcast_ref::<u64>()).copied()?;
-                        Some((token, image.clone()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        });
+        let mut events: Vec<_> = ctx.input(|i| control::screenshots_in(&i.raw.events));
+        // a screenshot is handed to whichever window draws next: the pop-outs pass theirs on
+        events.extend(panels::record_preview::take_screenshots(&self.ui.record.preview));
         for (token, image) in events {
             if let Some(i) = self.pending_screenshots.iter().position(|(t, ..)| *t == token) {
                 let (_, path, crop, reply, _) = self.pending_screenshots.remove(i);
@@ -1494,7 +1493,9 @@ impl eframe::App for FilmcraftApp {
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if !self.synthetic.is_empty() {
+        // The hook runs for every window's pass (the main window and each pop-out). Queued input
+        // is for one window: it goes into that window's passes only, never split between two.
+        if !self.synthetic.is_empty() && raw_input.viewport_id == self.synthetic_viewport {
             // Pointer events go one per frame so egui sees press → moves → release as a real drag
             // (all in one frame reads as a click); key/text runs go together up to a key release.
             let pointer = |e: &egui::Event| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. });
@@ -1535,6 +1536,15 @@ impl eframe::App for FilmcraftApp {
         }
         self.timeline_still = if self.ui.timeline.animating() { 0 } else { self.timeline_still.saturating_add(1) };
         let had_synthetic = !self.synthetic.is_empty();
+        if self.synthetic_viewport != egui::ViewportId::ROOT {
+            if self.synthetic.is_empty() {
+                self.synthetic_viewport = egui::ViewportId::ROOT;
+            } else if !ctx.input(|i| i.raw.viewports.contains_key(&self.synthetic_viewport)) {
+                // the pop-out closed before it took its input: nothing waits for it forever
+                self.synthetic.clear();
+                self.synthetic_viewport = egui::ViewportId::ROOT;
+            }
+        }
         self.drain_control(ctx);
         if !self.synthetic.is_empty() && !had_synthetic {
             // Occluded macOS windows stop running `ui`; bring the window forward (without taking
@@ -1543,6 +1553,7 @@ impl eframe::App for FilmcraftApp {
         }
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
+            ctx.request_repaint_of(self.synthetic_viewport);
         } else if !self.input_waiters.is_empty() {
             for w in self.input_waiters.drain(..) {
                 let _ = w.send(json!({"ok": true, "result": null}));
