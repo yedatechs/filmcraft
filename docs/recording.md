@@ -21,7 +21,7 @@ Window ▸ Record, or the red dot at the right end of the Program monitor's tran
 |---|---|
 | Screen | Off, a display (name and pixel size), Area of <display>… (drag a part of it: see Border and areas), or a window (app — title); with an area: "Area 1280×720" and Edit… |
 | Camera rows | per camera: its live picture (see Preview), the camera (or Off), Quality 720p / 1080p / 4K / Native (the camera's best), `−` (remove the row), Mirror, Rotate Auto / 0° / 90° / 180° / 270°, Offset … ms (see Sync), Pop out |
-| Microphone rows | per microphone: Off, Default Input (Settings ▸ Audio Hardware, or the Voice-Over source), or a device; `−`. The level meter under the buttons follows the chosen microphones as soon as the panel is open, before Record is pressed |
+| Microphone rows | per microphone: Off, Default Input (Settings ▸ Audio Hardware, or the Voice-Over source), or a device; `−`. The level meter under the buttons follows the recording's microphones; with Settings ▸ Audio ▸ Level before recording on, also the chosen microphones as soon as the panel is open, before Record is pressed |
 | + Camera / + Microphone | add a row (at most four of each); a new camera row takes the next camera not chosen yet and the camera defaults of the settings |
 | Name | the recording's name (empty: `Recording <n>`) |
 | ● Record / ■ Stop 00:12 | starts (after the countdown); reads `Starting screen capture…` (disabled) until every source is live, then becomes Stop with the recorded time; while paused it is amber and reads `■ Stop Paused 00:12` |
@@ -33,9 +33,11 @@ Window ▸ Record, or the red dot at the right end of the Program monitor's tran
 
 While recording the panel stays open, shows frames and dropped frames per video source and the
 microphone level (the loudest microphone), and the status bar reads `Recording · 00:12 · screen
-360 f / camera 358 f` (`Paused · 00:12 · …` while paused). Before a recording the same meter shows
-the microphones of the panel's rows: FilmCraft listens to them while the panel is open (macOS shows
-its microphone indicator) and stops when the panel closes.
+360 f / camera 358 f` (`Paused · 00:12 · …` while paused). Before a recording the meter is empty
+and no microphone is open, unless Settings ▸ Recording ▸ Audio ▸ Level before recording is on
+(off by default): then the same meter shows the microphones of the panel's rows, FilmCraft
+listens to them while the panel is open (macOS shows its microphone indicator the whole time)
+and stops when the panel closes.
 During the countdown the button and the status bar read `Recording in 3…`; the button or Esc
 cancels it. After it (or at once without one) the sources start, and until every one of them
 delivers, the button (disabled) and the status bar read `Starting screen capture…` (`Starting the
@@ -60,7 +62,7 @@ field) and put back in range when the preferences are loaded.
 | Screen | Resolution (`screenResolution`) | Native / 1440p / 1080p / 720p | Native | scales a taller screen down to that many rows, keeping its aspect (ScreenCaptureKit `width` / `height`; a source that cannot scale is scaled before encoding) |
 | Screen | Show cursor (`showCursor`) | on / off | on | ScreenCaptureKit `showsCursor` |
 | Screen | System audio (`systemAudio`) | on / off | off | the sound the system plays (ScreenCaptureKit `capturesAudio`, macOS 13+, FilmCraft's own sound left out) to `… - System Audio.wav` on the next free audio track; only with a screen source (greyed in the panel without one) |
-| Camera | Quality (`cameraQuality`) | 720p / 1080p / 4K / Native | 1080p | the default of new camera rows: the AVFoundation session preset |
+| Camera | Quality (`cameraQuality`) | 720p / 1080p / 4K / Native | 1080p | the default of new camera rows: the camera's own landscape format nearest that size (see Camera format) |
 | Camera | Frame rate (`cameraFps`) | 24 / 30 / 60 | 30 | `activeVideoMin/MaxFrameDuration` when the camera's format can do it, else the camera's best (said in the sidecar) |
 | Camera | Mirror (`cameraMirror`) | on / off | off | the default of new camera rows (see Sync) |
 | Camera | Rotate (`cameraRotate`) | Auto / 0 / 90 / 180 / 270 | Auto | the default of new camera rows: `"auto"` follows the camera's own orientation, a number of degrees turns it clockwise; written into the file's track header (see Rotate) |
@@ -72,6 +74,7 @@ field) and put back in range when the preferences are loaded.
 | Audio | Channels (`channels`) | Mono / Stereo | Mono | mono = the Voice-Over input channel; stereo = the device's first two channels (a mono device twice) |
 | Audio | Format (`audioFormat`) | 16-bit / 24-bit / 32-bit float WAV | 32-bit float | the WAV sample format of microphones and system audio |
 | Audio | Auto gain (`autoGain`) | on / off | off | a running-RMS normaliser (about 0.3 s) toward −18 dBFS that moves at most 2 dB per second and at most ±20 dB, holds during silence (below −60 dBFS) and limits peaks to full scale; applied to the written microphone file only, never to the level meter; marked in the sidecar |
+| Audio | Level before recording (`levelBeforeRecording`) | on / off | off | the level meter (panel and pop-out) moves before Record is pressed: the panel listens to the microphones of its rows while it is open (`record.monitor`), so macOS shows its microphone indicator for as long as the panel is; off: no microphone is opened before Record |
 | Behaviour | Countdown (`countdownSeconds`) | Off / 3 / 5 / 10 s | 3 s | the panel's Record button counts down (`Recording in 3…`); Esc or the button cancels |
 | Behaviour | Stop after (`stopAfterMinutes`) | Off (0) or 1–180 minutes | Off | stops (and builds the sequence) by itself |
 | Behaviour | Open the sequence after Stop (`openSequence`) | on / off | on | off: the new sequence is only selected in the Project panel |
@@ -240,6 +243,29 @@ mid-way: the file keeps the orientation of the start, the sidecar records the ch
 Auto does not touch Mirror: a selfie camera's mirror is a preference, so Mirror stays the row's
 own choice (a Horizontal Flip effect on the clip; the file stays as the camera saw it).
 
+## Camera format
+
+FilmCraft chooses the camera's format itself, from the formats the camera lists (`record.devices`
+shows them): the one nearest the row's Quality (720p = 1280 × 720, 1080p = 1920 × 1080, 4K =
+3840 × 2160, a size the camera lacks: the nearest, the larger of two equally near; Native = the
+most pixels), **always a landscape one**, then one that can do the frame rate, in the pixel format
+macOS prefers for video. It is set as the device's active format before the camera starts, and
+the capture session is told to leave the device alone (`InputPriority`; the device's
+configuration lock is held until the session runs). When another app holds that lock the camera
+records as it is, its format untouched.
+
+FilmCraft used to ask the capture session for a size ("1920 × 1080") and let macOS find the
+format. macOS takes the first format with those two numbers in either order, and an Insta360
+Link 2C lists 1080 × 1920 before 1920 × 1080. Selecting a portrait format is how that camera is
+switched to its portrait mode, so every preview and every recording turned it to 9:16, visibly
+also in the Insta360 Link Controller.
+
+A camera's own portrait mode is still there when you want it: ask for a portrait size
+(`cameras: [{device, width: 1080, height: 1920}]`). The Record panel's qualities are all
+landscape. A camera that only has portrait formats records in the nearest of those. The size a
+camera really runs at is in its thumbnail's label and in `record.preview` (`cameras: [{width,
+height, fps}]`), and in the camera's sidecar after a recording.
+
 ## Preview
 
 While the Record panel is open, each camera row shows its camera live in a 16:9 box about
@@ -318,29 +344,45 @@ window, the display scaled to fit, so `ui.drag` on `record.overlay` draws an are
 
 ## Permissions (macOS)
 
-**A rebuilt binary that stops recording the screen.** macOS keeps a Screen Recording record for a
-bare `filmcraft` binary's path, bound to the build that first recorded; after a rebuild every
-screen start stalls (the start is tried twice, then fails with this advice) while listing the
-screens still works. Remove the "FilmCraft" entry in System Settings ▸ Privacy & Security ▸ Screen
-& System Audio Recording (keep the terminal's entry) and start FilmCraft again; the terminal's own
-permission then covers it. `cargo xtask bundle`'s app has the same per-build binding through its
-ad-hoc signature.
+macOS ties Screen Recording (which also covers system audio), Camera and Microphone to the app
+that asks, and recognises an app by its code signature.
+
+**Use the app bundle, signed with the local identity.** Once per Mac:
+
+```sh
+cargo xtask dev-identity                        # a self-signed "FilmCraft Dev Signing" certificate in a keychain file of its own
+cargo xtask bundle --reset-permissions --open   # build, sign, forget the records of earlier builds, start FilmCraft Dev
+```
+
+Allow Camera and Microphone when macOS asks, and turn FilmCraft Dev on under System Settings ▸
+Privacy & Security ▸ Screen & System Audio Recording (that one takes effect after FilmCraft is
+restarted). From then on a plain `cargo xtask bundle` signs every build with that identity and the
+permissions stay: to macOS each build is the same app (bundle id `ai.storyteller.filmcraft.dev`,
+signed by that certificate). [contributing.md](contributing.md) "macOS app bundle" says what the
+identity is, where it lives and how to remove it.
+
+Without the identity the bundle is signed ad hoc and every rebuild is a new app to macOS: Camera
+and Microphone are asked again, and Screen Recording stays listed as allowed while every screen
+start stalls (the start is tried twice, then fails with this advice) although listing the screens
+still works. A bare `target/release/filmcraft` behaves the same once macOS has a Screen Recording
+record for it. The remedy for both is to remove the app's entry under Screen & System Audio
+Recording (for the bundle: `cargo xtask bundle --reset-permissions`).
+
+Started from a terminal, the bare binary uses the terminal's permissions: macOS asks for (and
+lists) the terminal app, and a terminal that declares no camera usage description (the Claude
+desktop app's terminal pane, for one) never shows the camera prompt at all.
 
 A camera or screen that rejects its configuration raises an Objective-C exception inside macOS;
 FilmCraft catches it (`docs/adr/0002-platform-capture-ffi.md` §4) and shows it in the Record panel
 as that source's error ("starting the camera: NSInvalidArgumentException …") instead of quitting.
 If you see one, the message is what to report.
 
-macOS asks once per app for Screen Recording (which also covers system audio), Camera and
-Microphone. FilmCraft checks first and never waits on the system: when a permission is missing it
-shows the system prompt (the first time) and the start fails with a message naming the pane, for
-example "open System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording, allow it,
-then press Record again". When FilmCraft is started from a terminal, macOS asks for (and lists)
-the terminal app instead, and a terminal that declares no camera usage description (the Claude
-desktop app's terminal pane, for one) never shows the camera prompt at all. Run the app bundle
-instead (`cargo xtask bundle`, then `open -a "target/release/FilmCraft Dev.app"`, see
-[contributing.md](contributing.md) "macOS app bundle"), so the permissions are FilmCraft's own.
-Screen Recording takes effect after FilmCraft is restarted.
+FilmCraft checks a permission first and does not wait on the system for the screen or a camera:
+when one is missing it shows the system prompt (the first time) and the start fails with a
+message naming the pane, for example "open System Settings ▸ Privacy & Security ▸ Screen & System
+Audio Recording, allow it, then press Record again". The microphone is the exception, for now:
+the first time an app lists its microphones macOS shows the Microphone prompt and FilmCraft's
+window does not respond until it is answered.
 `record.devices` lists no displays until Screen Recording is allowed and says why in `error`; it
 also says so when macOS lists no display because the display is asleep or the screen is locked
 (wake it and press Refresh). FilmCraft never changes System Settings.
@@ -383,7 +425,7 @@ there is simply no monitor) and read about every 30 ms: the peak is kept as `lev
 samples are dropped. An unknown device is refused by name. `record.start` stops the monitors
 before it opens the microphones, a voice-over too, and they come back by themselves after Stop,
 Cancel or a failed start while the list is still wanted. The Record panel asks for the
-microphones of its rows while it is open. In headless sessions (CLI, MCP, tests) the sources are synthetic:
+microphones of its rows while it is open and the Level before recording setting is on. In headless sessions (CLI, MCP, tests) the sources are synthetic:
 `synthetic:display` (1280 × 720, with a 440 Hz tone as system audio), `synthetic:window`,
 `synthetic:camera` and `synthetic:camera2` (640 × 360) and the `Synthetic Input` and
 `Synthetic Input 2` microphones; their frames carry the frame index in the top row so tests check
@@ -409,7 +451,7 @@ sync by pixel. A second microphone opens its own input (`AudioInput::spawn`).
 | `record.panel.minimize`, `record.panel.restore`, `record.panel.titleClose` | the title row's – (minimize), + (restore, while minimized) and × |
 | `record.panel.counters`, `record.panel.level`, `record.panel.error` | live counters (or the last result), mic level (`0.00` to `1.00`: the recording's loudest microphone, before a recording the monitored ones), error |
 | `record.panel.settings` | the Settings section header |
-| `record.panel.settings.<key>` (+ `.<i>` for choices), `record.panel.settings.outputFolder.choose` | its fields (`screenFps`, `screenResolution`, `showCursor`, `systemAudio`, `cameraQuality`, `cameraFps`, `cameraMirror`, `cameraRotate`, `codec`, `quality`, `keyframeSeconds`, `hardwareEncoder`, `sampleRate`, `channels`, `audioFormat`, `autoGain`, `countdownSeconds`, `stopAfterMinutes`, `openSequence`, `outputFolder`) |
+| `record.panel.settings.<key>` (+ `.<i>` for choices), `record.panel.settings.outputFolder.choose` | its fields (`screenFps`, `screenResolution`, `showCursor`, `systemAudio`, `cameraQuality`, `cameraFps`, `cameraMirror`, `cameraRotate`, `codec`, `quality`, `keyframeSeconds`, `hardwareEncoder`, `sampleRate`, `channels`, `audioFormat`, `autoGain`, `levelBeforeRecording`, `countdownSeconds`, `stopAfterMinutes`, `openSequence`, `outputFolder`) |
 | `settings.recording.<key>`, `settings.category.recording` | the same fields in Settings ▸ Recording |
 | `program.transport.record` | the Program monitor's red dot |
 
@@ -437,10 +479,8 @@ anything, and without the variable nothing changes.
 
 ## Not there yet
 
-- **Known issue (2026-10-10):** opening a capture session can switch an Insta360 Link 2C to its
-  9:16 (portrait) mode, visibly also in the Insta360 Link Controller. Set Rotate in the Record
-  panel rather than turning the camera back in the vendor app, which then records wrongly. Tracked
-  in `openspec/changes/recording/tasks.md` § 8.1.
+- A Portrait choice in the panel for cameras with a portrait mode of their own (today only
+  `record.start` / `record.preview` with a portrait `width` / `height`; see Camera format).
 - Several screens at once, a teleprompter.
 - Click tracking and auto zoom (the sidecar's `events` list is ready for a click log).
 - Camera audio (a camera's microphone can be picked as a microphone).

@@ -18,6 +18,7 @@
 
 mod bundle;
 mod ico;
+mod identity;
 mod version;
 
 use std::process::{Command, ExitCode};
@@ -491,12 +492,16 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             bundle::run_bundle(&root(), &rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
+        "dev-identity" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            identity::run_identity(&rest.iter().map(String::as_str).collect::<Vec<_>>())
+        }
         "ico" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
         _ => Err(
-            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|bundle [--release|--debug] [--open] [--release-id]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
+            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|bundle [--release|--debug] [--open] [--release-id] [--sign IDENTITY|--adhoc] [--reset-permissions]|dev-identity [--remove]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
                 .into(),
         ),
     };

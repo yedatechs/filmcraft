@@ -141,3 +141,22 @@ The pop-out preview window SHALL be sized to the camera picture as shown (after 
 #### Scenario: The level before and after a recording
 - **WHEN** the default synthetic microphone is monitored, a recording with it is started and stopped
 - **THEN** `monitor` shows the microphone's level moving before the recording, is empty while it runs (the recording's source has the level), and shows the level again after Stop without being asked for again
+
+### Requirement: FilmCraft chooses the camera's format, never a portrait one unasked
+A camera SHALL be started in a format chosen from the device's own list: landscape unless the request's size is portrait (height above width), then the size nearest the one asked for (the larger of two equally near; without a size the most pixels), then a format that can do the frame rate, then the system's preferred pixel format, then the device's order. The capture session SHALL NOT be given a size preset, and SHALL leave the device's format alone (`InputPriority`, the configuration lock held until the session runs). A camera with no format the wanted way up records in the nearest of the others. When the device cannot be locked the camera records in its current format.
+
+#### Scenario: A webcam that lists portrait formats first
+- **WHEN** a camera whose formats are listed as 1080x1920 before 1920x1080 (an Insta360 Link 2C) is previewed or recorded at 1080p
+- **THEN** the format selected is 1920x1080, the camera stays in landscape mode, and the file is 1920 wide
+
+#### Scenario: Portrait on request
+- **WHEN** `record.start` asks that camera for `width: 1080, height: 1920`
+- **THEN** the format selected is 1080x1920
+
+### Requirement: The dev bundle keeps its permissions across rebuilds
+`cargo xtask bundle` SHALL sign the bundle with the local identity of `cargo xtask dev-identity` when it exists (else with `--sign` / `FILMCRAFT_SIGN_IDENTITY`, else ad hoc and say what that costs), so the bundle's designated requirement names the bundle id and the certificate, not the build. The identity SHALL live in a keychain file of its own; the login keychain, the keychain search list and the trust settings SHALL NOT be changed.
+
+#### Scenario: Two builds
+- **WHEN** two different binaries are signed with the identity
+- **THEN** both have the same designated requirement and each satisfies it
+

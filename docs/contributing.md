@@ -69,12 +69,14 @@ glyphs skip when it is empty; when you touch fonts, run the gates both with and 
 ### macOS app bundle
 
 ```sh
+cargo xtask dev-identity      # once per Mac: a local signing identity, so macOS keeps the app's permissions
 cargo xtask bundle            # release build → "target/release/FilmCraft Dev.app" (--debug: target/debug/)
 cargo xtask bundle --open     # …and open it
 open -a "target/release/FilmCraft Dev.app" --args --control 9876 --data-dir /tmp/fc
 ```
 
-`cargo xtask bundle [--release|--debug] [--open] [--release-id]` (macOS only; elsewhere it does
+`cargo xtask bundle [--release|--debug] [--open] [--release-id] [--sign IDENTITY|--adhoc]
+[--reset-permissions]` (macOS only; elsewhere it does
 nothing) builds `filmcraft` and assembles `<target>/<profile>/FilmCraft Dev.app` (`CARGO_TARGET_DIR`
 is honoured): `Contents/MacOS/filmcraft`, `Contents/Resources/filmcraft.icns`, a generated
 `Info.plist` (`xtask/src/bundle.rs`: bundle id `ai.storyteller.filmcraft.dev` and the name
@@ -82,16 +84,40 @@ is honoured): `Contents/MacOS/filmcraft`, `Contents/Resources/filmcraft.icns`, a
 `ai.storyteller.filmcraft` and name `FilmCraft.app` the bundle takes only under `--release-id`; the
 workspace version; macOS 12.3+;
 camera and microphone usage descriptions, `.fcproj` and media document types) and `PkgInfo`. It
-copies nothing else (fonts and other assets are embedded) and signs the bundle ad hoc
-(`codesign --force --deep --sign -`). Options after `--args` reach FilmCraft as usual.
+copies nothing else (fonts and other assets are embedded) and signs the bundle (below). Options
+after `--args` reach FilmCraft as usual.
 
-**Permissions.** macOS attributes Camera, Microphone and Screen Recording to the app that started
-FilmCraft: from a terminal it asks for (and lists) the terminal, and a terminal that declares no
-camera usage description (such as the Claude desktop app's terminal pane) can never show the camera
-prompt. Started as `FilmCraft.app`, the permissions are FilmCraft's own. An ad-hoc signature
-changes with every build, so macOS asks for them again after a rebuild until a Developer ID signs
-the app (release builds, [releasing.md](releasing.md)). The bundle is for local use;
-`packaging/macos/package.sh` makes the release DMG.
+**Permissions and the signature.** macOS attributes Camera, Microphone and Screen Recording to
+the app that started FilmCraft: from a terminal it asks for (and lists) the terminal, and a
+terminal that declares no camera usage description (such as the Claude desktop app's terminal
+pane) can never show the camera prompt. Started as the bundle, the permissions are FilmCraft's
+own, and macOS recognises the app by its signature's *designated requirement*
+(`codesign -d -r- "target/release/FilmCraft Dev.app"`, printed by the bundle command):
+
+| Signed | Requirement | After a rebuild |
+|---|---|---|
+| ad hoc (no identity, or `--adhoc`) | `cdhash H"…"`: this exact build | a new app: Camera and Microphone are asked again; Screen Recording stays listed as allowed but every screen start stalls until its entry is removed |
+| with an identity | `identifier "ai.storyteller.filmcraft.dev" and certificate leaf = H"…"` | the same app: every permission stays |
+
+`cargo xtask dev-identity` makes the identity once (`xtask/src/identity.rs`): a self-signed
+certificate named "FilmCraft Dev Signing" (code signing only, ten years) whose private key is in a
+keychain file of its own, `~/Library/Application Support/FilmCraft Dev Signing/signing.keychain-db`
+(`FILMCRAFT_DEV_SIGNING_DIR` moves it), next to that keychain's random password (`password`,
+readable by you only; the bundle command unlocks the keychain with it, since it locks at logout).
+Your login keychain, the keychain search list and the system's trust settings are not touched,
+and the certificate is no trust anchor: all it does is make two builds recognisable as one app.
+Anything that can run programs as you can sign with it, as with any development certificate.
+`cargo xtask dev-identity --remove` deletes the keychain and the password (the next bundle is ad
+hoc again).
+
+`cargo xtask bundle` signs with, in this order: `--adhoc` or `--sign IDENTITY` (a name or SHA-1
+from `security find-identity -p codesigning`, for example your own "Apple Development: …"
+identity; `-` = ad hoc), the `FILMCRAFT_SIGN_IDENTITY` environment variable, the local identity
+when it exists, else ad hoc. After the way a bundle is signed changes (the first build with the
+identity, another identity), macOS still holds the records of the old signature:
+`--reset-permissions` drops them (`tccutil reset All <bundle id>`; nothing else is reset), and
+macOS asks once more. The bundle is for local use; `packaging/macos/package.sh` makes the release
+DMG, signed with a Developer ID ([releasing.md](releasing.md)).
 
 ## 3. Quality gates
 
