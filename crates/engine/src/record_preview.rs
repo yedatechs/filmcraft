@@ -31,7 +31,7 @@ use crate::{EngineError, Result, Session};
 /// process's windows whose title starts with it.
 pub const OVERLAY_TITLE: &str = "FilmCraft Recording Overlay";
 
-/// Title of the pop-out camera preview windows (`… — <camera>`): a screen recording leaves out
+/// Title of the pop-out camera preview windows (`…: <camera>`): a screen recording leaves out
 /// this process's windows whose title starts with it.
 pub const PREVIEW_TITLE: &str = "FilmCraft Camera Preview";
 

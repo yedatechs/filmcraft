@@ -136,6 +136,8 @@ pub struct RecordUi {
     /// The panel is a compact strip (title, Record / Stop with the time, the camera thumbnails,
     /// `+` to restore); kept until restored, also across recordings.
     pub minimized: bool,
+    /// The pop-out preview windows as shown (sizes in points). Set every frame.
+    pub popouts: Vec<super::record_preview::PopoutInfo>,
     /// `record.devices`, refreshed when the panel opens (not saved).
     #[serde(skip)]
     pub devices: Option<Value>,
@@ -199,9 +201,70 @@ fn countdown_text(left: f64) -> String {
     format!("Recording in {n}…")
 }
 
-fn mmss(secs: f64) -> String {
+pub(crate) fn mmss(secs: f64) -> String {
     let s = if secs.is_finite() { secs.max(0.0) as u64 } else { 0 };
     format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// The microphone level bar (`record.panel.level` and the pop-out's `record.preview.<n>.level`):
+/// `level` (0 to 1) of `rect`'s width, red near full scale.
+pub(crate) fn level_meter(painter: &egui::Painter, rect: Rect, level: f32, accent: Color32) {
+    let level = if level.is_finite() { level.clamp(0.0, 1.0) } else { 0.0 };
+    painter.rect_filled(rect, 2.0, Color32::from_gray(50));
+    let lv = Rect::from_min_size(rect.min, vec2(rect.width() * level, rect.height()));
+    painter.rect_filled(lv, 2.0, if level > 0.9 { RED } else { accent });
+}
+
+/// The loudest microphone of a `record.status` (None: it has no microphone).
+pub(crate) fn mic_level(status: &Value) -> Option<f32> {
+    let mics = status["sources"].as_array()?.iter().filter(|x| x["kind"] == "mic");
+    mics.filter_map(|m| m["level"].as_f64()).map(|l| if l.is_finite() { l.clamp(0.0, 1.0) as f32 } else { 0.0 }).reduce(f32::max)
+}
+
+/// What the pop-out windows' control bars show now (`record_preview::Popout::status`): the state
+/// and time, the Record / Stop / Cancel button and the microphone level.
+pub(crate) fn popout_status(app: &FilmcraftApp) -> super::record_preview::PopoutStatus {
+    use super::record_preview::{PopoutAction, PopoutStatus};
+    let rec = &app.session.record;
+    let idle = PopoutStatus {
+        recording: false,
+        paused: false,
+        elapsed: 0.0,
+        label: String::new(),
+        level: None,
+        record: ("● Record", PopoutAction::Record, true),
+        pause: None,
+        accent: app.tokens.accent,
+    };
+    if let Some(left) = rec.countdown_left() {
+        return PopoutStatus { label: countdown_text(left), record: ("Cancel", PopoutAction::Cancel, true), ..idle };
+    }
+    if rec.starting_label().is_some() {
+        return PopoutStatus { label: "Starting…".into(), record: ("Cancel", PopoutAction::Cancel, true), ..idle };
+    }
+    if !rec.recording() {
+        return idle;
+    }
+    let st = filmcraft_engine::record::status_of(&app.session);
+    let elapsed = st["elapsed"].as_f64().unwrap_or(0.0);
+    PopoutStatus {
+        recording: true, elapsed, label: format!("● {}", mmss(elapsed)), level: mic_level(&st), record: ("Stop", PopoutAction::Stop, true), ..idle
+    }
+}
+
+/// Run a click on a pop-out's bar through the panel's own functions. The state is checked again:
+/// a click made just before the state changed (a countdown that ran out, a Stop after) does
+/// nothing rather than something else.
+pub(crate) fn run_popout_action(app: &mut FilmcraftApp, action: super::record_preview::PopoutAction) {
+    use super::record_preview::PopoutAction;
+    let rec = &app.session.record;
+    let pending = rec.countdown.is_some() || rec.starting.is_some();
+    match action {
+        PopoutAction::Record if !rec.recording() && !pending => toggle(app),
+        PopoutAction::Stop if rec.recording() => toggle(app),
+        PopoutAction::Cancel if pending => cancel(app),
+        _ => {}
+    }
 }
 
 /// The status-bar line while recording (None when not recording).
@@ -754,15 +817,9 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             };
             let l = ui.label(RichText::new(if counters.is_empty() { " ".to_string() } else { counters.clone() }).small().color(dim));
             elems.push(("record.panel.counters".into(), l.rect, counters));
-            let level = st
-                .as_ref()
-                .and_then(|s| s["sources"].as_array().and_then(|a| a.iter().find(|x| x["kind"] == "mic")).and_then(|m| m["level"].as_f64()))
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0) as f32;
+            let level = st.as_ref().and_then(mic_level).unwrap_or(0.0);
             let (rect, _) = ui.allocate_exact_size(vec2(260.0, 6.0), Sense::hover());
-            ui.painter().rect_filled(rect, 2.0, Color32::from_gray(50));
-            let lv = Rect::from_min_size(rect.min, vec2(rect.width() * level, rect.height()));
-            ui.painter().rect_filled(lv, 2.0, if level > 0.9 { RED } else { accent });
+            level_meter(ui.painter(), rect, level, accent);
             elems.push(("record.panel.level".into(), rect, format!("{level:.2}")));
             if !r.error.is_empty() {
                 let mut text = r.error.clone();
