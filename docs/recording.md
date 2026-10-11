@@ -266,6 +266,14 @@ window, the display scaled to fit, so `ui.drag` on `record.overlay` draws an are
 
 ## Permissions (macOS)
 
+**A rebuilt binary that stops recording the screen.** macOS keeps a Screen Recording record for a
+bare `filmcraft` binary's path, bound to the build that first recorded; after a rebuild every
+screen start stalls (the start is tried twice, then fails with this advice) while listing the
+screens still works. Remove the "FilmCraft" entry in System Settings ▸ Privacy & Security ▸ Screen
+& System Audio Recording (keep the terminal's entry) and start FilmCraft again; the terminal's own
+permission then covers it. `cargo xtask bundle`'s app has the same per-build binding through its
+ad-hoc signature.
+
 A camera or screen that rejects its configuration raises an Objective-C exception inside macOS;
 FilmCraft catches it (`docs/adr/0002-platform-capture-ffi.md` §4) and shows it in the Record panel
 as that source's error ("starting the camera: NSInvalidArgumentException …") instead of quitting.

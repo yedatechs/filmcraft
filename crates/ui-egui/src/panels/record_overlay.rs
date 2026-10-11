@@ -2,7 +2,7 @@
 //! (an egui immediate viewport titled [`OVERLAY_TITLE`]) over the chosen display or window that
 //! draws a 3 pt frame just inside its edges: grey while the Record panel is open with a screen
 //! chosen ("this is what will be recorded"), red with a `● REC 00:12` pill while recording. On a
-//! window source it follows the window (its frame is read every 0.5 s on a background thread);
+//! window source it follows the window (its frame is read from CoreGraphics every 0.5 s on a background thread);
 //! on an area it frames the area. Choosing "Area of <display>…" turns it into a drawing surface
 //! (not pass-through, crosshair): drag the rectangle, Esc cancels.
 //!
@@ -57,7 +57,8 @@ pub struct OverlayInfo {
     pub window: Option<[f64; 4]>,
 }
 
-/// Reads a target's frame every 0.5 s on its own thread (ScreenCaptureKit can take a while).
+/// Reads a target's frame every 0.5 s on its own thread (CoreGraphics answers at once; the thread
+/// keeps even a slow answer off the UI).
 struct Poller {
     target: String,
     latest: Arc<Mutex<Option<ScreenFrame>>>,

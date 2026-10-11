@@ -27,9 +27,10 @@ use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFArray, CFDictionary, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGDisplayCopyDisplayMode, CGDisplayIsBuiltin, CGDisplayMode, CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
+    CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsBuiltin, CGDisplayMode, CGMainDisplayID, CGPreflightScreenCaptureAccess,
+    CGRectMakeWithDictionaryRepresentation, CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds,
 };
 use objc2_core_media::{CMAudioFormatDescriptionGetStreamBasicDescription, CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
@@ -47,6 +48,10 @@ use filmcraft_engine::record::{
 };
 
 use super::{HostClockMap, Need, OS_TIMEOUT, START_TIMEOUT, permission_error, time_ns, waited};
+
+/// How long a process's first `startCapture` may stay silent before it is abandoned and tried
+/// again (a working start answers in well under a second; a lost one never answers).
+const FIRST_START_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// `kCVPixelFormatType_32BGRA`.
 pub const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
@@ -201,37 +206,52 @@ fn display_filter(content: &SCShareableContent, d: &SCDisplay) -> (Retained<SCCo
     (unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), d, &list) }, n)
 }
 
-/// Where a display or window is (points, global; and its pixel size).
+/// Where a display or window is (points, global; and its pixel size). Answered by CoreGraphics
+/// at once: ScreenCaptureKit's shareable content is a round trip to the capture daemon, and the
+/// recording border asking for it twice a second starved every capture start on the machine
+/// (2026-10-10), so it is never used for this.
 pub fn screen_frame(target: &ScreenTarget) -> Option<ScreenFrame> {
-    let content = shareable_content().ok()?;
-    // SAFETY: `content` is valid; its displays and windows are retained while used.
-    unsafe {
-        match target {
-            ScreenTarget::Display(id) => {
-                let d = content.displays().iter().find(|d| d.displayID().to_string() == *id)?;
-                let f = d.frame();
-                let pts = (f.size.width.max(1.0).round() as u32, f.size.height.max(1.0).round() as u32);
-                let pixels = display_pixels(d.displayID(), pts);
-                Some(ScreenFrame { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height, pixels })
+    match target {
+        ScreenTarget::Display(id) => {
+            let did: u32 = id.parse().ok()?;
+            let f = CGDisplayBounds(did);
+            if !(f.size.width >= 1.0 && f.size.height >= 1.0 && f.size.width.is_finite() && f.size.height.is_finite()) {
+                return None;
             }
-            ScreenTarget::Window(id) => {
-                let w = content.windows().iter().find(|w| w.windowID().to_string() == *id)?;
-                let f = w.frame();
-                let scale = main_scale(&content);
-                let pixels = ((f.size.width * scale).round().max(1.0) as u32, (f.size.height * scale).round().max(1.0) as u32);
-                Some(ScreenFrame { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height, pixels })
+            let pts = (f.size.width.round() as u32, f.size.height.round() as u32);
+            let pixels = display_pixels(did, pts);
+            Some(ScreenFrame { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height, pixels })
+        }
+        ScreenTarget::Window(id) => {
+            let wid: u32 = id.parse().ok()?;
+            let list = CGWindowListCopyWindowInfo(CGWindowListOption::OptionIncludingWindow, wid)?;
+            // SAFETY: CGWindowListCopyWindowInfo returns an array of window-info dictionaries keyed
+            // by CFStrings; only the bounds entry, itself a dictionary, is read.
+            let list: CFRetained<CFArray<CFDictionary<CFString, CFDictionary>>> = unsafe { CFRetained::cast_unchecked(list) };
+            let info = list.get(0)?;
+            // SAFETY: `kCGWindowBounds` is a constant CoreGraphics string.
+            let bounds = info.get(unsafe { kCGWindowBounds })?;
+            let mut f = CGRect::default();
+            // SAFETY: `bounds` is the window's bounds dictionary; `f` is a valid, writable rect.
+            if !unsafe { CGRectMakeWithDictionaryRepresentation(Some(&bounds), &mut f) } {
+                return None;
             }
+            if !(f.size.width >= 1.0 && f.size.height >= 1.0 && f.size.width.is_finite() && f.size.height.is_finite()) {
+                return None;
+            }
+            let scale = main_scale();
+            let pixels = ((f.size.width * scale).round().max(1.0) as u32, (f.size.height * scale).round().max(1.0) as u32);
+            Some(ScreenFrame { x: f.origin.x, y: f.origin.y, w: f.size.width, h: f.size.height, pixels })
         }
     }
 }
 
-/// Pixels per point of the main display (2 on a Retina display).
-fn main_scale(content: &SCShareableContent) -> f64 {
+/// Pixels per point of the main display (2 on a Retina display), from CoreGraphics.
+fn main_scale() -> f64 {
     let main = CGMainDisplayID();
     let (mpw, _) = display_pixels(main, (0, 0));
-    // SAFETY: `content` is valid; its displays are retained while used.
-    let mpts = unsafe { content.displays().iter().find(|d| d.displayID() == main).map(|d| d.width()).unwrap_or(0) };
-    if mpts > 0 && mpw > 0 { f64::from(mpw) / mpts as f64 } else { 2.0 }
+    let mpts = CGDisplayBounds(main).size.width;
+    if mpts >= 1.0 && mpw > 0 { f64::from(mpw) / mpts } else { 2.0 }
 }
 
 /// State shared with the stream output object (callbacks on ScreenCaptureKit's queue).
@@ -547,7 +567,7 @@ impl ScreenInput {
                         .ok_or_else(|| CaptureError::new(CaptureErrorKind::NoDevice, format!("no window `{id}` (it may have closed)")))?;
                     let f = w.frame();
                     // windows are measured in points: capture at the main display's pixel scale
-                    let scale = main_scale(&content);
+                    let scale = main_scale();
                     let size = ((f.size.width * scale).round().max(16.0) as u32, (f.size.height * scale).round().max(16.0) as u32);
                     (SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &w), size)
                 }
@@ -584,18 +604,45 @@ impl ScreenInput {
                 error: Mutex::new(None),
             });
             let output = StreamOutput::new(shared.clone());
-            let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(&*output)));
             let queue = DispatchQueue::new("org.filmcraft.capture.screen", None);
-            stream
-                .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue))
-                .map_err(|e| failed(format!("cannot receive screen frames: {}", e.localizedDescription())))?;
-            if shared.audio.is_some() {
+            let with_audio = shared.audio.is_some();
+            // a stream with our output object on its queue (built twice when the first start is lost)
+            let make_stream = || -> Result<Retained<SCStream>, CaptureError> {
+                let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(ProtocolObject::from_ref(&*output)));
                 stream
-                    .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Audio, Some(&queue))
-                    .map_err(|e| failed(format!("cannot receive the system audio: {}", e.localizedDescription())))?;
+                    .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue))
+                    .map_err(|e| failed(format!("cannot receive screen frames: {}", e.localizedDescription())))?;
+                if with_audio {
+                    stream
+                        .addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Audio, Some(&queue))
+                        .map_err(|e| failed(format!("cannot receive the system audio: {}", e.localizedDescription())))?;
+                }
+                Ok(stream)
+            };
+            let mut stream = make_stream()?;
+            // ScreenCaptureKit sometimes loses the completion of a process's first `startCapture`
+            // (seen 2026-10-10: the first start never answered while every later one took 0.3 s),
+            // so a start that is silent for FIRST_START_WAIT is abandoned (asked to stop, released)
+            // and tried once more with a fresh stream within the rest of START_TIMEOUT.
+            let first = run_with_completion("starting the screen recording", FIRST_START_WAIT, |b| stream.startCaptureWithCompletionHandler(Some(b)));
+            if let Err(e) = first {
+                if !e.message.contains("did not answer") {
+                    return Err(e);
+                }
+                log::warn!("{e}; trying once more with a fresh stream");
+                let silent = RcBlock::new(|_: *mut NSError| {});
+                stream.stopCaptureWithCompletionHandler(Some(&silent));
+                stream = make_stream()?;
+                let rest = START_TIMEOUT.saturating_sub(FIRST_START_WAIT).max(FIRST_START_WAIT);
+                run_with_completion("starting the screen recording (second try)", rest, |b| stream.startCaptureWithCompletionHandler(Some(b))).map_err(|e| {
+                    // seen 2026-10-10: macOS keeps a Screen Recording record for a bare binary's
+                    // path, bound to the build that first recorded; after a rebuild it stalls every
+                    // start instead of asking again
+                    failed(format!(
+                        "{e}. If FilmCraft was rebuilt since it last recorded the screen, macOS may hold a stale Screen Recording entry for it: remove \"FilmCraft\" in System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording (keep your terminal's entry), then start FilmCraft again."
+                    ))
+                })?;
             }
-            // the first start in a process warms up ScreenCaptureKit: give it START_TIMEOUT
-            run_with_completion("starting the screen recording", START_TIMEOUT, |b| stream.startCaptureWithCompletionHandler(Some(b)))?;
             self.error = Some(shared.clone());
             self.running = Some(Sendable(Running { stream, output, _queue: queue, shared }));
             Ok(VideoFormat { width: w, height: h, fps, format: PixelFormat::Bgra8 })
