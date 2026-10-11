@@ -408,6 +408,11 @@ pub struct UiState {
     /// Text panel ▸ Transcript: the anchor word of a mouse drag that is selecting words. Not saved.
     #[serde(skip)]
     pub transcript_drag: Option<usize>,
+    /// Text panel ▸ Transcript: a mouse drag across crossed-out words that will put them back:
+    /// (cut index, the word the drag began on, the word under the pointer), words counted within
+    /// the cut. Not saved.
+    #[serde(skip)]
+    pub transcript_cut_drag: Option<(usize, usize, usize)>,
     /// Text panel ▸ Transcript: search text.
     #[serde(default)]
     pub transcript_search: String,
@@ -863,6 +868,7 @@ impl Default for UiState {
             caption_search: String::new(),
             transcript_sel: None,
             transcript_drag: None,
+            transcript_cut_drag: None,
             transcript_search: String::new(),
             transcript_show_takes: false,
             transcript_pause_min: pause_min(),

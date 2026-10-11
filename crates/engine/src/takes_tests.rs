@@ -233,6 +233,119 @@ fn restore_crossed_out_text_and_preview() {
     assert_eq!(r0["in"].as_i64().unwrap(), s.sequence_rate().snap(Tick(ts)).0);
 }
 
+/// Texts of the crossed-out words, one string per cut.
+fn cut_texts(s: &mut Session) -> Vec<String> {
+    let cuts = s.execute("transcript.cuts", json!({})).unwrap();
+    cuts["cuts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["words"].as_array().unwrap().iter().map(|w| w["text"].as_str().unwrap().to_string()).collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+#[test]
+fn single_crossed_out_words_go_back_one_at_a_time() {
+    let (mut s, item) = session();
+    let screen = with_screen_track(&mut s);
+    // the second pass is crossed out: media words 5..=9
+    s.execute("transcript.extract", json!({"from": 5, "to": 9})).unwrap();
+    assert_eq!(cut_texts(&mut s), vec!["We start the show here."]);
+    assert_eq!(live_text(&mut s), "We start the show here. We start the show here, friends.");
+    assert_in_step(&s, item, screen, "after the cut");
+    // one word from the middle: only that word is back, the words around it stay crossed out
+    let r = s.execute("transcript.restore", json!({"item": item.0, "words": [7, 7]})).unwrap();
+    assert!(r["seconds"].as_f64().unwrap() < 0.4, "{r}: one 0.2 s word, not the 1.2 s stretch");
+    assert_eq!(live_text(&mut s), "We start the show here. the We start the show here, friends.");
+    assert_eq!(cut_texts(&mut s), vec!["We start", "show here."]);
+    assert_in_step(&s, item, screen, "one word back");
+    // a single index and a range in either order; the last words run into the clip after them
+    s.execute("transcript.restore", json!({"item": item.0, "words": 9})).unwrap();
+    assert_eq!(cut_texts(&mut s), vec!["We start", "show"]);
+    s.execute("transcript.restore", json!({"item": item.0, "words": [6, 5]})).unwrap();
+    assert_eq!(cut_texts(&mut s), vec!["show"]);
+    assert_eq!(live_text(&mut s), "We start the show here. We start the here. We start the show here, friends.");
+    assert_in_step(&s, item, screen, "all but one word back");
+    // each restore is one undo step
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(cut_texts(&mut s), vec!["We start", "show"]);
+    s.execute("edit.redo", json!({})).unwrap();
+    // the last one closes the cut: no sliver stays crossed out
+    s.execute("transcript.restore", json!({"item": item.0, "words": [8]})).unwrap();
+    assert_eq!(live_text(&mut s), "We start the show here. We start the show here. We start the show here, friends.");
+    let left = s.execute("transcript.cuts", json!({})).unwrap();
+    for c in left["cuts"].as_array().unwrap() {
+        assert!(c["words"].as_array().unwrap().is_empty() && c["seconds"].as_f64().unwrap() >= 0.03, "only whole-frame pauses may stay cut: {c}");
+    }
+    assert_in_step(&s, item, screen, "everything back");
+    // hostile word lists
+    s.execute("transcript.extract", json!({"from": 5, "to": 9})).unwrap();
+    for p in [
+        json!({"item": item.0, "words": [0, 1]}),
+        json!({"item": item.0, "words": [7, 99]}),
+        json!({"item": item.0, "words": [4, 7]}),
+        json!({"item": item.0, "words": []}),
+        json!({"item": item.0, "words": [5, 6, 7]}),
+        json!({"item": item.0, "words": "all"}),
+        json!({"item": item.0, "words": [-1, 5]}),
+        json!({"item": item.0, "words": [7.5, 8]}),
+        json!({"item": 999_999, "words": [7, 7]}),
+        json!({"words": [7, 7]}),
+    ] {
+        let before = clip_starts(&s);
+        assert!(s.execute("transcript.restore", p.clone()).is_err(), "{p} should fail");
+        assert_eq!(clip_starts(&s), before, "{p} changed nothing");
+    }
+}
+
+#[test]
+fn putting_text_back_never_costs_a_clip_its_effects() {
+    let (mut s, item) = session();
+    let screen = with_screen_track(&mut s);
+    s.execute("transcript.extract", json!({"from": 5, "to": 9})).unwrap();
+    // after the cut, the screen clip that follows it is given a look (a redaction, a layout)
+    let seq_id = s.state.active_sequence.unwrap();
+    let cut_at = Tick(s.execute("transcript.cuts", json!({})).unwrap()["cuts"][0]["at"].as_i64().unwrap());
+    let effect = s.active_sequence().unwrap().video_tracks[0].items.iter().find_map(|it| it.effects.first().cloned()).expect("a clip with an effect to copy");
+    let mut marked = effect.clone();
+    marked.enabled = !marked.enabled;
+    let after_id = s.active_sequence().unwrap().video_tracks[1]
+        .items
+        .iter()
+        .find(|it| it.item == screen && it.start == cut_at)
+        .map(|it| it.id)
+        .expect("the screen piece after the cut");
+    let mark = marked.clone();
+    s.edit("look", move |pr, _| {
+        let q = pr.sequence_mut(seq_id).unwrap();
+        let it = q.video_tracks[1].items.iter_mut().find(|it| it.id == after_id).unwrap();
+        it.effects.push(mark);
+        Ok(())
+    })
+    .unwrap();
+    let looks = |s: &Session| -> Vec<(ClipId, usize)> {
+        s.active_sequence().unwrap().video_tracks[1]
+            .items
+            .iter()
+            .filter(|it| it.item == screen)
+            .map(|it| (it.id, it.effects.iter().filter(|e| **e == marked).count()))
+            .collect()
+    };
+    assert_eq!(looks(&s).iter().map(|x| x.1).sum::<usize>(), 1);
+    // the last crossed-out word goes back: it runs into that clip, which reaches back over it
+    s.execute("transcript.restore", json!({"item": item.0, "words": [9, 9]})).unwrap();
+    assert!(looks(&s).contains(&(after_id, 1)), "the clip after the cut is still there with its look: {:?}", looks(&s));
+    assert_in_step(&s, item, screen, "the last word back");
+    // then the whole rest: the clip before the cut grows over it and the two, which look
+    // different, stay two clips
+    s.execute("transcript.restore", json!({"cut": 0})).unwrap();
+    assert!(looks(&s).contains(&(after_id, 1)), "{:?}", looks(&s));
+    assert_eq!(looks(&s).len(), 2, "one clip without the look, one with it: {:?}", looks(&s));
+    assert_eq!(looks(&s).iter().map(|x| x.1).sum::<usize>(), 1);
+    assert_in_step(&s, item, screen, "everything back");
+    assert_eq!(live_text(&mut s), "We start the show here. We start the show here. We start the show here, friends.");
+}
+
 #[test]
 fn hostile_parameters_are_errors_not_crashes() {
     let (mut s, item) = session();

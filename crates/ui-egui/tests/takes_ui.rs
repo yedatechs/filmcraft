@@ -144,8 +144,7 @@ fn detect_cross_out_restore_and_cycle_in_the_text_panel() {
     assert_eq!(chips, vec![format!("text.transcript.take.{gid}")]);
     let cut_ids = d.ids("text.transcript.cut.");
     assert!(cut_ids.iter().any(|i| i == "text.transcript.cut.0"), "{cut_ids:?}");
-    let cut_words: Vec<&String> = cut_ids.iter().filter(|i| i.matches('.').count() == 4).collect();
-    assert_eq!(cut_words.len(), 10, "the two crossed-out passes show word by word: {cut_ids:?}");
+    assert_eq!(cut_word_ids(&cut_ids).len(), 10, "the two crossed-out passes show word by word: {cut_ids:?}");
     d.snapshot("detected");
 
     // the chip cycles takes
@@ -154,10 +153,10 @@ fn detect_cross_out_restore_and_cycle_in_the_text_panel() {
     assert_eq!(d.live_words(), ["We", "start", "the", "show", "here."]);
     assert_eq!(d.ids("text.transcript.word.").len(), 5);
 
-    // clicking a crossed-out span restores it: more live words, fewer cuts
+    // the arrow after a crossed-out stretch puts all of it back: more live words, fewer cuts
     let before = d.cuts();
     assert!(before >= 1);
-    d.click("text.transcript.cut.0");
+    d.click("text.transcript.cut.0.all");
     assert!(d.live_words().len() > 5, "{:?}", d.live_words());
     assert!(d.cuts() < before || d.groups()[0]["active"].is_null(), "restoring made a second take live");
 
@@ -182,8 +181,70 @@ fn detect_cross_out_restore_and_cycle_in_the_text_panel() {
     d.frames(3);
     assert_eq!(d.ids("text.transcript.word.").len(), 11);
     let cut_ids = d.ids("text.transcript.cut.");
-    assert_eq!(cut_ids.iter().filter(|i| i.matches('.').count() == 4).count(), 5, "{cut_ids:?}");
-    d.click("text.transcript.cut.0");
+    assert_eq!(cut_word_ids(&cut_ids).len(), 5, "{cut_ids:?}");
+    d.click("text.transcript.cut.0.all");
+    assert_eq!(d.ids("text.transcript.word.").len(), 16);
+    assert_eq!(d.cuts(), 0);
+}
+
+/// The ids of crossed-out words (`text.transcript.cut.<cut>.<word>`) among `ids`.
+fn cut_word_ids(ids: &[String]) -> Vec<&String> {
+    ids.iter().filter(|i| i.matches('.').count() == 4 && i.rsplit('.').next().is_some_and(|k| k.parse::<usize>().is_ok())).collect()
+}
+
+/// The crossed-out words, one string per stretch, as the panel shows them.
+fn crossed_out(d: &mut Driver) -> Vec<String> {
+    let cuts = d.exec("transcript.cuts", json!({}));
+    cuts["cuts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["words"].as_array().unwrap().iter().map(|w| w["text"].as_str().unwrap().to_string()).collect::<Vec<_>>().join(" "))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+#[test]
+fn a_click_on_a_crossed_out_word_puts_back_that_word_only() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    d.frames(2);
+    d.click("text.tab.Transcript");
+    three_passes(&mut d);
+    // the second pass is crossed out: "We start the show here."
+    d.exec("transcript.extract", json!({"from": 5, "to": 9}));
+    d.frames(3);
+    assert_eq!(crossed_out(&mut d), ["We start the show here."]);
+    assert_eq!(d.ids("text.transcript.word.").len(), 11);
+    // the toolbar's trash crosses out (the gap closes); Lift, which left holes, is not on it
+    assert_eq!(d.ids("text.transcript.extract").len(), 1);
+    assert!(d.ids("text.transcript.lift").is_empty());
+
+    // a click on "the": that word is back, its neighbours stay crossed out
+    d.click("text.transcript.cut.0.2");
+    d.frames(3);
+    assert_eq!(crossed_out(&mut d), ["We start", "show here."]);
+    assert_eq!(d.live_words(), ["We", "start", "the", "show", "here.", "the", "We", "start", "the", "show", "here,", "friends."]);
+    // one undo step
+    d.exec("edit.undo", json!({}));
+    d.frames(3);
+    assert_eq!(crossed_out(&mut d), ["We start the show here."]);
+
+    // a drag from "start" to "show" puts those three back
+    d.ok("ui.drag", json!({"from": {"id": "text.transcript.cut.0.1"}, "to": {"id": "text.transcript.cut.0.3"}, "steps": 6}));
+    d.frames(4);
+    assert_eq!(crossed_out(&mut d), ["We", "here."]);
+    assert_eq!(d.ids("text.transcript.word.").len(), 14);
+    // single words have no "whole stretch" arrow; a stretch of several has
+    assert!(d.ids("text.transcript.cut.0.all").is_empty() && d.ids("text.transcript.cut.1.all").is_empty());
+    d.exec("edit.undo", json!({}));
+    d.frames(3);
+    assert_eq!(d.ids("text.transcript.cut.0.all").len(), 1);
+
+    // Option-click on any word: the whole stretch
+    d.ok("ui.click", json!({"id": "text.transcript.cut.0.4", "modifiers": {"alt": true}}));
+    d.frames(3);
+    assert!(crossed_out(&mut d).is_empty());
     assert_eq!(d.ids("text.transcript.word.").len(), 16);
     assert_eq!(d.cuts(), 0);
 }

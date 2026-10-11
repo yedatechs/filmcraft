@@ -566,13 +566,15 @@ fn a_speed_changed_clip_before_the_span_gets_an_insert() {
     let mut next = 1000;
     restore_cut(&mut q, &sp[0], &mut ctx(&mut next)).unwrap();
     q.check().unwrap();
-    // the inserted piece (media 2–3 s at 1×) runs straight into the clip after it (media 3–5 s),
-    // so the two join: one piece of media 2–5 s from 1 s
-    for t in [&q.audio_tracks[0], &q.video_tracks[0]] {
+    // the piece that goes back (media 2–3 s at 1×) runs straight into the clip after it (media
+    // 3–5 s), so that clip reaches back over it: one piece of media 2–5 s from 1 s, still the
+    // clip it was (its id, its link to its own partner)
+    for (t, id) in [(&q.audio_tracks[0], 101), (&q.video_tracks[0], 201)] {
         assert_eq!(t.items.len(), 2, "{}", t.name);
         assert_eq!((t.items[0].duration, t.items[0].speed), (s(1.0), 2.0));
         let n = &t.items[1];
-        assert_eq!((n.start, n.duration, n.source_in, n.speed, n.link), (s(1.0), s(3.0), s(2.0), 1.0, Some(1)));
+        assert_eq!((n.start, n.duration, n.source_in, n.speed, n.link), (s(1.0), s(3.0), s(2.0), 1.0, Some(2)));
+        assert_eq!(n.id, ClipId(id));
     }
     assert!(spans(&q).is_empty());
 }
@@ -602,6 +604,219 @@ fn restore_rejoins_music_and_broll_that_extract_split() {
     assert_eq!(layout(&q), layout(&orig));
     assert_eq!(q.all_tracks().map(|t| t.items.len()).collect::<Vec<_>>(), orig.all_tracks().map(|t| t.items.len()).collect::<Vec<_>>());
     assert_eq!(q, orig);
+}
+
+/// An effect instance that stands for "this clip was given a look": `name` tells them apart.
+fn look(name: &str) -> filmcraft_project::EffectInstance {
+    let mut e = filmcraft_project::EffectInstance {
+        effect: name.to_string(),
+        enabled: true,
+        params: Default::default(),
+        masks: Vec::new(),
+        post_fader: false,
+        essential: false,
+        layer: None,
+    };
+    let mut p = filmcraft_project::Param::new(filmcraft_project::ParamValue::Float(1.0));
+    p.keyframes.push(filmcraft_project::Keyframe {
+        time: s(0.5),
+        value: filmcraft_project::ParamValue::Float(2.0),
+        interp: Default::default(),
+        out_influence: 1.0 / 3.0,
+        in_influence: 1.0 / 3.0,
+    });
+    e.params.insert("amount".into(), p);
+    e
+}
+
+/// The picture and the dialogue after words 4..=6 were crossed out, with a look given to the
+/// picture clip AFTER the cut only (a layout put on one clip, a redaction): (sequence, the cut).
+fn cut_with_a_look_after_it(next: &mut u64) -> (Sequence, CutSpan) {
+    let mut q = linked();
+    extract_words(&mut q, 4, 6, &mut ctx(next));
+    let c = spans(&q).remove(0);
+    let after = q.video_tracks[0].items.iter_mut().find(|i| i.start == c.at).unwrap();
+    after.effects.push(look("mosaic"));
+    (q, c)
+}
+
+#[test]
+fn a_piece_that_runs_into_the_next_clip_becomes_part_of_it_and_the_clip_keeps_its_effects() {
+    let mut next = 1000;
+    let (mut q, c) = cut_with_a_look_after_it(&mut next);
+    let (v_after, a_after) = (q.video_tracks[0].items[1].clone(), q.audio_tracks[0].items[1].clone());
+    // the tail of the cut goes back: it ends where the clip after the cut begins
+    let fd = R.frame_duration();
+    let tail = TimeRange::from_bounds(c.media.start + fd + fd, c.media.end());
+    restore_media(&mut q, MEDIA, tail, c.at, 0, &mut ctx(&mut next)).unwrap();
+    q.check().unwrap();
+    for (t, was) in [(&q.video_tracks[0], &v_after), (&q.audio_tracks[0], &a_after)] {
+        assert_eq!(t.items.len(), 3, "{}: no new clip, the clip after the cut reaches back", t.name);
+        let n = &t.items[1];
+        assert_eq!(n.id, was.id, "{}: the same clip", t.name);
+        assert_eq!((n.start, n.source_in, n.duration), (c.at, tail.start, was.duration + tail.duration));
+    }
+    let v = &q.video_tracks[0].items[1];
+    assert_eq!(v.effects.len(), 1, "the look is still on the clip");
+    assert_eq!(v.effects[0].effect, "mosaic");
+    // the clip starts earlier, so its keyframe moves later by as much and stays on the same picture
+    assert_eq!(v.effects[0].params["amount"].keyframes[0].time, s(0.5) + tail.duration);
+    assert!(q.video_tracks[0].items[0].effects.is_empty(), "the clip before the cut is as it was");
+    // what is left of the cut is its head
+    let rest = spans(&q);
+    assert_eq!(rest.iter().map(|x| x.media).collect::<Vec<_>>(), vec![TimeRange::from_bounds(c.media.start, tail.start)]);
+}
+
+#[test]
+fn a_whole_cut_put_back_between_two_different_looks_leaves_both_clips_as_they_are() {
+    let mut next = 1000;
+    let (mut q, c) = cut_with_a_look_after_it(&mut next);
+    let ids: Vec<ClipId> = q.video_tracks[0].items.iter().map(|i| i.id).collect();
+    restore_cut(&mut q, &c, &mut ctx(&mut next)).unwrap();
+    q.check().unwrap();
+    // the picture: the clip before grew over the cut, and is not joined with the clip after it,
+    // which looks different (joining would throw one clip's look away)
+    let v = &q.video_tracks[0];
+    assert_eq!(v.items.iter().map(|i| i.id).collect::<Vec<_>>(), ids);
+    assert!(v.items[0].effects.is_empty());
+    assert_eq!(v.items[0].end(), c.at + c.media.duration);
+    assert_eq!(v.items[1].effects.len(), 1);
+    assert_eq!(v.items[1].effects[0].params["amount"].keyframes[0].time, s(0.5), "untouched");
+    // the dialogue, which sounds the same on both sides, is one clip again
+    assert_eq!(q.audio_tracks[0].items.len(), 2);
+    assert!(spans(&q).is_empty());
+}
+
+#[test]
+fn a_piece_in_the_middle_of_a_cut_looks_like_the_nearer_clip() {
+    for near_the_end in [false, true] {
+        let mut next = 1000;
+        let (mut q, c) = cut_with_a_look_after_it(&mut next);
+        let fd = R.frame_duration();
+        // one frame from one end of the cut, several from the other
+        let len = c.media.duration.0 / fd.0;
+        assert!(len >= 8, "the cut is long enough for the test ({len} frames)");
+        let start = if near_the_end { c.media.end() - fd - fd - fd } else { c.media.start + fd };
+        let piece = TimeRange::new(start, fd + fd);
+        restore_media(&mut q, MEDIA, piece, c.at, 0, &mut ctx(&mut next)).unwrap();
+        q.check().unwrap();
+        let v = &q.video_tracks[0];
+        assert_eq!(v.items.len(), 4, "an island: a clip of its own");
+        let n = &v.items[1];
+        assert_eq!((n.start, n.duration, n.source_in), (c.at, piece.duration, piece.start));
+        assert_eq!(n.effects.len(), usize::from(near_the_end), "near the end: {near_the_end}");
+        assert!(v.items[0].effects.is_empty());
+        assert_eq!(v.items[2].effects.len(), 1);
+    }
+}
+
+/// A transcript of `words` (text, start s, end s) and the cut span of media `lo..hi` holding
+/// the words whose midpoint lies in it.
+fn word_cut(words: &[(&str, f64, f64)], lo: f64, hi: f64) -> (Transcript, CutSpan) {
+    let t = Transcript {
+        words: words
+            .iter()
+            .map(|(text, a, b)| filmcraft_project::Word { text: (*text).into(), start: s(*a), end: s(*b), speaker: None, confidence: 1.0 })
+            .collect(),
+        ..Default::default()
+    };
+    let media = TimeRange::from_bounds(s(lo), s(hi));
+    let cut = CutSpan { item: MEDIA, media, at: s(1.0), track: 0, before: ClipId(1), after: ClipId(2), words: t.words_within(media), after_word: None };
+    (t, cut)
+}
+
+#[test]
+fn one_crossed_out_word_goes_back_without_its_neighbours_or_the_pauses() {
+    // "to | uh filmcraft I don't … um wait so I don't think you see all | of": the cut runs from
+    // 7.8 s (after "to") to 16.08 s (before "of"), as in the owner's recording
+    let words = [
+        ("to", 7.35, 7.72),
+        ("uh", 8.54, 8.62),
+        ("filmcraft", 8.96, 9.48),
+        ("I", 9.68, 9.82),
+        ("don't", 9.82, 9.88),
+        ("wait", 14.24, 14.74),
+        ("so", 15.27, 15.36),
+        ("I", 15.36, 15.46),
+        ("see", 15.78, 15.94),
+        ("all", 15.94, 16.04),
+        ("of", 16.14, 16.24),
+    ];
+    let (t, cut) = word_cut(&words, 7.8, 16.08);
+    assert_eq!(cut.words, 1..10);
+    let fd = R.frame_duration();
+    let whole = |r: TimeRange| (r.start - cut.media.start).0 % fd.0 == 0 && (r.duration.0 % fd.0 == 0 || r.end() == cut.media.end());
+    // "filmcraft" alone: a little before it and after it, not "uh" before nor "I" after
+    let r = restore_range_for_words(&t, &cut, 2, 2, R).unwrap();
+    assert!(whole(r), "{r:?}");
+    assert!(r.start >= s(8.62) && r.start <= s(8.96), "after uh, before the word: {}", r.start.seconds());
+    assert!(r.end() >= s(9.48) && r.end() <= s(9.68), "after the word, before I: {}", r.end().seconds());
+    assert!(r.duration < s(0.9), "the word, not the pauses around it");
+    // the last words of the cut reach its end (they join the clip after it); the start does not
+    // go back into "wait"
+    let r = restore_range_for_words(&t, &cut, 6, 9, R).unwrap();
+    assert_eq!(r.end(), cut.media.end());
+    assert!(r.start >= s(14.74) && r.start <= s(15.27), "{}", r.start.seconds());
+    assert!(whole(r));
+    // the first word of the cut: 0.74 s of pause lies before it, which stays removed
+    let r = restore_range_for_words(&t, &cut, 1, 1, R).unwrap();
+    assert!(r.start > cut.media.start + s(0.5) && r.start <= s(8.54), "{}", r.start.seconds());
+    assert!(r.end() <= s(8.96));
+    // a word right at the start of a cut joins the clip before it
+    let (t2, cut2) = word_cut(&[("a", 1.0, 1.2), ("b", 1.25, 1.5), ("c", 3.0, 3.4)], 0.9, 3.5);
+    let r = restore_range_for_words(&t2, &cut2, 0, 0, R).unwrap();
+    assert_eq!(r.start, cut2.media.start);
+    assert!(r.end() <= s(1.25) + fd && r.end() >= s(1.2));
+    // a range in either order; everything: the whole cut
+    assert_eq!(restore_range_for_words(&t2, &cut2, 1, 0, R), restore_range_for_words(&t2, &cut2, 0, 1, R));
+    assert_eq!(restore_range_for_words(&t2, &cut2, 0, 2, R), Some(cut2.media));
+}
+
+#[test]
+fn restoring_words_one_by_one_puts_the_whole_cut_back_without_slivers() {
+    let mut q = linked();
+    let mut next = 1000;
+    let orig = q.clone();
+    extract_words(&mut q, 2, 7, &mut ctx(&mut next));
+    let tr = fixture();
+    // the last word first, then the others from the end: each click restores one word
+    for _ in 0..32 {
+        let Some(c) = spans(&q).into_iter().find(|c| !c.words.is_empty()) else { break };
+        let w = c.words.end - 1;
+        let r = restore_range_for_words(&tr, &c, w, w, R).unwrap();
+        assert!(r.start >= c.media.start && r.end() <= c.media.end());
+        restore_media(&mut q, MEDIA, r, c.at, c.track, &mut ctx(&mut next)).unwrap();
+        q.check().unwrap();
+        for c in spans(&q) {
+            assert!(c.media.duration >= R.frame_duration(), "no sliver under a frame stays cut: {:?}", c.media);
+        }
+    }
+    let left = spans(&q);
+    assert!(left.iter().all(|c| c.words.is_empty()), "every word is back: {left:?}");
+    // what is still cut is pauses only; putting those back gives the original edit
+    for _ in 0..8 {
+        let Some(c) = spans(&q).into_iter().next() else { break };
+        restore_cut(&mut q, &c, &mut ctx(&mut next)).unwrap();
+    }
+    assert_eq!(layout(&q), layout(&orig));
+}
+
+#[test]
+fn hostile_word_ranges_are_none_not_a_panic() {
+    let (t, cut) = word_cut(&[("a", 1.0, 1.2), ("b", 1.25, 1.5)], 0.9, 1.6);
+    assert_eq!(restore_range_for_words(&t, &cut, 5, 9, R), None);
+    assert_eq!(restore_range_for_words(&t, &cut, usize::MAX, 0, R), None);
+    let empty = CutSpan { media: TimeRange::new(s(1.0), Tick(0)), ..cut.clone() };
+    assert_eq!(restore_range_for_words(&t, &empty, 0, 0, R), None);
+    let zero_rate = FrameRate { num: 0, den: 1 };
+    let _ = restore_range_for_words(&t, &cut, 0, 1, zero_rate);
+    // words whose times are reversed or far outside the cut still give a range inside it
+    let (t, cut) = word_cut(&[("x", 5.0, 4.0), ("y", 4.5, 4.6)], 4.2, 4.9);
+    for (a, b) in [(0, 0), (1, 1), (0, 1)] {
+        if let Some(r) = restore_range_for_words(&t, &cut, a, b, R) {
+            assert!(r.start >= cut.media.start && r.end() <= cut.media.end() && r.duration >= R.frame_duration(), "{r:?}");
+        }
+    }
 }
 
 #[test]

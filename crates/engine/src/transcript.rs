@@ -588,18 +588,49 @@ fn cuts(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({"cuts": spans.iter().enumerate().map(|(i, c)| cut_json(s, i, c)).collect::<Vec<_>>()}))
 }
 
-/// `transcript.restore {cut}` (an index from `transcript.cuts`) or `{item, start, end, at?, track?}`
-/// (a media range in ticks; `at` and `track` default to the cut span holding it).
+/// `transcript.restore {cut}` (an index from `transcript.cuts`: the whole crossed-out stretch),
+/// `{item, words: [first, last]}` (crossed-out words by their media-transcript index, as
+/// `transcript.cuts` lists them: only those words go back, without the words or the pauses
+/// around them; a single index restores one word) or `{item, start, end, at?, track?}` (a media
+/// range in ticks; `at` and `track` default to the cut span holding it).
 fn restore(s: &mut Session, p: &Value) -> Result<Value> {
     let spans = cut_spans(s);
     let (item, media, at, track) = if let Some(i) = u64_p(p, "cut") {
         let c = spans.get(i as usize).ok_or_else(|| bad("transcript.restore", format!("cut index out of range (there are {} cuts)", spans.len())))?;
         (c.item, c.media, c.at, c.track)
+    } else if let Some(w) = p.get("words") {
+        let item = u64_p(p, "item")
+            .map(ItemId)
+            .and_then(|i| media_item(s, i))
+            .ok_or_else(|| bad("transcript.restore", "`words` needs `item` (the media item the words belong to)"))?;
+        let index = |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok());
+        let (a, b) = match w {
+            Value::Array(v) => match (v.first().and_then(index), v.get(1).and_then(index)) {
+                (Some(a), Some(b)) if v.len() == 2 => (a.min(b), a.max(b)),
+                (Some(a), None) if v.len() == 1 => (a, a),
+                _ => return Err(bad("transcript.restore", "`words` must be [first, last], two word indices")),
+            },
+            v => index(v).map(|a| (a, a)).ok_or_else(|| bad("transcript.restore", "`words` must be [first, last], two word indices"))?,
+        };
+        let c = spans
+            .iter()
+            .find(|c| c.item == item && c.words.contains(&a))
+            .ok_or_else(|| bad("transcript.restore", format!("word {a} is not crossed out (see transcript.cuts)")))?;
+        if !c.words.contains(&b) {
+            return Err(bad(
+                "transcript.restore",
+                format!("words {a} to {b} are not in one crossed-out stretch (this one holds {} to {})", c.words.start, c.words.end.saturating_sub(1)),
+            ));
+        }
+        let t = s.project.transcripts.get(&item).ok_or_else(|| bad("transcript.restore", "that item has no transcript"))?;
+        let media =
+            tx::restore_range_for_words(t, c, a, b, s.sequence_rate()).ok_or_else(|| bad("transcript.restore", "those words are too short to put back"))?;
+        (item, media, c.at, c.track)
     } else {
         let item = u64_p(p, "item")
             .map(ItemId)
             .and_then(|i| media_item(s, i))
-            .ok_or_else(|| bad("transcript.restore", "pass `cut` (an index from transcript.cuts) or `item` with `start`/`end`"))?;
+            .ok_or_else(|| bad("transcript.restore", "pass `cut` (an index from transcript.cuts), `item` with `words`, or `item` with `start`/`end`"))?;
         let (a, b) = match (p.get("start").and_then(Value::as_i64), p.get("end").and_then(Value::as_i64)) {
             (Some(a), Some(b)) => (Tick(a), Tick(b)),
             _ => return Err(bad("transcript.restore", "`start` and `end` (media ticks) are required")),
@@ -782,7 +813,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.restore",
             "Restore Crossed-out Text",
             &[],
-            r#"{"cut":n | "item":id,"start":ticks,"end":ticks,"at":ticks?,"track":n?}"#,
+            r#"{"cut":n | "item":id,"words":[first,last] | "item":id,"start":ticks,"end":ticks,"at":ticks?,"track":n?}"#,
             has_cuts,
             restore,
             true,

@@ -3,8 +3,9 @@
 //! merge, delete), track choice and the track style. Every edit dispatches a `captions.*` engine
 //! command; every widget registers an automation id (`text.*`). The Transcript tab shows the
 //! sequence transcript as speaker paragraphs of clickable words (click, Shift+click to extend);
-//! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands). Crossed-out
-//! text (cut spans) shows struck through in place and restores on click; take groups get a
+//! the selection marks In/Out and can be crossed out (`transcript.*` commands). Crossed-out
+//! text (cut spans) shows struck through in place; a click puts one word back, a drag several, the
+//! arrow after a stretch all of it; take groups get a
 //! `Take 2/3` chip and an optional Takes list (`takes.*` commands). Remove Pauses opens a dialog
 //! (`text.pauses.*`) with the threshold, the length kept and a live count from `transcript.pauses`.
 
@@ -341,31 +342,96 @@ struct CutView {
     seconds: f64,
 }
 
-/// Crossed-out words of a cut span: struck through and dimmed; a click restores the span.
+/// Crossed-out words of a cut span, struck through and dimmed. Each word is its own target:
+///
+/// - a click puts that word back, and only that word (`transcript.restore {item, words}`);
+/// - a drag across words puts those back;
+/// - Option-click on a word, or the small arrow after a stretch of several words, puts the whole
+///   stretch back (`transcript.restore {cut}`), as does a click on a wordless pause (`⋯ 0.5 s`);
+/// - a right-click offers the same choices by name.
 fn cut_span(app: &mut FilmcraftApp, ui: &mut egui::Ui, c: &CutView, actions: &mut Vec<(String, Value)>) {
     let t = app.tokens;
-    let hover = "Restore crossed-out text";
-    let style = |s: &str| egui::RichText::new(s).size(13.0).color(t.text_dim).strikethrough();
-    let mut first: Option<Rect> = None;
-    let mut clicked = false;
+    let whole = json!({"cut": c.index});
     if c.words.is_empty() {
-        let resp =
-            ui.add(egui::Label::new(style(&format!("⋯ {:.1} s", c.seconds))).wrap_mode(egui::TextWrapMode::Extend).sense(Sense::click())).on_hover_text(hover);
-        first = Some(resp.rect);
-        clicked |= resp.clicked();
-    } else {
-        for (k, w) in c.words.iter().enumerate() {
-            let resp = ui.add(egui::Label::new(style(w)).wrap_mode(egui::TextWrapMode::Extend).sense(Sense::click())).on_hover_text(hover);
-            app.auto.add(&format!("text.transcript.cut.{}.{k}", c.index), resp.rect, w);
-            first.get_or_insert(resp.rect);
-            clicked |= resp.clicked();
+        let hover = "Put this pause back";
+        let text = egui::RichText::new(format!("⋯ {:.1} s", c.seconds)).size(13.0).color(t.text_dim).strikethrough();
+        let resp = ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend).sense(Sense::click())).on_hover_text(hover);
+        app.auto.add(&format!("text.transcript.cut.{}", c.index), resp.rect, hover);
+        if resp.clicked() {
+            actions.push(("transcript.restore".into(), whole));
         }
+        return;
+    }
+    let hover = "Click: put this word back. Drag across words: put those back. Option-click: the whole crossed-out stretch.";
+    let words_of =
+        |a: usize, b: usize| json!({"item": c.item, "words": [c.media_words.start.saturating_add(a.min(b)), c.media_words.start.saturating_add(a.max(b))]});
+    let drag = app.ui.transcript_cut_drag.filter(|d| d.0 == c.index);
+    let mut first: Option<Rect> = None;
+    for (k, w) in c.words.iter().enumerate() {
+        let dragged_over = drag.is_some_and(|(_, a, b)| a.min(b) <= k && k <= a.max(b));
+        let mut text = egui::RichText::new(w).size(13.0).color(t.text_dim).strikethrough();
+        if dragged_over {
+            text = text.background_color(t.row_selected);
+        }
+        let resp = ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend).sense(Sense::click_and_drag())).on_hover_text(hover);
+        app.auto.add(&format!("text.transcript.cut.{}.{k}", c.index), resp.rect, w);
+        first.get_or_insert(resp.rect);
+        if resp.drag_started() {
+            app.ui.transcript_cut_drag = Some((c.index, k, k));
+            app.ui.focused = crate::dock::PanelKind::Text;
+        }
+        if let Some((ci, anchor, _)) = app.ui.transcript_cut_drag
+            && ci == c.index
+            && let Some(pos) = ui.input(|inp| inp.pointer.interact_pos())
+            && resp.rect.expand2(vec2(2.0, 1.5)).contains(pos)
+        {
+            app.ui.transcript_cut_drag = Some((ci, anchor, k));
+        }
+        if resp.clicked() {
+            let alt =
+                ui.input(|inp| inp.modifiers.alt || inp.events.iter().any(|e| matches!(e, egui::Event::PointerButton { modifiers, .. } if modifiers.alt)));
+            actions.push(("transcript.restore".into(), if alt { whole.clone() } else { words_of(k, k) }));
+        }
+        resp.context_menu(|ui| {
+            if ui.button(format!("Put Back \u{201c}{w}\u{201d}")).clicked() {
+                actions.push(("transcript.restore".into(), words_of(k, k)));
+                ui.close();
+            }
+            if c.words.len() > 1 {
+                if k > 0 && ui.button("Put Back From the Start to Here").clicked() {
+                    actions.push(("transcript.restore".into(), words_of(0, k)));
+                    ui.close();
+                }
+                if k + 1 < c.words.len() && ui.button("Put Back From Here to the End").clicked() {
+                    actions.push(("transcript.restore".into(), words_of(k, c.words.len() - 1)));
+                    ui.close();
+                }
+                if ui.button(format!("Put Back the Whole Stretch ({} words)", c.words.len())).clicked() {
+                    actions.push(("transcript.restore".into(), whole.clone()));
+                    ui.close();
+                }
+            }
+        });
     }
     if let Some(r) = first {
         app.auto.add(&format!("text.transcript.cut.{}", c.index), r, hover);
     }
-    if clicked {
-        actions.push(("transcript.restore".into(), json!({"cut": c.index})));
+    // the drag ended: the words it covered go back (a press that never became a drag is a click,
+    // handled above; the two never both happen)
+    if let Some((_, a, b)) = drag
+        && ui.input(|inp| !inp.pointer.any_down())
+    {
+        app.ui.transcript_cut_drag = None;
+        actions.push(("transcript.restore".into(), words_of(a, b)));
+    }
+    if c.words.len() > 1 {
+        let (r, resp) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::click());
+        let resp = resp.on_hover_text(format!("Put the whole crossed-out stretch back ({} words)", c.words.len()));
+        icons::paint(ui.painter(), r.shrink(1.0), Icon::Undo, if resp.hovered() { t.text } else { t.text_dim });
+        app.auto.add(&format!("text.transcript.cut.{}.all", c.index), r, "Put the whole stretch back");
+        if resp.clicked() {
+            actions.push(("transcript.restore".into(), whole));
+        }
     }
 }
 
@@ -643,9 +709,18 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut x = bar.min.x + sw + 10.0;
     let range = sel.map(|(a, b)| json!({"from": a.min(b), "to": a.max(b)}));
     let has_words = !words.is_empty();
-    let tools: [(Icon, &str, &str, bool, &str, Value); 8] = [
-        (Icon::Razor, "text.transcript.extract", "Extract selected text", sel.is_some(), "transcript.extract", range.clone().unwrap_or_default()),
-        (Icon::Trash, "text.transcript.lift", "Lift selected text", sel.is_some(), "transcript.lift", range.unwrap_or_default()),
+    // Crossing out closes the gap (Extract). Lift, which leaves a hole in the timeline, is not on
+    // this bar: it read as "delete" and left holes nobody asked for (`transcript.lift` remains a
+    // command).
+    let tools: [(Icon, &str, &str, bool, &str, Value); 7] = [
+        (
+            Icon::Trash,
+            "text.transcript.extract",
+            "Cross out selected text (the gap closes; click crossed-out words to put them back)",
+            sel.is_some(),
+            "transcript.extract",
+            range.unwrap_or_default(),
+        ),
         (Icon::Link, "text.transcript.removeFillers", "Remove filler words", has_words, "transcript.removeFillers", json!({})),
         // no thresholds: `menus::invoke` opens the Remove Pauses dialog
         (Icon::Pause, "text.transcript.removePauses", "Remove pauses…", has_words, "transcript.removePauses", json!({})),
@@ -794,6 +869,10 @@ fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             ui.add_space(8.0);
         }
     });
+    // a drag over crossed-out words whose stretch is gone (an undo mid-drag) ends with the press
+    if app.ui.transcript_cut_drag.is_some() && ui.input(|inp| !inp.pointer.any_down()) {
+        app.ui.transcript_cut_drag = None;
+    }
     if app.ui.transcript_drag.is_some() && ui.input(|inp| !inp.pointer.any_down()) {
         app.ui.transcript_drag = None;
         if let Some((a, b)) = app.ui.transcript_sel {

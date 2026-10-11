@@ -62,14 +62,38 @@ Nothing a text edit removes is lost. Media that a clip used to play but no longe
 stretch between two clips of the same media on an audio track, which is what Extract, Remove
 Pauses, Remove Filler Words and a crossed-out take leave behind) is a **cut span**
 (`filmcraft_edit::transcript::cut_spans`): derived from the timeline like the sequence transcript,
-never stored. The Text panel shows a cut span's words struck through where they were, a wordless
-span as a struck-through pause, and one click puts the media back. Head and tail trims are not
-spans (they would list a whole source file).
+never stored. The Text panel shows a cut span's words struck through where they were and a
+wordless span as a struck-through pause (`⋯ 0.5 s`). Head and tail trims are not spans (they
+would list a whole source file).
+
+**Putting crossed-out text back** works word by word:
+
+| In the Text panel | Puts back |
+|---|---|
+| Click a crossed-out word | that word only: the words around it stay crossed out, and so do the pauses |
+| Drag across crossed-out words | those words |
+| Option-click a word, or the small arrow after a stretch of several words | the whole crossed-out stretch |
+| Click a crossed-out pause (`⋯ 0.5 s`) | the pause |
+| Right-click a word | Put Back "word" / From the Start to Here / From Here to the End / the Whole Stretch |
+| Restore all (toolbar) | everything |
+
+A word comes back with a little room around it (60 ms before, 90 ms after) and never with a
+neighbouring word that stays crossed out. At an edge of the stretch it joins the clip there when
+no more than 0.3 s lies between; a longer pause there was removed on purpose and stays removed.
+Every piece is a whole number of frames, and no sliver under two frames is left crossed out, so
+clicking the words of a stretch one by one ends with all of it back.
+
+**A clip never loses its effects to a restore.** When a piece runs straight into the clip after
+it, that clip reaches back over the piece: it keeps its id, its effects (a layout, a redaction)
+and its keyframes, which stay on the same pictures. When a whole stretch goes back between two
+clips that were given different effects since the cut, the clip before it grows and the two stay
+two clips. A piece in the middle of a stretch becomes a clip of its own and looks like the clip
+of the same media nearest to it in media time.
 
 | Command | What it does |
 |---|---|
 | `transcript.cuts` | The sequence's cut spans: `index`, `item`, media `start`/`end`, `at` (where it goes back), `track`, `afterWord` (the live word it follows), `words`. |
-| `transcript.restore` | Put a span back (`cut` index, or `item` + media `start`/`end`): the clip before it grows, everything from `at` moves right on every unlocked track, a clip on another track spanning `at` is lengthened when its media allows (the inverse of Extract) and otherwise split; linked video grows with the audio. One undo step. |
+| `transcript.restore` | Put crossed-out media back: a whole span (`cut` index), crossed-out words (`item` + `words: [first, last]`, media-transcript indices as `transcript.cuts` lists them; one index for one word; both must be in one span), or a media range (`item` + `start`/`end` ticks). The clip before it grows, everything from `at` moves right on every unlocked track, a clip on another track spanning `at` is lengthened when its media allows (the inverse of Extract) and otherwise split; linked video grows with the audio. One undo step. |
 
 **Takes** are lines the speaker recorded more than once. `takes.detect` splits a media
 transcript into utterances (at pauses or sentence punctuation), compares neighbours by
@@ -106,7 +130,9 @@ Shortcuts (Sequence ▸ Takes): Detect Takes `Alt+Shift+T`, Next/Previous Take `
 Cross Out `Alt+Shift+X`, Restore `Alt+Shift+U`, Label `Alt+Shift+L`, Re-record `Alt+Shift+R`. In the
 Text panel, `Cmd+Backspace` crosses out the selected words, and with nothing selected brings back
 the crossed-out text beside the playhead word (Descript's ⌘⌫); `Backspace` extracts and
-`Alt+Backspace` lifts the selection. Words are selected with the mouse like text: click one,
+`Alt+Backspace` lifts the selection. The toolbar's trash button crosses out too (Extract: the gap
+closes). Lift, which leaves a hole in the timeline where the words were, is not on the toolbar:
+it read as "delete" and left holes nobody asked for; it stays a command and a shortcut. Words are selected with the mouse like text: click one,
 Shift+click to extend, or drag across words (in either direction). The toolbar is icons only;
 hovering a button names it at once in a tooltip and in the status bar.
 

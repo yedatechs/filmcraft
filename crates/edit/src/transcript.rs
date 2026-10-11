@@ -349,6 +349,72 @@ pub fn cut_spans(seq: &Sequence, transcripts: &Transcripts, live: &[SeqWord]) ->
     out
 }
 
+/// Most silence put back before a restored word, and after it: enough not to clip the word's
+/// attack or its tail, far less than a pause.
+const RESTORE_LEAD: f64 = 0.06;
+const RESTORE_TAIL: f64 = 0.09;
+/// A wordless stretch this short between restored words and the edge of their cut goes back with
+/// them (the breath between two words), so no sliver stays crossed out; a longer one is a pause
+/// that was removed and stays removed.
+const RESTORE_JOIN: f64 = 0.3;
+
+/// The media to put back so that the crossed-out words `a..=b` of `cut` (indices into the media
+/// transcript `t`) are heard again, and nothing else of the cut: [`restore_media`] of it at
+/// `cut.at` restores exactly those words.
+///
+/// - It starts a little before the first word ([`RESTORE_LEAD`]) and ends a little after the last
+///   ([`RESTORE_TAIL`]), never reaching into a neighbouring word that stays crossed out.
+/// - At an edge of the cut it reaches the edge when what lies between is short
+///   ([`RESTORE_JOIN`]), so the words join the clip there; a pause that was removed there stays
+///   removed.
+/// - It is a whole number of frames long, measured from the cut's start (the timeline stays on
+///   frames), and never leaves less than two frames of the cut on either side.
+///
+/// None when the words are not all inside the cut, or the cut is too short to hold a frame.
+pub fn restore_range_for_words(t: &Transcript, cut: &CutSpan, a: usize, b: usize, rate: FrameRate) -> Option<TimeRange> {
+    let (a, b) = (a.min(b), a.max(b));
+    if !cut.words.contains(&a) || !cut.words.contains(&b) {
+        return None;
+    }
+    let (first, last) = (t.words.get(a)?, t.words.get(b)?);
+    let (lo, hi) = (cut.media.start, cut.media.end());
+    let fd = rate.frame_duration();
+    if fd.0 <= 0 || hi.0.saturating_sub(lo.0) < fd.0 {
+        return None;
+    }
+    let secs = |x: f64| ticks(x * TICKS_PER_SECOND as f64);
+    // the start: the cut's own start when the word opens the cut after no more than a breath,
+    // else a little before the word, after the crossed-out word before it
+    let prev_end = a.checked_sub(1).filter(|k| cut.words.contains(k)).and_then(|k| t.words.get(k)).map(|w| w.end);
+    let mut start = match prev_end {
+        None if first.start.0.saturating_sub(lo.0) <= secs(RESTORE_JOIN).0 => lo,
+        _ => Tick(first.start.0.saturating_sub(secs(RESTORE_LEAD).0)).max(prev_end.unwrap_or(lo).min(first.start)),
+    };
+    let next_start = b.checked_add(1).filter(|k| cut.words.contains(k)).and_then(|k| t.words.get(k)).map(|w| w.start);
+    let mut end = match next_start {
+        None if hi.0.saturating_sub(last.end.0) <= secs(RESTORE_JOIN).0 => hi,
+        _ => Tick(last.end.0.saturating_add(secs(RESTORE_TAIL).0)).min(next_start.unwrap_or(hi).max(last.end)),
+    };
+    start = start.clamp(lo, hi);
+    end = end.clamp(lo, hi);
+    // whole frames from the cut's start, outward; a sliver under two frames goes back too
+    let frames = |d: i64| d.div_euclid(fd.0);
+    let mut sf = frames(start.0.saturating_sub(lo.0));
+    if sf < 2 {
+        sf = 0;
+    }
+    let start = Tick(lo.0.saturating_add(sf.saturating_mul(fd.0)));
+    let up = end.0.saturating_sub(lo.0).saturating_add(fd.0.saturating_sub(1));
+    let mut end = Tick(lo.0.saturating_add(frames(up).saturating_mul(fd.0))).min(hi);
+    if hi.0.saturating_sub(end.0) < fd.0.saturating_mul(2) {
+        end = hi;
+    }
+    if end.0.saturating_sub(start.0) < fd.0 {
+        end = Tick(start.0.saturating_add(fd.0)).min(hi);
+    }
+    (end.0.saturating_sub(start.0) >= fd.0).then(|| TimeRange::from_bounds(start, end))
+}
+
 /// Timeline ranges (sorted, merged) on which `media` of `item` is played by the audio track clips
 /// that play speech (as in [`sequence_words`]): each clip's share of `media` mapped through its
 /// media In and speed, clamped to the clip. Empty when that media is not heard anywhere.
@@ -383,10 +449,15 @@ pub fn live_ranges(seq: &Sequence, item: ItemId, media: TimeRange) -> Vec<TimeRa
 /// whose media continues into `media` at 100% grows by it (the clip before, its linked picture),
 /// and so does a 100% clip of other media that Extract split at `at` (the clip starting at `at` is
 /// the same media resuming exactly `media.duration` later: music, B-roll on a ripple track); a
-/// grown clip joins the clip after it when that clip continues it (no edit point is left); a clip spanning
+/// grown clip joins the clip after it when that clip continues it and looks the same (the same
+/// effects: no edit point is left; two clips that were given different effects since the cut stay
+/// two clips, each with its own); a clip spanning
 /// `at` is lengthened when its media allows, else split; everything from `at` moves right. When the
 /// clip on `track` could not grow (part of a span, a speed change), a new 100% clip of `media` is
-/// inserted at `at` with its linked partners. Fails without changing anything when the track does
+/// inserted at `at` with its linked partners. A new piece never costs a clip its effects: when it
+/// runs straight into the clip after it, that clip reaches back over it (its id, effects and
+/// keyframes stay as they are); otherwise it looks like the clip of the same media nearest to it
+/// in media time. Fails without changing anything when the track does
 /// not exist or is locked, no clip of `item` ends at `at` on it, `media` is empty, shorter than a
 /// frame or outside the media.
 pub fn restore_media(seq: &mut Sequence, item: ItemId, media: TimeRange, at: Tick, track: usize, ctx: &mut EditCtx) -> crate::Result<TimeRange> {
@@ -580,7 +651,7 @@ fn restore(
         let id = n.id;
         let idx = tr.items.partition_point(|i| i.start <= at);
         tr.items.insert(idx, n);
-        join_continuation(tr, id);
+        settle_piece(tr, id);
     }
     for ct in work.caption_tracks.iter_mut().filter(|c| !c.locked && c.sync_lock) {
         crate::captions::shift_from(ct, at, dur);
@@ -614,8 +685,8 @@ fn restore(
             let idx = tr.items.partition_point(|i| i.start <= at);
             tr.items.insert(idx, n);
             // a piece that runs straight into the clip after it (the last take of a group put
-            // back) joins it, as the other tracks' pieces do, so the edit points line up
-            join_continuation(tr, id);
+            // back) becomes part of it, as the other tracks' pieces do, so the edit points line up
+            settle_piece(tr, id);
         }
     }
     // 5. transitions
@@ -626,13 +697,21 @@ fn restore(
     Ok(TimeRange::from_bounds(at, end))
 }
 
+/// Whether two clips look and sound the same: the same effects with the same values, masks and
+/// keyframes, both enabled or both not. Only such clips are joined into one.
+fn same_look(a: &TrackItem, b: &TrackItem) -> bool {
+    a.enabled == b.enabled && a.effects == b.effects
+}
+
 /// Join a grown clip with the clip right after it when that one continues it in media time (the
-/// rest of the clip Extract split off), leaving no edit point. The left clip's attributes win.
+/// rest of the clip Extract split off) and looks the same, leaving no edit point. Two clips that
+/// were given different effects since the cut (a layout or a redaction on one of them) stay two
+/// clips: joining them would throw one clip's effects away.
 fn join_continuation(tr: &mut Track, id: ClipId) {
     let Some(i) = tr.items.iter().position(|it| it.id == id) else { return };
     let Some(j) = i.checked_add(1) else { return };
     let (Some(a), Some(b)) = (tr.items.get(i), tr.items.get(j)) else { return };
-    if !crate::through::is_through_edit(a, b) {
+    if !crate::through::is_through_edit(a, b) || !same_look(a, b) {
         return;
     }
     let (aid, bid, bdur) = (a.id, b.id, b.duration);
@@ -647,6 +726,65 @@ fn join_continuation(tr: &mut Track, id: ClipId) {
         }
         if t.to == Some(bid) {
             t.to = Some(aid);
+        }
+    }
+}
+
+/// Move every keyframe of `effects` (parameters and masks) `by` later in clip time: what a clip
+/// needs when it starts earlier and its animation must stay where it was.
+fn shift_keyframes(effects: &mut [filmcraft_project::EffectInstance], by: Tick) {
+    let shift = |p: &mut filmcraft_project::Param| {
+        for k in &mut p.keyframes {
+            k.time = Tick(k.time.0.saturating_add(by.0));
+        }
+    };
+    for e in effects {
+        e.params.values_mut().for_each(shift);
+        for m in &mut e.masks {
+            for p in [&mut m.path, &mut m.feather, &mut m.opacity, &mut m.expansion] {
+                shift(p);
+            }
+        }
+    }
+}
+
+/// Give a new piece (just inserted by a restore, a copy of the clip before it) its place among
+/// the clips that were already there, without costing any of them its effects:
+///
+/// - the clip after it continues it in media time: that clip reaches back over the piece. Its id,
+///   effects and transitions stay; its keyframes move later by the piece's length so its
+///   animation stays where it was. The piece is gone.
+/// - otherwise the piece stays a clip of its own and looks like the clip of the same media
+///   nearest to it in media time: the clip before it (whose copy it is) or, when the clip after it
+///   is nearer, that one.
+fn settle_piece(tr: &mut Track, id: ClipId) {
+    let Some(i) = tr.items.iter().position(|it| it.id == id) else { return };
+    let Some(piece) = tr.items.get(i).cloned() else { return };
+    let j = i.saturating_add(1);
+    if tr.items.get(j).is_some_and(|b| !piece.reverse && crate::through::is_through_edit(&piece, b)) {
+        if let Some(b) = tr.items.get_mut(j) {
+            b.start = piece.start;
+            b.source_in = piece.source_in;
+            b.duration = Tick(b.duration.0.saturating_add(piece.duration.0));
+            shift_keyframes(&mut b.effects, piece.duration);
+        }
+        tr.items.retain(|it| it.id != id);
+        tr.transitions.retain(|t| t.from != Some(id) && t.to != Some(id));
+        return;
+    }
+    let before = i.checked_sub(1).and_then(|k| tr.items.get(k)).filter(|a| a.item == piece.item && a.end() == piece.start);
+    let after = tr.items.get(j).filter(|b| b.item == piece.item && b.start == piece.end());
+    let Some(b) = after else { return };
+    let gap_after = b.source_in.0.saturating_sub(media_end(&piece).0);
+    let nearer = match before {
+        Some(a) => gap_after >= 0 && gap_after < piece.source_in.0.saturating_sub(media_end(a).0),
+        None => true,
+    };
+    if nearer {
+        let (effects, enabled) = (b.effects.clone(), b.enabled);
+        if let Some(p) = tr.items.get_mut(i) {
+            p.effects = effects;
+            p.enabled = enabled;
         }
     }
 }
